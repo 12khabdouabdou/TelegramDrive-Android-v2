@@ -8,6 +8,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -321,7 +322,7 @@ private fun ApiCredsForm(state: AuthState, vm: AuthViewModel) {
 }
 
 @Composable
-private fun PhoneForm(state: AuthState, vm: AuthViewModel) {
+private fun ColumnScope.PhoneForm(state: AuthState, vm: AuthViewModel) {
     Text(
         text = stringResource(R.string.auth_welcome_back),
         style = TgTypography.Display.titleMedium,
@@ -429,7 +430,7 @@ private fun CodeForm(state: AuthState, vm: AuthViewModel) {
 }
 
 @Composable
-private fun PasswordForm(state: AuthState, vm: AuthViewModel) {
+private fun ColumnScope.PasswordForm(state: AuthState, vm: AuthViewModel) {
     val context = LocalContext.current
     var reveal by remember { mutableStateOf(false) }
 
@@ -483,7 +484,7 @@ private fun PasswordForm(state: AuthState, vm: AuthViewModel) {
 }
 
 @Composable
-private fun RegistrationForm(state: AuthState, vm: AuthViewModel) {
+private fun ColumnScope.RegistrationForm(state: AuthState, vm: AuthViewModel) {
     Text(
         text = stringResource(R.string.auth_registration_title),
         style = TgTypography.Display.titleMedium,
