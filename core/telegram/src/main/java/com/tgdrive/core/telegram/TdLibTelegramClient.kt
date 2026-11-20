@@ -46,11 +46,16 @@ class TdLibTelegramClient(
 
     @Volatile private var scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatchers.io)
     @Volatile private var client: Client? = null
+    @Volatile private var initializedApiId: Int? = null
+    @Volatile private var initializedApiHash: String? = null
     @Volatile private var myUserIdCache: Long? = null
     @Volatile private var tdlibFilesDir: File? = null
 
     private val _authState = MutableStateFlow<AuthorizationState>(AuthorizationState.WaitInitialization)
     override val authState: StateFlow<AuthorizationState> = _authState.asStateFlow()
+
+    private val _authCodeInfo = MutableStateFlow<AuthCodeInfo?>(null)
+    override val authCodeInfo: StateFlow<AuthCodeInfo?> = _authCodeInfo.asStateFlow()
 
     private val _authEvents = MutableSharedFlow<AuthEvent>(extraBufferCapacity = 8)
     val authEvents: SharedFlowLike<AuthEvent> = _authEvents.asSharedFlow()
@@ -106,10 +111,23 @@ class TdLibTelegramClient(
                 is TdApi.UpdateAuthorizationState -> {
                     val st = update.authorizationState
                     _authState.value = st.toDomain()
-                    if (st is TdApi.AuthorizationStateReady) {
-                        scope.launch { refreshMyUserId() }
-                    } else if (st is TdApi.AuthorizationStateClosed) {
-                        onClosed?.invoke()
+                    when (st) {
+                        is TdApi.AuthorizationStateWaitCode -> {
+                            _authCodeInfo.value = st.codeInfo.toDomain()
+                            Log.i("TDLib: WaitCode type=${st.codeInfo?.type?.javaClass?.simpleName} next=${st.codeInfo?.nextType?.javaClass?.simpleName} timeout=${st.codeInfo?.timeout}")
+                        }
+                        is TdApi.AuthorizationStateReady -> {
+                            _authCodeInfo.value = null
+                            scope.launch { refreshMyUserId() }
+                        }
+                        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+                            _authCodeInfo.value = null
+                        }
+                        is TdApi.AuthorizationStateClosed -> {
+                            _authCodeInfo.value = null
+                            onClosed?.invoke()
+                        }
+                        else -> Unit
                     }
                 }
                 is TdApi.UpdateFile -> {
@@ -147,7 +165,17 @@ class TdLibTelegramClient(
 
     override suspend fun initialize(apiId: Int, apiHash: String, sessionDir: String) {
         initLock.withLock {
-            if (client != null) return@withLock
+            if (client != null) {
+                if (initializedApiId == apiId && initializedApiHash == apiHash) {
+                    return@withLock
+                }
+                Log.i("TDLib init: API credentials changed — recreating client")
+                try { client?.send(TdApi.Close()) { } } catch (_: Throwable) {}
+                client = null
+                initializedApiId = null
+                initializedApiHash = null
+                _authCodeInfo.value = null
+            }
 
             val sessionDirFile = File(appContext.filesDir, sessionDir)
             check(sessionDirFile.isDirectory || sessionDirFile.mkdirs()) {
@@ -184,6 +212,11 @@ class TdLibTelegramClient(
             }
 
             var activeClient = c
+            val langCode = java.util.Locale.getDefault().language.ifBlank { "en" }
+            val modelName = "${android.os.Build.MANUFACTURER.orEmpty()} ${android.os.Build.MODEL.orEmpty()}"
+                .trim()
+                .ifBlank { "Android" }
+            val sysVersion = "Android ${android.os.Build.VERSION.RELEASE ?: "14"}"
 
             val params = TdApi.SetTdlibParameters().apply {
                 this.apiId = apiId
@@ -194,9 +227,9 @@ class TdLibTelegramClient(
                 useChatInfoDatabase = true
                 useFileDatabase = true
                 useSecretChats = false
-                systemLanguageCode = "en"
-                deviceModel = "Telegram Drive Android"
-                systemVersion = "Android"
+                systemLanguageCode = langCode
+                deviceModel = modelName
+                systemVersion = sysVersion
                 applicationVersion = "1.0.3"
                 useTestDc = false
                 databaseEncryptionKey = keystoreHelper.tdlibSessionKey()
@@ -247,9 +280,9 @@ class TdLibTelegramClient(
                             useChatInfoDatabase = true
                             useFileDatabase = true
                             useSecretChats = false
-                            systemLanguageCode = "en"
-                            deviceModel = "Telegram Drive Android"
-                            systemVersion = "Android"
+                            systemLanguageCode = langCode
+                            deviceModel = modelName
+                            systemVersion = sysVersion
                             applicationVersion = "1.0.3"
                             useTestDc = false
                             databaseEncryptionKey = freshKey
@@ -282,6 +315,8 @@ class TdLibTelegramClient(
             }
 
             client = activeClient
+            initializedApiId = apiId
+            initializedApiHash = apiHash
             Log.i("TDLib client initialised (apiId=$apiId)")
         }
     }
@@ -304,12 +339,29 @@ class TdLibTelegramClient(
 
     // Auth
     override suspend fun sendPhoneNumber(phone: String) {
-        val settings = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, true, null, null)
+        val settings = TdApi.PhoneNumberAuthenticationSettings().apply {
+            allowFlashCall = false
+            allowMissedCall = false
+            isCurrentPhoneNumber = false
+            hasUnknownPhoneNumber = false
+            // Must be false: this app has no official Telegram Play Services SMS Retriever
+            // signature or Firebase token, so setting true causes Telegram to withhold SMS OTP.
+            allowSmsRetrieverApi = false
+        }
         send<TdApi.Ok>(TdApi.SetAuthenticationPhoneNumber(phone, settings))
         _authEvents.tryEmit(AuthEvent.CodeRequested)
     }
 
+    override suspend fun resendAuthCode() {
+        send<TdApi.Ok>(TdApi.ResendAuthenticationCode(TdApi.ResendCodeReasonUserRequest()))
+    }
+
     override suspend fun sendAuthCode(code: String) { send<TdApi.Ok>(TdApi.CheckAuthenticationCode(code)) }
+    override suspend fun requestQrCodeLogin() { send<TdApi.Ok>(TdApi.RequestQrCodeAuthentication(longArrayOf())) }
+    override suspend fun sendEmailAddress(email: String) { send<TdApi.Ok>(TdApi.SetAuthenticationEmailAddress(email)) }
+    override suspend fun sendEmailCode(code: String) {
+        send<TdApi.Ok>(TdApi.CheckAuthenticationEmailCode(TdApi.EmailAddressAuthenticationCode(code)))
+    }
     override suspend fun sendAuthPassword(password: String) { send<TdApi.Ok>(TdApi.CheckAuthenticationPassword(password)) }
     override suspend fun registerNewUser(firstName: String, lastName: String) {
         send<TdApi.Ok>(TdApi.RegisterUser(firstName, lastName, false))
@@ -322,7 +374,10 @@ class TdLibTelegramClient(
             catch (t: Throwable) { Log.w("Logout error (ignored)", t) }
             finally {
                 _authState.value = AuthorizationState.Closed
+                _authCodeInfo.value = null
                 myUserIdCache = null
+                initializedApiId = null
+                initializedApiHash = null
                 pendingSendConfirmations.values.forEach {
                     runCatching { it.completeExceptionally(TelegramException(-1, "Logged out")) }
                 }
@@ -752,7 +807,10 @@ class TdLibTelegramClient(
             uploadHandlers.clear()
             scope.cancel()
             client = null
+            initializedApiId = null
+            initializedApiHash = null
             myUserIdCache = null
+            _authCodeInfo.value = null
             _authState.value = AuthorizationState.Closed
             Log.i("TDLib client closed")
             Unit

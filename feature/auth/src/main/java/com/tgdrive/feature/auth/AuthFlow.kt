@@ -1,9 +1,15 @@
 package com.tgdrive.feature.auth
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
+import android.net.Uri
 import android.view.WindowManager
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,6 +37,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
@@ -39,6 +46,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -52,6 +60,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -63,6 +74,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
+import com.tgdrive.core.telegram.AuthCodeChannel
 import com.tgdrive.designsystem.theme.TgTypography
 
 /**
@@ -139,6 +153,9 @@ fun AuthFlow(
                     AuthStep.ApiCreds -> ApiCredsForm(state = state, vm = vm)
                     AuthStep.Phone -> PhoneForm(state = state, vm = vm)
                     AuthStep.Code -> CodeForm(state = state, vm = vm)
+                    AuthStep.QrLogin -> QrLoginForm(state = state, vm = vm)
+                    AuthStep.EmailAddress -> EmailAddressForm(state = state, vm = vm)
+                    AuthStep.EmailCode -> EmailCodeForm(state = state, vm = vm)
                     AuthStep.Password -> PasswordForm(state = state, vm = vm)
                     AuthStep.Registration -> RegistrationForm(state = state, vm = vm)
                     AuthStep.Done -> DoneScreen()
@@ -345,6 +362,25 @@ private fun ColumnScope.PhoneForm(state: AuthState, vm: AuthViewModel) {
         loading = state.loading,
         onClick = vm::submitPhone,
     )
+    OutlinedButton(
+        onClick = vm::startQrLogin,
+        enabled = !state.loading,
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth().height(48.dp),
+    ) {
+        Icon(Icons.Filled.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = stringResource(R.string.auth_qr_button),
+            fontWeight = FontWeight.Medium,
+        )
+    }
+    Text(
+        text = stringResource(R.string.auth_qr_hint),
+        style = TgTypography.Caption,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.align(Alignment.CenterHorizontally),
+    )
     TextButton(
         onClick = vm::goToApiCreds,
         enabled = !state.loading,
@@ -358,7 +394,29 @@ private fun ColumnScope.PhoneForm(state: AuthState, vm: AuthViewModel) {
 }
 
 @Composable
-private fun CodeForm(state: AuthState, vm: AuthViewModel) {
+private fun ColumnScope.CodeForm(state: AuthState, vm: AuthViewModel) {
+    val displayPhone = state.codeInfo?.phoneNumber?.ifBlank { state.phone } ?: state.phone
+    val deliveryText = when (state.codeInfo?.channel) {
+        AuthCodeChannel.TELEGRAM_APP -> stringResource(R.string.auth_code_via_telegram_app, displayPhone)
+        AuthCodeChannel.SMS, AuthCodeChannel.SMS_WORD, AuthCodeChannel.SMS_PHRASE ->
+            stringResource(R.string.auth_code_via_sms, displayPhone)
+        AuthCodeChannel.CALL, AuthCodeChannel.FLASH_CALL, AuthCodeChannel.MISSED_CALL ->
+            stringResource(R.string.auth_code_via_call, displayPhone)
+        AuthCodeChannel.FRAGMENT -> stringResource(R.string.auth_code_via_fragment, displayPhone)
+        AuthCodeChannel.FIREBASE_ANDROID -> stringResource(R.string.auth_code_via_firebase, displayPhone)
+        else -> stringResource(R.string.auth_code_via_unknown, displayPhone)
+    }
+    val resendLabel = when {
+        state.resendWaitSeconds > 0 -> stringResource(R.string.auth_code_resend_wait, state.resendWaitSeconds)
+        state.codeInfo?.nextChannel == AuthCodeChannel.SMS -> stringResource(R.string.auth_code_resend_sms)
+        state.codeInfo?.nextChannel == AuthCodeChannel.CALL ||
+            state.codeInfo?.nextChannel == AuthCodeChannel.FLASH_CALL ||
+            state.codeInfo?.nextChannel == AuthCodeChannel.MISSED_CALL ->
+            stringResource(R.string.auth_code_resend_call)
+        else -> stringResource(R.string.auth_code_resend)
+    }
+    val canResend = state.resendWaitSeconds == 0 && state.cooldownSeconds == 0 && !state.loading
+
     Text(
         text = stringResource(R.string.auth_code_title),
         style = TgTypography.Display.titleMedium,
@@ -366,7 +424,7 @@ private fun CodeForm(state: AuthState, vm: AuthViewModel) {
         fontWeight = FontWeight.Bold,
     )
     Text(
-        text = stringResource(R.string.auth_code_subtitle, state.phone),
+        text = deliveryText,
         style = TgTypography.Display.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -415,17 +473,210 @@ private fun CodeForm(state: AuthState, vm: AuthViewModel) {
         }
         TextButton(
             onClick = vm::resendCode,
-            enabled = state.cooldownSeconds == 0 && !state.loading,
+            enabled = canResend,
         ) {
             Text(
-                text = stringResource(R.string.auth_code_resend),
-                color = if (state.cooldownSeconds == 0 && !state.loading) {
+                text = resendLabel,
+                color = if (canResend) {
                     MaterialTheme.colorScheme.tertiary
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
         }
+    }
+    TextButton(
+        onClick = vm::startQrLogin,
+        enabled = !state.loading,
+        modifier = Modifier.align(Alignment.CenterHorizontally),
+    ) {
+        Text(
+            text = stringResource(R.string.auth_code_no_code_qr),
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
+}
+
+@Composable
+private fun ColumnScope.QrLoginForm(state: AuthState, vm: AuthViewModel) {
+    val context = LocalContext.current
+    var localNotice by remember(state.qrLink) { mutableStateOf<String?>(null) }
+    val missingAppMsg = stringResource(R.string.auth_qr_no_telegram_app)
+    val copiedMsg = stringResource(R.string.auth_qr_link_copied)
+
+    val qrMatrix = remember(state.qrLink) {
+        if (state.qrLink.isBlank()) {
+            null
+        } else {
+            runCatching { QRCodeWriter().encode(state.qrLink, BarcodeFormat.QR_CODE, 48, 48) }.getOrNull()
+        }
+    }
+
+    Text(
+        text = stringResource(R.string.auth_qr_title),
+        style = TgTypography.Display.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        fontWeight = FontWeight.Bold,
+    )
+    Text(
+        text = stringResource(R.string.auth_qr_subtitle),
+        style = TgTypography.Display.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (qrMatrix != null) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color.White)
+                .padding(14.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(modifier = Modifier.size(180.dp)) {
+                val w = qrMatrix.width
+                val h = qrMatrix.height
+                val cellW = size.width / w
+                val cellH = size.height / h
+                for (y in 0 until h) {
+                    for (x in 0 until w) {
+                        if (qrMatrix.get(x, y)) {
+                            drawRect(
+                                color = Color.Black,
+                                topLeft = Offset(x * cellW, y * cellH),
+                                size = Size(cellW + 0.5f, cellH + 0.5f),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ErrorBanner(error = state.error ?: localNotice, onDismiss = {
+        localNotice = null
+        vm.clearError()
+    })
+    AuthButton(
+        text = stringResource(R.string.auth_qr_open_telegram),
+        loading = state.loading,
+        enabled = state.qrLink.isNotBlank(),
+        onClick = {
+            localNotice = null
+            try {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(state.qrLink))
+                context.startActivity(intent)
+            } catch (_: ActivityNotFoundException) {
+                localNotice = missingAppMsg
+            } catch (t: Throwable) {
+                localNotice = t.message ?: missingAppMsg
+            }
+        },
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        TextButton(
+            onClick = {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("Telegram login link", state.qrLink))
+                localNotice = copiedMsg
+            },
+            enabled = state.qrLink.isNotBlank(),
+        ) {
+            Text(
+                text = stringResource(R.string.auth_qr_copy_link),
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        TextButton(
+            onClick = vm::goToPhone,
+            enabled = !state.loading,
+        ) {
+            Text(
+                text = stringResource(R.string.auth_qr_use_phone),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.EmailAddressForm(state: AuthState, vm: AuthViewModel) {
+    Text(
+        text = stringResource(R.string.auth_email_title),
+        style = TgTypography.Display.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        fontWeight = FontWeight.Bold,
+    )
+    Text(
+        text = stringResource(R.string.auth_email_subtitle),
+        style = TgTypography.Display.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    AuthField(
+        value = state.email,
+        onValueChange = vm::onEmailChanged,
+        label = stringResource(R.string.auth_email_label),
+        keyboardType = KeyboardType.Email,
+        imeAction = ImeAction.Done,
+        onImeAction = vm::submitEmail,
+        enabled = !state.loading,
+    )
+    ErrorBanner(error = state.error, onDismiss = vm::clearError)
+    AuthButton(
+        text = stringResource(R.string.auth_phone_continue),
+        loading = state.loading,
+        onClick = vm::submitEmail,
+    )
+    TextButton(
+        onClick = vm::goToPhone,
+        enabled = !state.loading,
+        modifier = Modifier.align(Alignment.CenterHorizontally),
+    ) {
+        Text(
+            text = stringResource(R.string.auth_change_phone),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun ColumnScope.EmailCodeForm(state: AuthState, vm: AuthViewModel) {
+    Text(
+        text = stringResource(R.string.auth_email_code_title),
+        style = TgTypography.Display.titleMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        fontWeight = FontWeight.Bold,
+    )
+    Text(
+        text = stringResource(R.string.auth_email_code_subtitle, state.emailPattern.ifBlank { state.email }),
+        style = TgTypography.Display.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    AuthField(
+        value = state.emailCode,
+        onValueChange = vm::onEmailCodeChanged,
+        label = stringResource(R.string.auth_code_title),
+        keyboardType = KeyboardType.Number,
+        imeAction = ImeAction.Done,
+        onImeAction = vm::submitEmailCode,
+        enabled = !state.loading,
+    )
+    ErrorBanner(error = state.error, onDismiss = vm::clearError)
+    AuthButton(
+        text = stringResource(R.string.auth_phone_continue),
+        loading = state.loading,
+        onClick = vm::submitEmailCode,
+    )
+    TextButton(
+        onClick = vm::goToPhone,
+        enabled = !state.loading,
+        modifier = Modifier.align(Alignment.CenterHorizontally),
+    ) {
+        Text(
+            text = stringResource(R.string.auth_change_phone),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

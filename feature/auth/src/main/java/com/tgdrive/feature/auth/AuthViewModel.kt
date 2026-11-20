@@ -6,6 +6,7 @@ import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.isE164
 import com.tgdrive.core.security.KeystoreHelper
+import com.tgdrive.core.telegram.AuthCodeInfo
 import com.tgdrive.core.telegram.AuthorizationState
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.TelegramException
@@ -34,6 +35,9 @@ sealed interface AuthStep {
     data object ApiCreds : AuthStep
     data object Phone : AuthStep
     data object Code : AuthStep
+    data object QrLogin : AuthStep
+    data object EmailAddress : AuthStep
+    data object EmailCode : AuthStep
     data object Password : AuthStep
     data object Registration : AuthStep
     data object Done : AuthStep
@@ -45,6 +49,12 @@ data class AuthState(
     val apiHash: String = "",
     val phone: String = "",
     val code: String = "",
+    val codeInfo: AuthCodeInfo? = null,
+    val resendWaitSeconds: Int = 0,
+    val qrLink: String = "",
+    val email: String = "",
+    val emailCode: String = "",
+    val emailPattern: String = "",
     val password: String = "",
     val firstName: String = "",
     val lastName: String = "",
@@ -65,30 +75,53 @@ class AuthViewModel @Inject constructor(
     val state: StateFlow<AuthState> = _state.asStateFlow()
 
     private var cooldownJob: Job? = null
+    private var resendTimerJob: Job? = null
 
     init {
         observeAuthState()
+        observeCodeInfo()
         loadStoredApiCreds()
     }
 
     private fun observeAuthState() {
         viewModelScope.launch(dispatchers.io) {
             telegramClient.authState.collect { st ->
-                val target = when (st) {
-                    AuthorizationState.WaitInitialization -> AuthStep.ApiCreds
-                    AuthorizationState.WaitPhoneNumber -> AuthStep.Phone
-                    AuthorizationState.WaitCode -> AuthStep.Code
-                    AuthorizationState.WaitPassword -> AuthStep.Password
-                    AuthorizationState.WaitRegistration -> AuthStep.Registration
-                    AuthorizationState.Ready -> AuthStep.Done
-                    else -> _state.value.step
-                }
                 _state.update { prev ->
-                    if (target != prev.step) {
-                        prev.copy(step = target, loading = false, error = null)
-                    } else {
-                        prev
+                    when (st) {
+                        AuthorizationState.WaitInitialization ->
+                            if (prev.step != AuthStep.ApiCreds) prev.copy(step = AuthStep.ApiCreds, loading = false, error = null) else prev
+                        AuthorizationState.WaitPhoneNumber ->
+                            if (prev.step != AuthStep.Phone) prev.copy(step = AuthStep.Phone, loading = false, error = null) else prev
+                        AuthorizationState.WaitCode ->
+                            if (prev.step != AuthStep.Code) prev.copy(step = AuthStep.Code, loading = false, error = null) else prev
+                        is AuthorizationState.WaitQrConfirmation ->
+                            prev.copy(step = AuthStep.QrLogin, qrLink = st.link, loading = false, error = null)
+                        AuthorizationState.WaitEmailAddress ->
+                            if (prev.step != AuthStep.EmailAddress) prev.copy(step = AuthStep.EmailAddress, loading = false, error = null) else prev
+                        is AuthorizationState.WaitEmailCode ->
+                            prev.copy(step = AuthStep.EmailCode, emailPattern = st.emailPattern, loading = false, error = null)
+                        AuthorizationState.WaitPassword ->
+                            if (prev.step != AuthStep.Password) prev.copy(step = AuthStep.Password, loading = false, error = null) else prev
+                        AuthorizationState.WaitRegistration ->
+                            if (prev.step != AuthStep.Registration) prev.copy(step = AuthStep.Registration, loading = false, error = null) else prev
+                        AuthorizationState.Ready ->
+                            if (prev.step != AuthStep.Done) prev.copy(step = AuthStep.Done, loading = false, error = null) else prev
+                        else -> prev
                     }
+                }
+            }
+        }
+    }
+
+    private fun observeCodeInfo() {
+        viewModelScope.launch(dispatchers.io) {
+            telegramClient.authCodeInfo.collect { info ->
+                _state.update { it.copy(codeInfo = info) }
+                if (info != null && info.timeoutSeconds > 0) {
+                    startResendTimer(info.timeoutSeconds)
+                } else {
+                    resendTimerJob?.cancel()
+                    _state.update { it.copy(resendWaitSeconds = 0) }
                 }
             }
         }
@@ -113,6 +146,12 @@ class AuthViewModel @Inject constructor(
 
     fun onCodeChanged(v: String) =
         _state.update { it.copy(code = v.filter { c -> c.isDigit() }.take(6), error = null) }
+
+    fun onEmailChanged(v: String) =
+        _state.update { it.copy(email = v, error = null) }
+
+    fun onEmailCodeChanged(v: String) =
+        _state.update { it.copy(emailCode = v.filter { c -> c.isDigit() }.take(8), error = null) }
 
     fun onPasswordChanged(v: String) =
         _state.update { it.copy(password = v, error = null) }
@@ -165,18 +204,42 @@ class AuthViewModel @Inject constructor(
     }
 
     fun submitPhone() {
-        val s = _state.value
-        if (!s.phone.isE164()) {
-            _state.update { it.copy(error = "Enter a valid E.164 phone number") }
+        val cleaned = _state.value.phone.replace(Regex("[\\s\\-()]"), "").trim()
+        val normalized = if (cleaned.isNotEmpty() && !cleaned.startsWith("+")) "+$cleaned" else cleaned
+        if (!normalized.isE164()) {
+            _state.update { it.copy(error = "Enter a valid E.164 phone number (with country code, e.g. +15551234567)") }
             return
         }
-        runAuthAction { telegramClient.sendPhoneNumber(s.phone) }
+        _state.update { it.copy(phone = normalized, code = "", error = null) }
+        runAuthAction { telegramClient.sendPhoneNumber(normalized) }
+    }
+
+    fun startQrLogin() {
+        runAuthAction { telegramClient.requestQrCodeLogin() }
     }
 
     fun resendCode() {
         val s = _state.value
-        if (s.cooldownSeconds > 0 || s.loading || s.phone.isBlank()) return
-        runAuthAction { telegramClient.sendPhoneNumber(s.phone) }
+        if (s.resendWaitSeconds > 0 || s.cooldownSeconds > 0 || s.loading) return
+        runAuthAction { telegramClient.resendAuthCode() }
+    }
+
+    fun submitEmail() {
+        val email = _state.value.email.trim()
+        if (email.isBlank() || !email.contains("@")) {
+            _state.update { it.copy(error = "Enter a valid email address") }
+            return
+        }
+        runAuthAction { telegramClient.sendEmailAddress(email) }
+    }
+
+    fun submitEmailCode() {
+        val code = _state.value.emailCode.trim()
+        if (code.length < 4) {
+            _state.update { it.copy(error = "Code must be at least 4 digits") }
+            return
+        }
+        runAuthAction { telegramClient.sendEmailCode(code) }
     }
 
     fun submitCode() {
@@ -227,7 +290,20 @@ class AuthViewModel @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: TelegramException) {
-                _state.update { it.copy(loading = false, error = e.message) }
+                val raw = e.errorMessage.orEmpty()
+                val friendly = when {
+                    raw.contains("UPDATE_APP_TO_LOGIN", ignoreCase = true) ||
+                        raw.contains("PHONE_NUMBER_APP_SIGNUP_FORBIDDEN", ignoreCase = true) ->
+                        "Telegram blocked direct SMS login for this API key ($raw). Use \"Sign in with Telegram app / QR\" instead."
+                    raw.contains("API_ID_INVALID", ignoreCase = true) ->
+                        "Invalid Telegram API ID or API Hash. Double-check your credentials at my.telegram.org."
+                    raw.contains("PHONE_NUMBER_BANNED", ignoreCase = true) ->
+                        "This phone number is banned by Telegram."
+                    raw.contains("FLOOD_WAIT", ignoreCase = true) ->
+                        "Too many login attempts ($raw). Wait before retrying, or try QR sign-in later."
+                    else -> e.message ?: "Authentication error"
+                }
+                _state.update { it.copy(loading = false, error = friendly) }
             } catch (t: Throwable) {
                 Log.w("Auth action failed", t)
                 _state.update { it.copy(loading = false, error = t.message ?: "Unexpected error") }
@@ -236,6 +312,17 @@ class AuthViewModel @Inject constructor(
                     _state.update { it.copy(loading = false) }
                 }
             }
+        }
+    }
+
+    private fun startResendTimer(seconds: Int) {
+        resendTimerJob?.cancel()
+        resendTimerJob = viewModelScope.launch(dispatchers.io) {
+            for (sec in seconds downTo 1) {
+                _state.update { it.copy(resendWaitSeconds = sec) }
+                delay(1000)
+            }
+            _state.update { it.copy(resendWaitSeconds = 0) }
         }
     }
 

@@ -36,6 +36,7 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.navigation.compose)
+    implementation(libs.zxing.core)
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)

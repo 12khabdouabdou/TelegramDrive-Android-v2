@@ -19,11 +19,17 @@ interface TelegramClient : TelegramAuthObserver {
         const val MAX_FILE_SIZE: Long = 2L * 1024 * 1024 * 1024
     }
 
+    val authCodeInfo: StateFlow<AuthCodeInfo?>
+
     suspend fun initialize(apiId: Int, apiHash: String, sessionDir: String)
 
     // Auth
     suspend fun sendPhoneNumber(phone: String)
+    suspend fun resendAuthCode()
     suspend fun sendAuthCode(code: String)
+    suspend fun requestQrCodeLogin()
+    suspend fun sendEmailAddress(email: String)
+    suspend fun sendEmailCode(code: String)
     suspend fun sendAuthPassword(password: String)
     suspend fun registerNewUser(firstName: String, lastName: String)
     suspend fun logout()
