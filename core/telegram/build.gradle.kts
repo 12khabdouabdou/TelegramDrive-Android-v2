@@ -29,12 +29,8 @@ dependencies {
     api(project(":core:security"))
 
     // TDLib — prebuilt AAR from FaiBah/tdlib-android-prebuilt (v1.8.65, official
-    // tdlib/td@ a17f87c, Java interface). Contains:
-    //   - classes.jar with org.drinkless.tdlib.{TdApi,Client}
-    //   - jni/<abi>/libtdjni.so for arm64-v8a, armeabi-v7a, x86_64, x86
-    // The .so files are extracted into the APK at install time and loaded by
-    // TDLib's Client.create() via System.loadLibrary("tdjni").
-    api(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
+    // tdlib/td@ a17f87c, Java interface) exposed via :core:tdlib wrapper module.
+    api(project(":core:tdlib"))
 
     // Hilt
     implementation(libs.hilt.android)

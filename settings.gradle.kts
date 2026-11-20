@@ -29,6 +29,7 @@ include(":app")
 
 // Core modules
 include(":core:common")
+include(":core:tdlib")
 include(":core:telegram")
 include(":core:db")
 include(":core:datastore")

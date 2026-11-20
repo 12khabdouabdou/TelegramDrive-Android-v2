@@ -13,14 +13,16 @@ plugins {
 // Apply ktlint to every subproject so `./gradlew ktlintCheck` enforces
 // the style rules documented in CONTRIBUTING.md across all modules.
 subprojects {
-    apply(plugin = "org.jlleitschuh.gradle.ktlint")
+    if (path != ":core:tdlib") {
+        apply(plugin = "org.jlleitschuh.gradle.ktlint")
 
-    configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
-        version.set("1.3.1")
-        android.set(true)
-        // Don't fail builds on first run — there's existing style drift.
-        // Flip to true once the codebase is clean.
-        ignoreFailures.set(true)
+        configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
+            version.set("1.3.1")
+            android.set(true)
+            // Don't fail builds on first run — there's existing style drift.
+            // Flip to true once the codebase is clean.
+            ignoreFailures.set(true)
+        }
     }
 }
 
