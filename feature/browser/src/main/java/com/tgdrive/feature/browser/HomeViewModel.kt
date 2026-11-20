@@ -191,7 +191,7 @@ class HomeViewModel
                                 ),
                             )
                         } else if (local.title != f.title) {
-                            folderDao.updateTitle(local.id, f.title)
+                            folderDao.update(local.copy(title = f.title))
                         }
                     }
 
