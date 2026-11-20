@@ -1,0 +1,28 @@
+# Built artifacts
+*.apk
+*.aab
+*.dex
+
+# Gradle
+.gradle/
+.kotlin/
+build/
+build-cache/
+local.properties
+
+# Android
+*.iml
+.idea/
+.DS_Store
+captures/
+
+# Native
+*.so
+!src/main/jniLibs/**/*.so
+
+# TDLib session (don't commit user data)
+tgdrive_tdlib/
+
+# Editor
+*.swp
+*.swo

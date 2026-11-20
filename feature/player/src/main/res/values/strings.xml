@@ -1,0 +1,20 @@
+<resources>
+    <string name="player_back">Back</string>
+    <string name="player_downloading">Downloading…</string>
+    <string name="player_downloading_pct">Downloading… %d%%</string>
+    <string name="player_download_failed">Download failed</string>
+    <string name="player_retry">Retry</string>
+    <string name="player_pdf_page_counter">Page %1$d / %2$d</string>
+    <string name="player_pdf_error">Could not open PDF document</string>
+    <string name="player_pdf_empty">This PDF has no pages</string>
+    <string name="player_pdf_page_desc">PDF page %d</string>
+    <string name="player_image_desc">Image viewer</string>
+    <string name="player_image_error">Could not load image</string>
+    <string name="player_video_pip">Picture-in-picture</string>
+    <string name="player_video_error">Playback error</string>
+    <string name="player_audio_now_playing">Now playing</string>
+    <string name="player_audio_play">Play</string>
+    <string name="player_audio_pause">Pause</string>
+    <string name="player_audio_stop">Close player</string>
+    <string name="player_audio_seek">Seek audio position</string>
+</resources>

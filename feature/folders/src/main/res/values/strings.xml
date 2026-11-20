@@ -1,0 +1,12 @@
+<resources>
+    <string name="folders_new_title">New folder</string>
+    <string name="folders_rename_title">Rename folder</string>
+    <string name="folders_delete_title">Delete folder</string>
+    <string name="folders_name_label">Folder name</string>
+    <string name="folders_create">Create</string>
+    <string name="folders_save">Save</string>
+    <string name="folders_delete">Delete</string>
+    <string name="folders_cancel">Cancel</string>
+    <string name="folders_delete_confirm">Are you sure you want to delete \"%1$s\"?</string>
+    <string name="folders_delete_note">This will leave the Telegram channel and remove it from your folder list. Files already in the channel remain on Telegram\'s servers.</string>
+</resources>

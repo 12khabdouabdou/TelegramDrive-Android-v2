@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Deep Space Terminal palette -->
+    <color name="bg_root">#FF031524</color>
+    <color name="bg_surface">#FF111520</color>
+    <color name="bg_card">#FF161C2D</color>
+    <color name="accent_blue">#FF2D8CF0</color>
+    <color name="accent_teal">#FF00C9B1</color>
+    <color name="accent_amber">#FFF5A623</color>
+    <color name="accent_red">#FFE05252</color>
+    <color name="text_primary">#FFE8EDF5</color>
+    <color name="text_muted">#FF6B7A99</color>
+</resources>

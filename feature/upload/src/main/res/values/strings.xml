@@ -1,0 +1,17 @@
+<resources>
+    <string name="upload_zip_title">Upload folder as ZIP</string>
+    <string name="upload_zip_name_label">ZIP file name</string>
+    <string name="upload_zip_suffix">.zip</string>
+    <string name="upload_zip_password_protect">Password-protect ZIP</string>
+    <string name="upload_zip_password">Password</string>
+    <string name="upload_zip_confirm">Confirm password</string>
+    <string name="upload_zip_encrypt_desc">AES-256 encryption. Recipient needs the password to open.</string>
+    <string name="upload_zip_show_password">Show password</string>
+    <string name="upload_zip_hide_password">Hide password</string>
+    <string name="upload_zip_error_empty_name">ZIP name cannot be empty</string>
+    <string name="upload_zip_error_empty_password">Password cannot be empty</string>
+    <string name="upload_zip_error_mismatch">Passwords don\'t match</string>
+    <string name="upload_zip_error_short">Use at least 4 characters</string>
+    <string name="upload_zip_action">Upload</string>
+    <string name="upload_zip_cancel">Cancel</string>
+</resources>

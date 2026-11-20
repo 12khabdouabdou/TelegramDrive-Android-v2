@@ -1,0 +1,46 @@
+<resources>
+    <string name="auth_title">Telegram Drive</string>
+    <string name="auth_subtitle">Unlimited free cloud storage</string>
+    <string name="auth_welcome_back">Welcome back</string>
+
+    <string name="auth_phone_label">Phone number</string>
+    <string name="auth_phone_hint">+1 555 000 0000</string>
+    <string name="auth_phone_invalid">Enter a valid E.164 phone number</string>
+    <string name="auth_phone_continue">Continue</string>
+
+    <string name="auth_code_title">Enter code</string>
+    <string name="auth_code_subtitle">We sent a login code to %1$s</string>
+    <string name="auth_code_resend">Resend code</string>
+    <string name="auth_code_attempts_remaining">%1$d attempts remaining</string>
+    <string name="auth_code_cooldown">Try again in %1$ds</string>
+    <string name="auth_code_wrong">Wrong code</string>
+
+    <string name="auth_password_title">Two-step verification</string>
+    <string name="auth_password_subtitle">Enter your cloud password</string>
+    <string name="auth_password_label">Password</string>
+    <string name="auth_password_wrong">Wrong password</string>
+    <string name="auth_password_continue">Unlock</string>
+
+    <string name="auth_api_id">API ID</string>
+    <string name="auth_api_hash">API Hash</string>
+    <string name="auth_api_help">Get your API credentials at my.telegram.org</string>
+    <string name="auth_api_save">Save and continue</string>
+    <string name="auth_api_required">Both API ID and Hash are required</string>
+
+    <string name="auth_loading">Working…</string>
+    <string name="auth_error_generic">Login failed: %1$s</string>
+    <string name="auth_error_dismiss">Dismiss error</string>
+    <string name="auth_api_invalid_id">API ID must be a valid positive number</string>
+    <string name="auth_change_api_creds">Change API credentials</string>
+    <string name="auth_change_phone">Change phone number</string>
+    <string name="auth_password_show">Show password</string>
+    <string name="auth_password_hide">Hide password</string>
+    <string name="auth_registration_title">Complete registration</string>
+    <string name="auth_registration_subtitle">Enter your display name to create your Telegram account</string>
+    <string name="auth_first_name">First name</string>
+    <string name="auth_last_name">Last name (optional)</string>
+    <string name="auth_registration_required">First name is required</string>
+    <string name="auth_registration_submit">Create account</string>
+    <string name="auth_done_title">Connected</string>
+    <string name="auth_done_subtitle">Opening your cloud drive…</string>
+</resources>

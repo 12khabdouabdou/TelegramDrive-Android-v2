@@ -1,0 +1,20 @@
+<resources>
+    <string name="transfers_title">Transfers</string>
+    <string name="transfers_back">Back</string>
+    <string name="transfers_clear_completed">Clear completed</string>
+    <string name="transfers_tab_active">Active</string>
+    <string name="transfers_tab_completed">Completed</string>
+    <string name="transfers_tab_active_count">Active (%d)</string>
+    <string name="transfers_tab_completed_count">Completed (%d)</string>
+    <string name="transfers_empty_active">No active transfers</string>
+    <string name="transfers_empty_completed">No completed transfers</string>
+    <string name="transfers_empty_hint">Files you download or save will appear here</string>
+    <string name="transfers_status_queued">Queued</string>
+    <string name="transfers_status_downloading">Downloading…</string>
+    <string name="transfers_status_done">Completed</string>
+    <string name="transfers_status_failed">Failed</string>
+    <string name="transfers_status_cancelled">Cancelled</string>
+    <string name="transfers_cancel">Cancel download</string>
+    <string name="transfers_retry">Retry</string>
+    <string name="transfers_open_failed">No app found to open this file</string>
+</resources>

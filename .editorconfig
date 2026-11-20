@@ -1,0 +1,27 @@
+# ktlint configuration — enforces the style rules in CONTRIBUTING.md.
+# Run `./gradlew ktlintCheck` to verify, `./gradlew ktlintFormat` to auto-fix.
+
+root = true
+
+[*.{kt,kts}]
+# 4-space indent, no tabs (per CONTRIBUTING.md)
+indent_style = space
+indent_size = 4
+
+# Max line length 120 (per CONTRIBUTING.md)
+max_line_length = 120
+
+# No wildcard imports (per CONTRIBUTING.md)
+ktlint_standard_no-wildcard-imports = enabled
+
+# Ensure a newline at end of file
+ktlint_standard_final-newline = enabled
+
+# No trailing whitespace
+ktlint_standard_no-trailing-spaces = enabled
+
+# Imports alphabetical (per CONTRIBUTING.md)
+ktlint_standard_import-ordering = enabled
+
+# Disable the "no semicolons" rule for now — the codebase uses them sparingly
+ktlint_standard_no-semi = disabled

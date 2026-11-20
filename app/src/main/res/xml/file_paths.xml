@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- App's own cache/downloads dirs -->
+    <files-path name="cache" path="cache/" />
+    <files-path name="downloads" path="downloads/" />
+    <cache-path name="downloads_cache" path="downloads/" />
+    <cache-path name="shared_cache" path="shared/" />
+
+    <!--
+        ZIP browser extraction target. ZipBrowserViewModel.extractEntry()
+        writes to cacheDir/zip_extracts/. Without this entry,
+        FileProvider.getUriForFile() throws IllegalArgumentException
+        and "Open in external app" silently fails for every extracted
+        ZIP entry (videos, PDFs, audio — none would open).
+    -->
+    <cache-path name="zip_extracts" path="zip_extracts/" />
+
+    <!--
+        TDLib's own download destination. TdLibTelegramClient.downloadFile()
+        lets TDLib place files under filesDir/tgdrive_tdlib/files/... — without
+        this entry, FileProvider.getUriForFile() throws IllegalArgumentException
+        and "Open in external app" silently fails (test checklist §16).
+    -->
+    <files-path name="tdlib_files" path="tgdrive_tdlib/files/" />
+    <files-path name="tdlib_thumbs" path="tgdrive_tdlib/thumbnails/" />
+</paths>

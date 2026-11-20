@@ -1,0 +1,68 @@
+<resources>
+    <string name="app_name">Telegram Drive</string>
+
+    <!-- Tabs -->
+    <string name="tab_home">Files</string>
+    <string name="tab_folders">Folders</string>
+    <string name="tab_transfers">Transfers</string>
+    <string name="tab_backup">Backup</string>
+    <string name="tab_settings">Settings</string>
+
+    <!-- Notification channels -->
+    <string name="channel_backup_progress">Backup in progress</string>
+    <string name="channel_backup_progress_desc">Shows when AutoBackup is uploading files</string>
+    <string name="channel_backup_result">Backup results</string>
+    <string name="channel_backup_result_desc">Notifies you when a backup job finishes or fails</string>
+    <string name="channel_download_progress">Downloads</string>
+    <string name="channel_upload_progress">Uploads</string>
+
+    <!-- Backup notification actions -->
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_retry">Retry</string>
+
+    <!-- Backup notification text -->
+    <string name="notif_backup_running">Backing up %1$d of %2$d files</string>
+    <string name="notif_backup_success">Backup complete: %1$d uploaded, %2$d skipped</string>
+    <string name="notif_backup_partial">Backup partially failed: %1$d uploaded, %2$d failed</string>
+    <string name="notif_backup_failed">Backup failed. Tap to retry.</string>
+
+    <!-- Biometric gate -->
+    <string name="biometric_prompt_title">Unlock Telegram Drive</string>
+    <string name="biometric_prompt_subtitle">Use your fingerprint or face to unlock</string>
+    <string name="biometric_locked_title">App locked</string>
+    <string name="biometric_locked_subtitle">Authenticate to continue</string>
+
+    <!-- Share-to-app dialog -->
+    <string name="share_upload_title_one">Upload 1 file?</string>
+    <string name="share_upload_title_many">Upload %1$d files?</string>
+    <string name="share_upload_body_one">Upload 1 file to Saved Messages?</string>
+    <string name="share_upload_body_many">Upload %1$d files to Saved Messages?</string>
+    <string name="share_upload_action">Upload</string>
+
+    <!-- Onboarding -->
+    <string name="onboarding_skip">Skip</string>
+    <string name="onboarding_next">Next</string>
+    <string name="onboarding_get_started">Get started</string>
+    <string name="onboarding_slide1_title">Infinite storage\nvia Telegram</string>
+    <string name="onboarding_slide1_body">Telegram Drive uses your Saved Messages and private channels as a cloud drive. Every file is stored on Telegram\'s servers — free, fast, and accessible from any device.</string>
+    <string name="onboarding_slide2_title">Upload anything,\nanywhere</string>
+    <string name="onboarding_slide2_body">Tap the + button to pick files from your device, or upload an entire folder as a ZIP archive — with optional password protection. Files up to 2 GB each are supported.</string>
+    <string name="onboarding_slide3_title">AutoBackup keeps\nyour data safe</string>
+    <string name="onboarding_slide3_body">Pick device folders and a schedule. Telegram Drive syncs new and changed files to Telegram automatically — over Wi-Fi only, while charging, or however you configure it.</string>
+    <string name="onboarding_slide4_title">Locked with\nbiometrics</string>
+    <string name="onboarding_slide4_body">Enable biometric lock in Settings to require fingerprint or face authentication when returning to the app. Your session stays encrypted on-device via Android Keystore.</string>
+
+    <!-- Common -->
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="confirm">Confirm</string>
+    <string name="delete">Delete</string>
+    <string name="rename">Rename</string>
+    <string name="move">Move</string>
+    <string name="download">Download</string>
+    <string name="share">Share</string>
+    <string name="retry">Retry</string>
+    <string name="error_generic">Something went wrong</string>
+</resources>

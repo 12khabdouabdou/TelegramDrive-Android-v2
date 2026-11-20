@@ -1,0 +1,31 @@
+# Build & runtime notes
+
+## JDK
+Telegram Drive requires **JDK 17** to build. AGP 8.5+ also supports JDK 21.
+Set `JAVA_HOME` to your JDK 17 install before running `./gradlew`.
+
+## Android SDK
+- compileSdk 35
+- minSdk 26
+- targetSdk 35
+- Build Tools 35.0.0
+
+Install via Android Studio SDK Manager or:
+```
+sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+```
+
+## TDLib native libraries
+The :core:telegram module depends on `it.tdlight:tdlight-java` and
+`it.tdlight:tdlight-natives`. The natives artifact ships prebuilt `.so` files
+for `arm64-v8a`, `armeabi-v7a`, and `x86_64`. No manual JNI compilation
+required.
+
+If TDLight Maven artifacts are unreachable from your network, see
+`docs/TDLIB_SETUP.md` for building TDLib from source.
+
+## First build
+```
+./gradlew :app:assembleDebug
+```
+Output APK: `app/build/outputs/apk/debug/app-debug.apk`

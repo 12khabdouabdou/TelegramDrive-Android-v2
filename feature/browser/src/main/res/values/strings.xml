@@ -1,0 +1,182 @@
+<resources>
+    <string name="browser_home">Telegram Drive</string>
+    <string name="browser_saved_messages">Saved Messages</string>
+    <string name="browser_saved_messages_subtitle">Sync files here directly</string>
+    <string name="browser_connecting">Connecting…</string>
+    <string name="browser_folders">Folders</string>
+    <string name="browser_your_folders">Your folders</string>
+    <string name="browser_search">Search</string>
+    <string name="browser_search_all_hint">Search all folders…</string>
+    <string name="browser_search_idle">Type to search across all folders</string>
+    <string name="browser_search_empty">No files found for \"%1$s\"</string>
+    <string name="browser_search_results_one">1 result</string>
+    <string name="browser_search_results_many">%1$d results</string>
+    <string name="browser_clear">Clear</string>
+    <string name="browser_retry">Retry</string>
+    <string name="browser_back">Back</string>
+    <string name="browser_more">More</string>
+    <string name="browser_dismiss">Dismiss</string>
+
+    <!-- Home Dashboard -->
+    <string name="browser_storage_status">STORAGE STATUS</string>
+    <string name="browser_unlimited_storage">Unlimited Storage</string>
+    <string name="browser_storage_summary">%1$s cached · %2$d files · Unlimited via Telegram</string>
+    <string name="browser_storage_tagline">Free, unlimited cloud storage via Telegram</string>
+    <string name="browser_cat_photos">Photos</string>
+    <string name="browser_cat_videos">Videos</string>
+    <string name="browser_cat_docs">Docs</string>
+    <string name="browser_cat_audio">Audio</string>
+    <string name="browser_starred_files">Starred</string>
+    <string name="browser_recent_files">Recent Files</string>
+    <string name="browser_channel_subtitle">Telegram channel</string>
+    <string name="browser_channel_size_subtitle">%1$s · Telegram channel</string>
+
+    <!-- Folder Screen -->
+    <string name="browser_empty_folder">No files yet</string>
+    <string name="browser_empty_folder_desc">Upload files via the + button — they\'ll appear here.</string>
+    <string name="browser_empty_filtered">No matching files</string>
+    <string name="browser_empty_filtered_desc">No files match your current search or filter.</string>
+    <string name="browser_clear_filters">Clear filters</string>
+    <string name="browser_empty_folders">No folders yet</string>
+    <string name="browser_empty_folders_desc">Tap + to create a private Telegram channel as a folder.</string>
+    <string name="browser_pull_to_refresh">Pull to refresh</string>
+    <string name="browser_loading">Loading…</string>
+    <string name="browser_selected_count">%1$d selected</string>
+    <string name="browser_action_select_all">Select all</string>
+    <string name="browser_action_clear_selection">Clear selection</string>
+    <string name="browser_action_delete">Delete</string>
+    <string name="browser_action_move">Move</string>
+    <string name="browser_action_download">Download</string>
+    <string name="browser_action_sort">Sort</string>
+    <string name="browser_action_upload">Upload</string>
+    <string name="browser_upload_files">Upload files</string>
+    <string name="browser_upload_zip">Upload folder as ZIP</string>
+    <string name="browser_view_grid">Switch to grid view</string>
+    <string name="browser_view_list">Switch to list view</string>
+    <string name="browser_starred_badge">Starred</string>
+    <string name="browser_upload_done">Done</string>
+    <string name="browser_upload_failed">Failed</string>
+    <string name="browser_no_app_error">No app installed to open this file</string>
+
+    <!-- Delete confirmation -->
+    <string name="browser_delete_confirm_title_one">Delete file?</string>
+    <string name="browser_delete_confirm_title_many">Delete %1$d files?</string>
+    <string name="browser_delete_confirm_body_one">Delete \"%1$s\" permanently from Telegram? This cannot be undone.</string>
+    <string name="browser_delete_confirm_body_many">Delete %1$d selected files permanently from Telegram? This cannot be undone.</string>
+    <string name="browser_cancel">Cancel</string>
+
+    <!-- Filter chips & Sort labels -->
+    <string name="browser_filter_all">All</string>
+    <string name="browser_filter_images">Images</string>
+    <string name="browser_filter_videos">Videos</string>
+    <string name="browser_filter_audio">Audio</string>
+    <string name="browser_filter_docs">Docs</string>
+    <string name="browser_filter_archives">Archives</string>
+    <string name="browser_sort_name_asc">Name A→Z</string>
+    <string name="browser_sort_name_desc">Name Z→A</string>
+    <string name="browser_sort_size_asc">Size small→large</string>
+    <string name="browser_sort_size_desc">Size large→small</string>
+    <string name="browser_sort_date_asc">Date old→new</string>
+    <string name="browser_sort_date_desc">Date new→old</string>
+
+    <!-- File Details Sheet -->
+    <string name="details_downloaded">✓ Downloaded</string>
+    <string name="details_not_downloaded">Not downloaded</string>
+    <string name="details_size">Size</string>
+    <string name="details_type">Type</string>
+    <string name="details_type_unknown">Unknown</string>
+    <string name="details_date">Date</string>
+    <string name="details_message_id">Message ID</string>
+    <string name="details_remote_id">Remote ID</string>
+    <string name="details_redownload">Re-download</string>
+    <string name="details_download">Download</string>
+    <string name="details_copy_downloads">Copy to Downloads</string>
+    <string name="details_move">Move to folder</string>
+    <string name="details_star">Star</string>
+    <string name="details_unstar">Unstar</string>
+    <string name="details_share_link">Copy share link</string>
+    <string name="details_delete">Delete</string>
+
+    <!-- Folder management & Move picker -->
+    <string name="folders_title">Folders</string>
+    <string name="folders_create">Create folder</string>
+    <string name="folders_rename">Rename</string>
+    <string name="folders_rename_title">Rename folder</string>
+    <string name="folders_name_label">Folder name</string>
+    <string name="folders_change_color">Change color</string>
+    <string name="folders_pick_color_title">Choose folder color</string>
+    <string name="folders_delete">Delete</string>
+    <string name="folders_delete_title">Delete folder?</string>
+    <string name="folders_delete_body">Delete \"%1$s\"? This will leave/delete the Telegram channel. Files already on Telegram are not affected.</string>
+    <string name="move_picker_title">Move to folder</string>
+    <string name="move_picker_loading">Loading folders…</string>
+    <string name="move_picker_empty">No other folders available. Create one from the Folders tab first.</string>
+    <string name="move_picker_type_saved">Saved Messages</string>
+    <string name="move_picker_type_channel">Private channel</string>
+    <string name="move_picker_type_chat">Chat</string>
+
+    <!-- Storage Analytics dashboard -->
+    <string name="analytics_title">Storage Analytics</string>
+    <string name="analytics_entry_title">Storage analytics</string>
+    <string name="analytics_entry_subtitle">Total usage · duplicates · backup coverage</string>
+    <string name="analytics_refresh">Refresh</string>
+    <string name="analytics_retry">Retry</string>
+    <string name="analytics_error_title">Couldn\'t load analytics</string>
+    <string name="analytics_total_stored">Total stored</string>
+    <string name="analytics_total_label">total</string>
+    <string name="analytics_no_data">No data</string>
+    <string name="analytics_summary_counts">%1$d files · %2$d folders · %3$d starred</string>
+    <string name="analytics_label_files">files</string>
+    <string name="analytics_label_starred">starred</string>
+    <string name="analytics_label_folders">folders</string>
+    <string name="analytics_by_folder">By folder</string>
+    <string name="analytics_by_type">By file type</string>
+    <string name="analytics_dedup_title">Duplicates</string>
+    <string name="analytics_dedup_none_title">No duplicates</string>
+    <string name="analytics_dedup_none_desc">Every file in your storage is unique — no wasted space.</string>
+    <string name="analytics_dedup_summary">%1$d group(s) · %2$d total copies</string>
+    <string name="analytics_dedup_top_offenders">Top offenders</string>
+    <string name="analytics_backup_title">AutoBackup coverage</string>
+    <string name="analytics_backup_summary">%1$d file(s) synced</string>
+    <string name="analytics_backup_last_sync"> · last %1$s</string>
+    <string name="analytics_empty_title">No files yet</string>
+    <string name="analytics_empty_desc">Upload or sync files to see storage analytics here.</string>
+    <string name="analytics_legend_format">%1$s: %2$s · %3$d file(s)</string>
+    <string name="analytics_folder_subtitle">%1$d files · last %2$s</string>
+    <string name="analytics_folder_subtitle_no_date">%1$d files</string>
+
+    <!-- ZIP Browser -->
+    <string name="zip_browser_title">ZIP Browser</string>
+    <string name="zip_browser_entries_count">%1$d entries</string>
+    <string name="zip_browser_reading">Reading ZIP…</string>
+    <string name="zip_browser_downloading">Downloading %1$s…</string>
+    <string name="zip_browser_downloading_progress">Downloading %1$s (%2$d%%)…</string>
+    <string name="zip_browser_download_hint">Tap back if this takes too long.</string>
+    <string name="zip_browser_download_failed">ZIP download failed</string>
+    <string name="zip_browser_error_title">Couldn\'t open ZIP</string>
+    <string name="zip_browser_empty">ZIP is empty</string>
+    <string name="zip_browser_root">Root</string>
+    <string name="zip_browser_folder_label">Folder</string>
+    <string name="zip_browser_compressed_suffix"> · compressed %1$s</string>
+    <string name="zip_browser_encrypted_suffix"> · encrypted</string>
+    <string name="zip_browser_password_required_title">Password required</string>
+    <string name="zip_browser_password_required_desc">Enter the password to extract \'%1$s\'</string>
+    <string name="zip_browser_password_label">Password</string>
+    <string name="zip_browser_show_password">Show password</string>
+    <string name="zip_browser_hide_password">Hide password</string>
+    <string name="zip_browser_extract_button">Extract</string>
+    <string name="zip_browser_cancel_button">Cancel</string>
+    <string name="zip_browser_dismiss_button">Dismiss</string>
+    <string name="zip_browser_back">Back</string>
+    <string name="zip_browser_encrypted_icon">Encrypted</string>
+    <string name="zip_browser_folder_empty">This folder is empty</string>
+    <string name="zip_browser_folder_items">%1$d items</string>
+    <string name="zip_browser_retry">Retry</string>
+    <string name="zip_browser_password_show">Show password</string>
+    <string name="zip_browser_password_hide">Hide password</string>
+    <string name="zip_browser_dismiss">Dismiss</string>
+    <string name="zip_browser_no_viewer">No app found to open this file</string>
+    <string name="analytics_back">Back</string>
+    <string name="analytics_files_bytes">%1$d files · %2$s</string>
+    <string name="analytics_donut_desc">Storage usage distribution by file category</string>
+</resources>
