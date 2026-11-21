@@ -38,6 +38,13 @@ subprojects {
         // above doesn't always apply on the first configuration pass).
         tasks.withType<Test>().configureEach {
             useJUnitPlatform()
+            // Route Robolectric runtime SDK artifact downloads through Google's
+            // Maven Central mirror so shared CI runners avoid repo1.maven.org HTTP 429s.
+            systemProperty(
+                "robolectric.dependency.repo.url",
+                "https://maven-central.storage-download.googleapis.com/maven2/",
+            )
+            systemProperty("robolectric.dependency.repo.id", "google-central-mirror")
             // Force test discovery — without this, Gradle sometimes reports
             // 0 tests even though the classes compile and have @Test annotations.
             testLogging {
