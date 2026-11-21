@@ -269,9 +269,11 @@ class VideoPlayerViewModel @Inject constructor(
                         parts += "${String.format(Locale.US, "%.1f", sec)}s"
                     }
                 }
-                exif.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.takeIf { it.isNotBlank() }?.let { iso ->
-                    parts += "ISO $iso"
-                }
+                (exif.getAttribute("ISOSpeedRatings") ?: exif.getAttribute("PhotographicSensitivity"))
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { iso ->
+                        parts += "ISO $iso"
+                    }
                 exif.getAttribute(ExifInterface.TAG_FOCAL_LENGTH)?.let { raw ->
                     val segs = raw.split('/')
                     val mm = if (segs.size == 2) {
