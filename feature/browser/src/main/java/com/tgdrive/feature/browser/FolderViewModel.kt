@@ -253,7 +253,7 @@ class FolderViewModel
                         .map { st ->
                             st.items
                                 .filter { it.chatId == chatId && it.status == DownloadStatus.DONE }
-                                .map { it.messageId to it.localPath }
+                                .map { it.id to it.localPath }
                         }.distinctUntilChanged()
                         .collect {
                             refreshLocalThumbnails(chatId, _items.value)
