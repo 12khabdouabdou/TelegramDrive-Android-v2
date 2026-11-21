@@ -6,6 +6,7 @@ import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileViewMode
@@ -117,20 +118,19 @@ class HomeViewModel
 
                     val counts = mutableMapOf<FileFilter, Int>()
                     val perChatFilterCounts = mutableMapOf<FileFilter, MutableMap<Long, Int>>()
-                    for (chatId in fileCacheDao.getAllChatIds()) {
-                        for (file in fileCacheDao.forChat(chatId)) {
-                            val filter = when (classifyFile(file.mimeType, file.fileName)) {
-                                FileBucket.IMAGES -> FileFilter.IMAGES
-                                FileBucket.VIDEOS -> FileFilter.VIDEOS
-                                FileBucket.AUDIO -> FileFilter.AUDIO
-                                FileBucket.PDF, FileBucket.DOCUMENTS -> FileFilter.DOCUMENTS
-                                FileBucket.ARCHIVES -> FileFilter.ARCHIVES
-                                FileBucket.OTHER -> continue
-                            }
-                            counts[filter] = (counts[filter] ?: 0) + 1
-                            val map = perChatFilterCounts.getOrPut(filter) { mutableMapOf() }
-                            map[chatId] = (map[chatId] ?: 0) + 1
+                    for (file in fileCacheDao.getAll()) {
+                        val chatId = file.chatId
+                        val filter = when (classifyFile(file.mimeType, file.fileName)) {
+                            FileBucket.IMAGES -> FileFilter.IMAGES
+                            FileBucket.VIDEOS -> FileFilter.VIDEOS
+                            FileBucket.AUDIO -> FileFilter.AUDIO
+                            FileBucket.PDF, FileBucket.DOCUMENTS -> FileFilter.DOCUMENTS
+                            FileBucket.ARCHIVES -> FileFilter.ARCHIVES
+                            FileBucket.OTHER -> continue
                         }
+                        counts[filter] = (counts[filter] ?: 0) + 1
+                        val map = perChatFilterCounts.getOrPut(filter) { mutableMapOf() }
+                        map[chatId] = (map[chatId] ?: 0) + 1
                     }
 
                     val targets = perChatFilterCounts.mapValues { (_, byChat) ->
@@ -219,10 +219,11 @@ class HomeViewModel
 
         fun openOrPreviewFile(
             file: FileCacheEntity,
-            onOpenVideo: (Long) -> Unit,
-            onOpenImage: (String) -> Unit,
+            onOpenVideo: (Long, Long) -> Unit,
+            onOpenImage: (Long, Long) -> Unit,
             onOpenPdf: (Long) -> Unit,
             onOpenZip: (Long) -> Unit,
+            onOpenText: (Long, Long) -> Unit,
             onOpenFolder: (Long, String) -> Unit,
         ) {
             viewModelScope.launch(dispatchers.io) {
@@ -234,8 +235,8 @@ class HomeViewModel
             }
             val bucket = classifyFile(file.mimeType, file.fileName)
             val needsDownload = run {
-                val item = downloadManager.state.value.items
-                    .find { it.id == file.messageId && it.status == DownloadStatus.DONE }
+                val item = downloadManager.findItem(file.chatId, file.messageId)
+                    ?.takeIf { it.status == DownloadStatus.DONE }
                 val path = item?.localPath
                 path == null || !File(path).exists()
             }
@@ -244,6 +245,7 @@ class HomeViewModel
                     downloadManager.enqueue(
                         DownloadItem(
                             id = file.messageId,
+                            chatId = file.chatId,
                             remoteId = file.remoteId,
                             fileName = file.fileName,
                             totalBytes = file.fileSize,
@@ -257,16 +259,19 @@ class HomeViewModel
                     onOpenZip(file.messageId)
                 }
                 bucket == FileBucket.VIDEOS -> {
-                    enqueueIfNeeded()
-                    onOpenVideo(file.messageId)
+                    onOpenVideo(file.chatId, file.messageId)
                 }
                 bucket == FileBucket.IMAGES -> {
                     enqueueIfNeeded()
-                    onOpenImage(file.messageId.toString())
+                    onOpenImage(file.chatId, file.messageId)
                 }
                 bucket == FileBucket.PDF -> {
                     enqueueIfNeeded()
                     onOpenPdf(file.messageId)
+                }
+                isTextPreviewable(file.mimeType, file.fileName) -> {
+                    enqueueIfNeeded()
+                    onOpenText(file.chatId, file.messageId)
                 }
                 else -> {
                     val title = state.value.folders.find { it.channelId == file.chatId }?.title ?: "Saved Messages"

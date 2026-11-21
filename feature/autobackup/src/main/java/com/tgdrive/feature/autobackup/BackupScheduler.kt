@@ -1,6 +1,9 @@
 package com.tgdrive.feature.autobackup
 
 import android.content.Context
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.Data
@@ -43,6 +46,7 @@ class BackupScheduler @Inject constructor(
     companion object {
         const val PERIODIC_WORK_NAME = "autobackup_periodic"
         const val ONE_TIME_WORK_NAME = "autobackup_onetime"
+        const val CONTENT_TRIGGER_WORK_NAME = "autobackup_content_trigger"
         const val TAG = "autobackup"
     }
 
@@ -51,6 +55,7 @@ class BackupScheduler @Inject constructor(
         val prefs = preferences.data.first()
         if (!prefs.backupEnabled || prefs.backupPaused) {
             cancelPeriodic()
+            cancelContentTrigger()
             return
         }
         val constraints = Constraints.Builder()
@@ -64,11 +69,18 @@ class BackupScheduler @Inject constructor(
         val intervalMin = when (prefs.backupSchedule) {
             BackupSchedule.DAILY -> 24L * 60
             BackupSchedule.WEEKLY -> 7L * 24 * 60
-            BackupSchedule.ON_CHANGE, BackupSchedule.MANUAL -> {
+            BackupSchedule.ON_CHANGE -> {
                 cancelPeriodic()
+                armContentUriTriggerIfEnabled()
+                return
+            }
+            BackupSchedule.MANUAL -> {
+                cancelPeriodic()
+                cancelContentTrigger()
                 return
             }
         }
+        cancelContentTrigger()
 
         // Minimum WorkManager interval is 15 minutes.
         val interval = intervalMin.coerceAtLeast(15)
@@ -185,6 +197,65 @@ class BackupScheduler @Inject constructor(
         }
     }
 
+    /**
+     * Arms a WorkManager ContentUriTrigger worker for background ON_CHANGE detection
+     * across selected SAF trees and MediaStore even when the app process is terminated.
+     */
+    suspend fun armContentUriTriggerIfEnabled() {
+        val prefs = preferences.data.first()
+        if (!prefs.backupEnabled || prefs.backupPaused || prefs.backupSchedule != BackupSchedule.ON_CHANGE) {
+            cancelContentTrigger()
+            return
+        }
+        val builder = Constraints.Builder()
+            .setRequiredNetworkType(
+                if (prefs.backupWifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED,
+            )
+            .setRequiresBatteryNotLow(true)
+            .setRequiresCharging(prefs.backupChargingOnly)
+            .setTriggerContentUpdateDelay(15, TimeUnit.SECONDS)
+            .setTriggerContentMaxDelay(2, TimeUnit.MINUTES)
+
+        var triggerCount = 0
+        for (raw in prefs.backupFolderUris) {
+            runCatching {
+                val treeUri = Uri.parse(raw)
+                val docId = DocumentsContract.getTreeDocumentId(treeUri)
+                val childUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                builder.addContentUriTrigger(childUri, true)
+                triggerCount++
+            }
+        }
+        runCatching {
+            builder.addContentUriTrigger(MediaStore.Files.getContentUri("external"), true)
+            triggerCount++
+        }
+        if (triggerCount == 0) return
+
+        val req = OneTimeWorkRequestBuilder<BackupWorker>()
+            .addTag(TAG)
+            .addTag("content_trigger")
+            .setConstraints(builder.build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setInputData(
+                Data.Builder()
+                    .putString(BackupWorker.KEY_JOB_ID, "contentTrigger_${System.currentTimeMillis()}")
+                    .putBoolean(BackupWorker.KEY_IS_MANUAL, false)
+                    .build(),
+            )
+            .build()
+        WorkManager.getInstance(ctx).enqueueUniqueWork(
+            CONTENT_TRIGGER_WORK_NAME,
+            ExistingWorkPolicy.REPLACE,
+            req,
+        )
+        Log.i("BackupScheduler: armed ContentUriTrigger ($triggerCount URIs)")
+    }
+
+    fun cancelContentTrigger() {
+        WorkManager.getInstance(ctx).cancelUniqueWork(CONTENT_TRIGGER_WORK_NAME)
+    }
+
     fun cancelPeriodic() {
         WorkManager.getInstance(ctx).cancelUniqueWork(PERIODIC_WORK_NAME)
         Log.i("BackupScheduler: cancelled periodic")
@@ -193,5 +264,6 @@ class BackupScheduler @Inject constructor(
     fun cancelAll() {
         WorkManager.getInstance(ctx).cancelAllWorkByTag(TAG)
         cancelPeriodic()
+        cancelContentTrigger()
     }
 }

@@ -67,11 +67,32 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_3_4 = object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN is_pinned_offline INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_chat_id_date ON file_cache(chat_id, date)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_file_name_file_size ON file_cache(file_name, file_size)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_last_accessed ON file_cache(last_accessed)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_is_pinned_offline ON file_cache(is_pinned_offline)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_synced_files_sha256 ON synced_files(sha256)")
+            db.execSQL(
+                """
+                DELETE FROM synced_files
+                WHERE id NOT IN (
+                    SELECT MAX(id) FROM synced_files GROUP BY local_path, folder_id
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_synced_files_local_path_folder_id ON synced_files(local_path, folder_id)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_sync_log_started_at ON sync_log(started_at)")
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()

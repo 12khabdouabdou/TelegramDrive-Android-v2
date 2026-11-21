@@ -11,10 +11,13 @@
     <string name="transfers_empty_hint">Files you download or save will appear here</string>
     <string name="transfers_status_queued">Queued</string>
     <string name="transfers_status_downloading">Downloading…</string>
+    <string name="transfers_status_uploading">Uploading…</string>
     <string name="transfers_status_done">Completed</string>
+    <string name="transfers_upload_done">Uploaded</string>
     <string name="transfers_status_failed">Failed</string>
     <string name="transfers_status_cancelled">Cancelled</string>
     <string name="transfers_cancel">Cancel download</string>
+    <string name="transfers_dismiss">Dismiss</string>
     <string name="transfers_retry">Retry</string>
     <string name="transfers_open_failed">No app found to open this file</string>
 </resources>

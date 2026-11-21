@@ -80,11 +80,17 @@ interface FileCacheDao {
     @Query("SELECT * FROM file_cache WHERE is_starred = 1 ORDER BY date DESC LIMIT 100")
     suspend fun getStarred(): List<FileCacheEntity>
 
-    @Query("SELECT * FROM file_cache ORDER BY last_accessed DESC LIMIT 50")
+    @Query("SELECT * FROM file_cache WHERE last_accessed > 0 ORDER BY last_accessed DESC LIMIT 50")
     suspend fun getRecent(): List<FileCacheEntity>
 
     @Query("UPDATE file_cache SET is_starred = :starred WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun setStarred(chatId: Long, messageId: Long, starred: Boolean)
+
+    @Query("UPDATE file_cache SET is_pinned_offline = :pinned WHERE message_id = :messageId AND chat_id = :chatId")
+    suspend fun setPinnedOffline(chatId: Long, messageId: Long, pinned: Boolean)
+
+    @Query("SELECT * FROM file_cache WHERE is_pinned_offline = 1 ORDER BY date DESC")
+    suspend fun getPinnedOffline(): List<FileCacheEntity>
 
     @Query("UPDATE file_cache SET last_accessed = :timestamp WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun updateLastAccessed(chatId: Long, messageId: Long, timestamp: Long)
@@ -100,6 +106,9 @@ interface FileCacheDao {
 
     @Query("SELECT DISTINCT chat_id FROM file_cache")
     suspend fun getAllChatIds(): List<Long>
+
+    @Query("SELECT * FROM file_cache ORDER BY date DESC")
+    suspend fun getAll(): List<FileCacheEntity>
 
     /**
      * Per-chat aggregate used by the Storage Analytics dashboard.

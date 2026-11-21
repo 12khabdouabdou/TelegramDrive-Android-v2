@@ -72,13 +72,19 @@ fun CacheSettingsScreen(
     val scope = rememberCoroutineScope()
 
     var cacheSize by remember { mutableLongStateOf(0L) }
+    var pinnedCount by remember { mutableStateOf(0) }
+    var pinnedBytes by remember { mutableLongStateOf(0L) }
     var showClearDialog by remember { mutableStateOf(false) }
 
     val clearedMsg = stringResource(R.string.settings_cache_cleared)
+    val pinsClearedMsg = stringResource(R.string.settings_cache_pins_cleared)
     val bottomPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
     LaunchedEffect(Unit) {
         cacheSize = measureTdlibCache(context)
+        val (count, bytes) = vm.offlinePinStats()
+        pinnedCount = count
+        pinnedBytes = bytes
     }
 
     if (showClearDialog) {
@@ -181,6 +187,33 @@ fun CacheSettingsScreen(
                     subtitle = stringResource(R.string.settings_cache_tdlib_desc),
                     tint = MaterialTheme.colorScheme.primary,
                 )
+
+                CalloutCard(
+                    label = stringResource(R.string.settings_cache_pins_label),
+                    value = pinnedBytes.toHumanSize(),
+                    subtitle = stringResource(R.string.settings_cache_pins_desc, pinnedCount),
+                    tint = MaterialTheme.colorScheme.secondary,
+                )
+
+                if (pinnedCount > 0) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                vm.clearOfflinePins()
+                                pinnedCount = 0
+                                pinnedBytes = 0L
+                                snackbarHostState.showSnackbar(pinsClearedMsg)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.settings_cache_pins_clear),
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
 
                 Button(
                     onClick = { showClearDialog = true },

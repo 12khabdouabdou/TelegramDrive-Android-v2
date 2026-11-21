@@ -180,4 +180,14 @@
     <string name="analytics_back">Back</string>
     <string name="analytics_files_bytes">%1$d files · %2$s</string>
     <string name="analytics_donut_desc">Storage usage distribution by file category</string>
+    <string name="details_pin_offline">Keep offline</string>
+    <string name="details_unpin_offline">Remove offline copy</string>
+    <string name="analytics_dedup_cleanup_hint">Tap an entry to review and delete duplicates</string>
+    <string name="analytics_dedup_dialog_title">Duplicate copies</string>
+    <string name="analytics_dedup_dialog_keep">Keep</string>
+    <string name="analytics_dedup_dialog_delete_n">Delete %d duplicate(s)</string>
+    <string name="analytics_dedup_cancel">Cancel</string>
+    <string name="folder_zip_preparing_parts">Creating multi-part ZIP for %1$s…</string>
+    <string name="folder_zip_uploading_part">Uploading %1$s (part %2$d)…</string>
+    <string name="folder_zip_manifest_uploaded">Uploaded %1$d part(s) with manifest</string>
 </resources>

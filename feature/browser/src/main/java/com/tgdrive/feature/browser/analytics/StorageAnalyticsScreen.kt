@@ -26,12 +26,17 @@ import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.PieChartOutline
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -55,7 +60,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
-import com.tgdrive.designsystem.editorial.EditorialKeyValueRow
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.browser.R
 
@@ -72,6 +76,7 @@ fun StorageAnalyticsScreen(
     vm: StorageAnalyticsViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val dupDialog by vm.duplicateDialog.collectAsStateWithLifecycle()
 
     Column(
         modifier = Modifier
@@ -97,9 +102,19 @@ fun StorageAnalyticsScreen(
                         onBack = onBack,
                         onRefresh = { vm.refresh() },
                         onOpenFolder = onOpenFolder,
+                        onInspectDuplicate = { fileName, fileSize -> vm.inspectDuplicate(fileName, fileSize) },
                     )
                 }
         }
+    }
+
+    dupDialog?.let { dlg ->
+        DuplicateCleanupDialog(
+            state = dlg,
+            onSelectKeep = { chatId, msgId -> vm.selectKeepCopy(chatId, msgId) },
+            onDeleteDuplicates = { vm.confirmDeleteDuplicates() },
+            onDismiss = { vm.dismissDuplicateDialog() },
+        )
     }
 }
 
@@ -199,6 +214,7 @@ private fun EditorialDashboard(
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onOpenFolder: (Long, String) -> Unit,
+    onInspectDuplicate: (String, Long) -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -356,7 +372,10 @@ private fun EditorialDashboard(
         // ── 4. Deduplication Callout ──
         item {
             Box(modifier = Modifier.padding(horizontal = 24.dp)) {
-                DedupCallout(report.dedup)
+                DedupCallout(
+                    dedup = report.dedup,
+                    onInspectDuplicate = onInspectDuplicate,
+                )
             }
         }
 
@@ -480,7 +499,10 @@ private fun FolderPagerCard(
 }
 
 @Composable
-private fun DedupCallout(dedup: StorageAnalytics.DedupStat) {
+private fun DedupCallout(
+    dedup: StorageAnalytics.DedupStat,
+    onInspectDuplicate: (String, Long) -> Unit,
+) {
     if (dedup.duplicateGroups == 0) {
         EditorialCalloutCard(
             title = "✓ ${stringResource(R.string.analytics_dedup_none_title)}",
@@ -525,15 +547,118 @@ private fun DedupCallout(dedup: StorageAnalytics.DedupStat) {
                     style = TgTypography.Display.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                for (o in dedup.topOffenders.take(3)) {
-                    EditorialKeyValueRow(
-                        label = "${o.fileName} (×${o.copies})",
-                        value = o.wastedBytes.toHumanSize(),
-                    )
+                Text(
+                    text = stringResource(R.string.analytics_dedup_cleanup_hint),
+                    style = TgTypography.Caption,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                for (o in dedup.topOffenders.take(5)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onInspectDuplicate(o.fileName, o.fileSize) }
+                            .padding(vertical = 4.dp, horizontal = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "${o.fileName} (×${o.copies})",
+                            style = TgTypography.Display.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f).padding(end = 8.dp),
+                        )
+                        Text(
+                            text = o.wastedBytes.toHumanSize(),
+                            style = TgTypography.Mono,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun DuplicateCleanupDialog(
+    state: StorageAnalyticsViewModel.DuplicateCleanupState,
+    onSelectKeep: (Long, Long) -> Unit,
+    onDeleteDuplicates: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val deleteCount = (state.copies.size - 1).coerceAtLeast(0)
+    AlertDialog(
+        onDismissRequest = { if (!state.deleting) onDismiss() },
+        title = { Text(stringResource(R.string.analytics_dedup_dialog_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "${state.fileName} (${state.fileSize.toHumanSize()})",
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                for (copy in state.copies) {
+                    val selected =
+                        copy.entity.chatId == state.keepChatId &&
+                            copy.entity.messageId == state.keepMessageId
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable(enabled = !state.deleting) {
+                                onSelectKeep(copy.entity.chatId, copy.entity.messageId)
+                            }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = selected,
+                            enabled = !state.deleting,
+                            onClick = { onSelectKeep(copy.entity.chatId, copy.entity.messageId) },
+                        )
+                        Column(modifier = Modifier.weight(1f).padding(start = 6.dp)) {
+                            Text(
+                                text = copy.folderName,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = copy.entity.date.toLocalShort(),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (selected) {
+                            Text(
+                                text = stringResource(R.string.analytics_dedup_dialog_keep),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.secondary,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(enabled = !state.deleting, onClick = onDismiss) {
+                Text(stringResource(R.string.analytics_dedup_cancel))
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !state.deleting && deleteCount > 0,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                onClick = onDeleteDuplicates,
+            ) {
+                Text(stringResource(R.string.analytics_dedup_dialog_delete_n, deleteCount))
+            }
+        },
+    )
 }
 
 @Composable

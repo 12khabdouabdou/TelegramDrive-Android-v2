@@ -8,6 +8,9 @@ import org.drinkless.tdlib.TdApi
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -49,6 +52,7 @@ class TdLibTelegramClient(
     @Volatile private var initializedApiId: Int? = null
     @Volatile private var initializedApiHash: String? = null
     @Volatile private var myUserIdCache: Long? = null
+    @Volatile private var myUserIsPremiumCache: Boolean? = null
     @Volatile private var tdlibFilesDir: File? = null
 
     private val _authState = MutableStateFlow<AuthorizationState>(AuthorizationState.WaitInitialization)
@@ -380,6 +384,7 @@ class TdLibTelegramClient(
                 _authState.value = AuthorizationState.Closed
                 _authCodeInfo.value = null
                 myUserIdCache = null
+                myUserIsPremiumCache = null
                 initializedApiId = null
                 initializedApiHash = null
                 pendingSendConfirmations.values.forEach {
@@ -407,7 +412,7 @@ class TdLibTelegramClient(
             try {
                 val tdMsg = msgById[msg.id]
                 val thumbFileId = tdMsg?.extractThumbnailFileId()
-                if (thumbFileId != null && thumbFileId != 0) {
+                if (thumbFileId != null && thumbFileId != 0 && tdMsg.isThumbnailDownloaded().not()) {
                     client?.send(TdApi.DownloadFile(thumbFileId, 5, 0, 0, false)) { _ -> }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -445,16 +450,31 @@ class TdLibTelegramClient(
         } catch (_: Throwable) {}
         val resp = send<TdApi.Chats>(TdApi.GetChats(TdApi.ChatListMain(), 200))
         val folders = mutableListOf(TelegramFolder(me, "Saved Messages", true, false, System.currentTimeMillis()))
-        for (id in resp.chatIds) {
-            val chat = send<TdApi.Chat>(TdApi.GetChat(id))
-            val type = chat.type
-            if (type is TdApi.ChatTypeSupergroup && type.isChannel) {
-                val supergroup = send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId))
-                if (supergroup.status is TdApi.ChatMemberStatusCreator) {
-                    folders.add(TelegramFolder(chat.id, chat.title, false, true, System.currentTimeMillis()))
+        val extraFolders = coroutineScope {
+            resp.chatIds.map { id ->
+                async {
+                    try {
+                        val chat = send<TdApi.Chat>(TdApi.GetChat(id))
+                        val type = chat.type
+                        if (type is TdApi.ChatTypeSupergroup && type.isChannel) {
+                            val supergroup = send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId))
+                            if (supergroup.status is TdApi.ChatMemberStatusCreator) {
+                                TelegramFolder(chat.id, chat.title, false, true, System.currentTimeMillis())
+                            } else {
+                                null
+                            }
+                        } else {
+                            null
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        null
+                    }
                 }
-            }
+            }.awaitAll().filterNotNull()
         }
+        folders.addAll(extraFolders)
         folders
     }
 
@@ -481,8 +501,9 @@ class TdLibTelegramClient(
         val src = File(localPath)
         require(src.isFile) { "Upload source not found: $localPath" }
         val totalSize = src.length()
-        require(totalSize <= TelegramClient.MAX_FILE_SIZE) {
-            "File exceeds 2 GB Telegram limit"
+        val maxLimit = maxUploadSizeBytes()
+        require(totalSize <= maxLimit) {
+            "File exceeds ${maxLimit / (1024L * 1024 * 1024)} GB Telegram limit"
         }
 
         Log.i("uploadFile: '$fileName' ($totalSize bytes) → chatId=$chatId")
@@ -791,6 +812,72 @@ class TdLibTelegramClient(
         }
     }.flowOn(dispatchers.io)
 
+    override suspend fun openStreamFile(remoteId: String): StreamFileInfo? = withContext(dispatchers.io) {
+        if (remoteId.isEmpty() || client == null) return@withContext null
+        try {
+            val file = send<TdApi.File>(TdApi.GetRemoteFile(remoteId, null))
+            val path = file.local?.path.orEmpty()
+            val done = file.local?.isDownloadingCompleted == true && path.isNotEmpty() && File(path).exists()
+            val total = if (file.size > 0L) file.size else file.expectedSize
+            StreamFileInfo(
+                fileId = file.id,
+                size = total,
+                localPath = path,
+                isCompleted = done,
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("openStreamFile failed", t)
+            null
+        }
+    }
+
+    override suspend fun ensureFileRangeDownloaded(fileId: Int, offset: Long, length: Long): StreamFileState? = withContext(dispatchers.io) {
+        if (client == null || fileId == 0) return@withContext null
+        fun toStreamState(f: TdApi.File): StreamFileState? {
+            val loc = f.local ?: return null
+            val path = loc.path.orEmpty()
+            val done = loc.isDownloadingCompleted && path.isNotEmpty() && File(path).exists()
+            return StreamFileState(
+                localPath = path,
+                downloadOffset = loc.downloadOffset,
+                downloadedPrefixSize = loc.downloadedPrefixSize,
+                isCompleted = done,
+            )
+        }
+        try {
+            val current = send<TdApi.File>(TdApi.GetFile(fileId))
+            val currentState = toStreamState(current)
+            val safeLength = length.coerceAtLeast(1L)
+            val covered = currentState != null && (
+                currentState.isCompleted || (
+                    currentState.localPath.isNotEmpty() &&
+                        currentState.downloadOffset <= offset &&
+                        currentState.downloadOffset + currentState.downloadedPrefixSize >= offset + safeLength
+                    )
+                )
+            if (covered) return@withContext currentState
+
+            val updated = withTimeoutOrNull(45_000L) {
+                send<TdApi.File>(TdApi.DownloadFile(fileId, 32, offset.coerceAtLeast(0L), safeLength, true))
+            } ?: send<TdApi.File>(TdApi.GetFile(fileId))
+            toStreamState(updated)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("ensureFileRangeDownloaded failed (fileId=$fileId, offset=$offset)", t)
+            null
+        }
+    }
+
+    override suspend fun cancelFileStream(fileId: Int) {
+        if (fileId == 0) return
+        try {
+            client?.send(TdApi.CancelDownloadFile(fileId, false)) { _ -> }
+        } catch (_: Throwable) {}
+    }
+
     override suspend fun clearDownloadCache(): Unit = withContext(dispatchers.io) {
         try {
             val optimize = TdApi.OptimizeStorage().apply {
@@ -813,7 +900,23 @@ class TdLibTelegramClient(
         myUserIdCache?.let { return@withContext it }
         val me = send<TdApi.User>(TdApi.GetMe())
         myUserIdCache = me.id
+        myUserIsPremiumCache = me.isPremium
         me.id
+    }
+
+    override suspend fun isPremiumUser(): Boolean = withContext(dispatchers.io) {
+        myUserIsPremiumCache?.let { return@withContext it }
+        try {
+            val me = send<TdApi.User>(TdApi.GetMe())
+            myUserIdCache = me.id
+            myUserIsPremiumCache = me.isPremium
+            me.isPremium
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("isPremiumUser failed", t)
+            false
+        }
     }
 
     private suspend fun refreshMyUserId() {
@@ -863,6 +966,7 @@ class TdLibTelegramClient(
             initializedApiId = null
             initializedApiHash = null
             myUserIdCache = null
+            myUserIsPremiumCache = null
             _authCodeInfo.value = null
             _authState.value = AuthorizationState.Closed
             Log.i("TDLib client closed")

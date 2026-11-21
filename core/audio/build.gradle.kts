@@ -19,6 +19,8 @@ android {
 dependencies {
     implementation(project(":core:common"))
     implementation(libs.coroutines.android)
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.common)
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
 

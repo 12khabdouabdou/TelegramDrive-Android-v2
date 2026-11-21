@@ -2,6 +2,7 @@ package com.tgdrive.core.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
@@ -12,7 +13,10 @@ import androidx.room.PrimaryKey
  *
  * Per spec §7 and §F-05.
  */
-@Entity(tableName = "sync_log")
+@Entity(
+    tableName = "sync_log",
+    indices = [Index("started_at")],
+)
 data class SyncLogEntity(
     @PrimaryKey @ColumnInfo(name = "job_id") val jobId: String,
     @ColumnInfo(name = "started_at") val startedAt: Long,

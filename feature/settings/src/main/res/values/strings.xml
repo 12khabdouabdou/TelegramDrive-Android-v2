@@ -56,4 +56,8 @@
     <string name="settings_crash_log_copy">Copy log</string>
     <string name="settings_crash_log_copied">Crash log copied</string>
     <string name="settings_crash_log_clear">Clear</string>
+    <string name="settings_cache_pins_label">Offline pinned files</string>
+    <string name="settings_cache_pins_desc">%1$d file(s) · preserved when clearing temporary cache</string>
+    <string name="settings_cache_pins_clear">Clear offline pins</string>
+    <string name="settings_cache_pins_cleared">Offline pins removed</string>
 </resources>

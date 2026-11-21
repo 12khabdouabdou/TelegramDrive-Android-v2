@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Star
@@ -65,6 +67,8 @@ fun FileDetailsSheet(
     onMove: () -> Unit,
     onDelete: () -> Unit,
     onToggleStar: () -> Unit,
+    isPinnedOffline: Boolean = item.isPinnedOffline,
+    onTogglePinOffline: (() -> Unit)? = null,
     onShareLink: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
@@ -168,6 +172,18 @@ fun FileDetailsSheet(
             ) {
                 onDownload()
                 onDismiss()
+            }
+            if (onTogglePinOffline != null) {
+                ActionRow(
+                    icon = if (isPinnedOffline) Icons.Filled.CloudDone else Icons.Filled.OfflinePin,
+                    label = stringResource(
+                        if (isPinnedOffline) R.string.details_unpin_offline else R.string.details_pin_offline,
+                    ),
+                    tint = MaterialTheme.colorScheme.secondary,
+                ) {
+                    onTogglePinOffline()
+                    onDismiss()
+                }
             }
             if (isDownloaded) {
                 ActionRow(

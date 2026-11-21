@@ -2,6 +2,8 @@ package com.tgdrive.feature.player
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -118,7 +120,7 @@ fun ImageViewer(
 }
 
 @Composable
-private fun ZoomableImagePage(
+internal fun ZoomableImagePage(
     path: String,
     isActive: Boolean,
     onZoomChanged: (Boolean) -> Unit,
@@ -258,7 +260,7 @@ private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bi
                 this.inPreferredConfig = Bitmap.Config.ARGB_8888
             },
         ) ?: return null
-        if (
+        val scaledOrDecoded = if (
             decoded.width > reqWidth ||
             decoded.height > reqHeight ||
             decoded.allocationByteCount > MAX_DECODED_BITMAP_BYTES
@@ -278,7 +280,45 @@ private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bi
         } else {
             decoded
         }
+        applyExifOrientation(path, scaledOrDecoded)
     } catch (_: Throwable) {
         null
+    }
+}
+
+private fun applyExifOrientation(path: String, bitmap: Bitmap): Bitmap {
+    val orientation = runCatching {
+        ExifInterface(path).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+    val matrix = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            matrix.postRotate(90f)
+            matrix.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            matrix.postRotate(270f)
+            matrix.postScale(-1f, 1f)
+        }
+        else -> return bitmap
+    }
+
+    return try {
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated !== bitmap && !bitmap.isRecycled) {
+            bitmap.recycle()
+        }
+        rotated
+    } catch (_: Throwable) {
+        bitmap
     }
 }

@@ -18,7 +18,7 @@ import com.tgdrive.core.db.entity.SyncLogEntity
         SyncLogEntity::class,
         FileCacheEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class TgDriveDatabase : RoomDatabase() {

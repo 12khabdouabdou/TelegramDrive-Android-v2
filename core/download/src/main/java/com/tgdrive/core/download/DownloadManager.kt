@@ -24,94 +24,216 @@ import javax.inject.Singleton
 /**
  * Process-wide download queue manager — Singleton.
  *
- * Promoted from `:feature:download` to `:core:download` so that
- * `:feature:browser`, `:feature:player`, and `:feature:settings` can
- * all depend on it WITHOUT feature→feature dependencies (per
- * CONTRIBUTING.md "Features don't depend on each other").
- *
- * The UI screen ([com.tgdrive.feature.download.DownloadListScreen])
- * stays in `:feature:download` and depends on this module.
+ * Uses composite `(chatId, messageId)` keys so identical message IDs across
+ * different folders never collide, computes rolling speed/ETA, triggers
+ * [TransferKeepAliveWorker] so background downloads survive process backgrounding,
+ * and copies pinned downloads into [OfflinePinStore].
  */
 @Singleton
 class DownloadManager @Inject constructor(
     @ApplicationContext private val ctx: Context,
     private val telegramClient: TelegramClient,
     private val dispatchers: DispatchersProvider,
+    private val offlinePinStore: OfflinePinStore,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
     private val concurrencyLimiter = Semaphore(2)
-    private val jobs = ConcurrentHashMap<Long, Job>()
+    private val jobs = ConcurrentHashMap<String, Job>()
     private val lastNotifUpdateMs = java.util.concurrent.atomic.AtomicLong(0L)
     @Volatile private var dismissNotifJob: Job? = null
+
+    private data class SpeedSample(var lastMs: Long, var lastBytes: Long, var smoothedBps: Long)
+    private val speedSamples = ConcurrentHashMap<String, SpeedSample>()
 
     private val _state = MutableStateFlow(DownloadQueueState())
     val state: StateFlow<DownloadQueueState> = _state.asStateFlow()
 
     private val downloadsDir = File(ctx.cacheDir, "downloads").apply { mkdirs() }
 
+    private fun keyFor(chatId: Long, id: Long): String = "${chatId}_$id"
+
+    private fun matchesKey(item: DownloadItem, chatId: Long, id: Long): Boolean =
+        item.id == id && (chatId == 0L || item.chatId == 0L || item.chatId == chatId)
+
+    fun findItem(chatId: Long, id: Long): DownloadItem? =
+        _state.value.items.firstOrNull { matchesKey(it, chatId, id) }
+
     fun enqueue(item: DownloadItem) {
-        val existing = _state.value.items.find { it.id == item.id }
+        val key = keyFor(item.chatId, item.id)
+        val pinnedPath = offlinePinStore.getPinnedFilePathSync(item.chatId, item.id)
+        if (pinnedPath != null) {
+            val doneItem = item.copy(
+                status = DownloadStatus.DONE,
+                progress = 1f,
+                downloadedBytes = item.totalBytes,
+                localPath = pinnedPath,
+                speedBytesPerSec = 0L,
+                etaSeconds = null,
+            )
+            _state.update { s ->
+                val without = s.items.filterNot { matchesKey(it, item.chatId, item.id) }
+                s.copy(items = without + doneItem)
+            }
+            return
+        }
+
+        val existing = _state.value.items.find { matchesKey(it, item.chatId, item.id) }
         if (existing != null) {
             if (existing.status == DownloadStatus.DONE) {
                 val fileExists = runCatching {
                     existing.localPath != null && File(existing.localPath).exists()
                 }.getOrDefault(false)
-                if (fileExists) return
-                updateItem(item.id) { it.copy(status = DownloadStatus.QUEUED, progress = 0f, errorMessage = null, localPath = null) }
+                if (fileExists) {
+                    if (item.pinOfflineWhenDone && existing.localPath != null) {
+                        scope.launch {
+                            offlinePinStore.pinFile(item.chatId, item.id, existing.localPath, item.fileName)?.let { pinned ->
+                                updateItem(item.chatId, item.id) { it.copy(localPath = pinned, pinOfflineWhenDone = true) }
+                            }
+                        }
+                    }
+                    return
+                }
+                updateItem(item.chatId, item.id) {
+                    it.copy(
+                        status = DownloadStatus.QUEUED,
+                        progress = 0f,
+                        downloadedBytes = 0L,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = null,
+                        errorMessage = null,
+                        localPath = null,
+                        pinOfflineWhenDone = it.pinOfflineWhenDone || item.pinOfflineWhenDone,
+                    )
+                }
             } else if (existing.status != DownloadStatus.FAILED && existing.status != DownloadStatus.CANCELLED) {
+                if (item.pinOfflineWhenDone && !existing.pinOfflineWhenDone) {
+                    updateItem(item.chatId, item.id) { it.copy(pinOfflineWhenDone = true) }
+                }
                 return
             } else {
-                updateItem(item.id) { it.copy(status = DownloadStatus.QUEUED, progress = 0f, errorMessage = null) }
+                updateItem(item.chatId, item.id) {
+                    it.copy(
+                        status = DownloadStatus.QUEUED,
+                        progress = 0f,
+                        downloadedBytes = 0L,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = null,
+                        errorMessage = null,
+                        pinOfflineWhenDone = it.pinOfflineWhenDone || item.pinOfflineWhenDone,
+                    )
+                }
             }
-            jobs[item.id]?.cancel()
-            jobs[item.id] = scope.launch { runDownload(item) }
+            jobs[key]?.cancel()
+            TransferKeepAliveWorker.ensureRunning(ctx)
+            jobs[key] = scope.launch { runDownload(item.copy(pinOfflineWhenDone = existing.pinOfflineWhenDone || item.pinOfflineWhenDone)) }
             return
         }
         _state.update { it.copy(items = it.items + item) }
-        jobs[item.id] = scope.launch { runDownload(item) }
+        TransferKeepAliveWorker.ensureRunning(ctx)
+        jobs[key] = scope.launch { runDownload(item) }
     }
 
     fun cancel(id: Long) {
-        jobs[id]?.cancel()
-        jobs.remove(id)
+        val matchingKeys = _state.value.items.filter { it.id == id }.map { keyFor(it.chatId, it.id) }
+        matchingKeys.forEach { k ->
+            jobs[k]?.cancel()
+            jobs.remove(k)
+            speedSamples.remove(k)
+        }
         _state.update { s -> s.copy(items = s.items.filter { it.id != id }) }
+    }
+
+    fun cancel(chatId: Long, id: Long) {
+        val k = keyFor(chatId, id)
+        jobs[k]?.cancel()
+        jobs.remove(k)
+        speedSamples.remove(k)
+        _state.update { s -> s.copy(items = s.items.filterNot { matchesKey(it, chatId, id) }) }
     }
 
     fun clearCompleted() {
         _state.update { s ->
-            s.copy(items = s.items.filter {
-                it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
-            })
+            s.copy(
+                items = s.items.filter {
+                    it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
+                },
+            )
         }
     }
 
     private suspend fun runDownload(item: DownloadItem) {
+        val key = keyFor(item.chatId, item.id)
         concurrencyLimiter.withPermit {
-            updateItem(item.id) { it.copy(status = DownloadStatus.DOWNLOADING, progress = 0f) }
+            speedSamples[key] = SpeedSample(System.currentTimeMillis(), 0L, 0L)
+            updateItem(item.chatId, item.id) { it.copy(status = DownloadStatus.DOWNLOADING, progress = 0f) }
             updateNotification(force = true)
             try {
                 downloadsDir.mkdirs()
-                Log.i("DownloadManager: starting download for '${item.fileName}' (remoteId=${item.remoteId})")
+                Log.i("DownloadManager: starting download for '${item.fileName}' (chat=${item.chatId}, id=${item.id})")
                 telegramClient.downloadFile(item.remoteId, "")
                     .collect { upd ->
                         when (upd) {
                             is DownloadUpdate.Progress -> {
-                                updateItem(item.id) { cur ->
+                                val now = System.currentTimeMillis()
+                                val sample = speedSamples[key]
+                                var speedBps = sample?.smoothedBps ?: 0L
+                                if (sample != null) {
+                                    val dt = now - sample.lastMs
+                                    val db = upd.downloaded - sample.lastBytes
+                                    if (dt >= 400L && db >= 0L) {
+                                        val instant = (db * 1000L) / dt.coerceAtLeast(1L)
+                                        speedBps = if (speedBps == 0L) instant else (speedBps * 7L + instant * 3L) / 10L
+                                        sample.lastMs = now
+                                        sample.lastBytes = upd.downloaded
+                                        sample.smoothedBps = speedBps
+                                    }
+                                }
+                                updateItem(item.chatId, item.id) { cur ->
                                     val effectiveTotal = if (upd.total > 0L) upd.total else cur.totalBytes
                                     val raw = if (effectiveTotal <= 0L) 0f else upd.downloaded.toFloat() / effectiveTotal.toFloat()
                                     val safeProgress = if (raw.isFinite()) raw.coerceIn(0f, 1f) else 0f
-                                    cur.copy(progress = safeProgress, downloadedBytes = upd.downloaded, totalBytes = effectiveTotal)
+                                    val remaining = (effectiveTotal - upd.downloaded).coerceAtLeast(0L)
+                                    val eta = if (speedBps > 0L && effectiveTotal > 0L && remaining > 0L) remaining / speedBps else null
+                                    cur.copy(
+                                        progress = safeProgress,
+                                        downloadedBytes = upd.downloaded,
+                                        totalBytes = effectiveTotal,
+                                        speedBytesPerSec = speedBps,
+                                        etaSeconds = eta,
+                                    )
                                 }
                                 updateNotification(force = false)
                             }
                             is DownloadUpdate.Done -> {
-                                Log.i("DownloadManager: done → ${upd.localPath}")
-                                updateItem(item.id) { it.copy(status = DownloadStatus.DONE, progress = 1f, localPath = upd.localPath) }
+                                val latestItem = findItem(item.chatId, item.id) ?: item
+                                val finalPath = if (latestItem.pinOfflineWhenDone) {
+                                    offlinePinStore.pinFile(item.chatId, item.id, upd.localPath, item.fileName) ?: upd.localPath
+                                } else {
+                                    upd.localPath
+                                }
+                                Log.i("DownloadManager: done → $finalPath")
+                                updateItem(item.chatId, item.id) {
+                                    it.copy(
+                                        status = DownloadStatus.DONE,
+                                        progress = 1f,
+                                        downloadedBytes = if (it.totalBytes > 0L) it.totalBytes else it.downloadedBytes,
+                                        localPath = finalPath,
+                                        speedBytesPerSec = 0L,
+                                        etaSeconds = null,
+                                    )
+                                }
                                 updateNotification(force = true)
                             }
                             is DownloadUpdate.Failed -> {
                                 Log.w("DownloadManager: failed — ${upd.message}")
-                                updateItem(item.id) { it.copy(status = DownloadStatus.FAILED, errorMessage = upd.message) }
+                                updateItem(item.chatId, item.id) {
+                                    it.copy(
+                                        status = DownloadStatus.FAILED,
+                                        speedBytesPerSec = 0L,
+                                        etaSeconds = null,
+                                        errorMessage = upd.message,
+                                    )
+                                }
                                 updateNotification(force = true)
                             }
                         }
@@ -119,10 +241,18 @@ class DownloadManager @Inject constructor(
             } catch (t: Throwable) {
                 if (t is kotlinx.coroutines.CancellationException) throw t
                 Log.w("Download failed for ${item.fileName}", t)
-                updateItem(item.id) { it.copy(status = DownloadStatus.FAILED, errorMessage = t.message) }
+                updateItem(item.chatId, item.id) {
+                    it.copy(
+                        status = DownloadStatus.FAILED,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = null,
+                        errorMessage = t.message,
+                    )
+                }
                 updateNotification(force = true)
             } finally {
-                jobs.remove(item.id)
+                jobs.remove(key)
+                speedSamples.remove(key)
                 updateNotification(force = true)
             }
         }
@@ -130,7 +260,6 @@ class DownloadManager @Inject constructor(
 
     /**
      * Post/update/cancel the download progress notification.
-     * Shows "Downloading N files…" when active, clears when done.
      */
     private fun updateNotification(force: Boolean = false) {
         try {
@@ -185,8 +314,8 @@ class DownloadManager @Inject constructor(
                 dismissNotifJob = null
                 nm.cancel(DOWNLOAD_NOTIF_ID)
             }
-        } catch (t: Throwable) {
-            // Notifications are best-effort — don't crash the download
+        } catch (_: Throwable) {
+            // Notifications are best-effort
         }
     }
 
@@ -194,21 +323,28 @@ class DownloadManager @Inject constructor(
         private const val DOWNLOAD_NOTIF_ID = 50001
     }
 
-    private fun updateItem(id: Long, transform: (DownloadItem) -> DownloadItem) {
+    private fun updateItem(chatId: Long, id: Long, transform: (DownloadItem) -> DownloadItem) {
         _state.update { cur ->
-            cur.copy(items = cur.items.map { if (it.id == id) transform(it) else it })
+            cur.copy(items = cur.items.map { if (matchesKey(it, chatId, id)) transform(it) else it })
         }
     }
 
     /**
-     * Clear completed downloads from the local cache directory and TDLib cache.
+     * Clear completed downloads from the temporary local cache directory and TDLib cache,
+     * preserving permanently offline-pinned files in `filesDir/offline_pins/`.
      */
     fun clearCache() {
         _state.value.items
             .filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING }
-            .forEach { cancel(it.id) }
+            .forEach { cancel(it.chatId, it.id) }
 
-        _state.update { it.copy(items = emptyList()) }
+        _state.update { s ->
+            s.copy(
+                items = s.items.filter {
+                    offlinePinStore.getPinnedFilePathSync(it.chatId, it.id) != null
+                },
+            )
+        }
         updateNotification(force = true)
 
         scope.launch {
@@ -224,12 +360,16 @@ data class DownloadItem(
     val id: Long,
     val remoteId: String,
     val fileName: String,
+    val chatId: Long = 0L,
     val totalBytes: Long = 0L,
     val downloadedBytes: Long = 0L,
     val progress: Float = 0f,
+    val speedBytesPerSec: Long = 0L,
+    val etaSeconds: Long? = null,
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val localPath: String? = null,
     val errorMessage: String? = null,
+    val pinOfflineWhenDone: Boolean = false,
 )
 
 enum class DownloadStatus { QUEUED, DOWNLOADING, DONE, FAILED, CANCELLED }

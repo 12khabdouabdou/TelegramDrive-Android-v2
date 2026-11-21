@@ -17,6 +17,10 @@ interface TelegramClient : TelegramAuthObserver {
 
     companion object {
         const val MAX_FILE_SIZE: Long = 2L * 1024 * 1024 * 1024
+        const val MAX_FILE_SIZE_STANDARD: Long = 2L * 1024 * 1024 * 1024
+        const val MAX_FILE_SIZE_PREMIUM: Long = 4L * 1024 * 1024 * 1024
+        const val SAFE_CHUNK_LIMIT_STANDARD: Long = 1_900L * 1024 * 1024
+        const val SAFE_CHUNK_LIMIT_PREMIUM: Long = 3_800L * 1024 * 1024
     }
 
     val authCodeInfo: StateFlow<AuthCodeInfo?>
@@ -71,6 +75,14 @@ interface TelegramClient : TelegramAuthObserver {
     fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate>
     suspend fun clearDownloadCache()
     suspend fun myUserId(): Long
+    suspend fun isPremiumUser(): Boolean = false
+    suspend fun maxUploadSizeBytes(): Long =
+        if (isPremiumUser()) MAX_FILE_SIZE_PREMIUM else MAX_FILE_SIZE_STANDARD
+    suspend fun safeZipChunkLimitBytes(): Long =
+        if (isPremiumUser()) SAFE_CHUNK_LIMIT_PREMIUM else SAFE_CHUNK_LIMIT_STANDARD
+    suspend fun openStreamFile(remoteId: String): StreamFileInfo? = null
+    suspend fun ensureFileRangeDownloaded(fileId: Int, offset: Long, length: Long): StreamFileState? = null
+    suspend fun cancelFileStream(fileId: Int) {}
     suspend fun close()
 
     /**
@@ -105,6 +117,20 @@ sealed interface DownloadUpdate {
     data class Done(val localPath: String) : DownloadUpdate
     data class Failed(val message: String) : DownloadUpdate
 }
+
+data class StreamFileInfo(
+    val fileId: Int,
+    val size: Long,
+    val localPath: String,
+    val isCompleted: Boolean,
+)
+
+data class StreamFileState(
+    val localPath: String,
+    val downloadOffset: Long,
+    val downloadedPrefixSize: Long,
+    val isCompleted: Boolean,
+)
 
 data class TelegramFolder(
     val chatId: Long,

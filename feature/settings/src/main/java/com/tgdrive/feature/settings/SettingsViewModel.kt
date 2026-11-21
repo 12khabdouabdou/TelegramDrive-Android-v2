@@ -15,6 +15,7 @@ import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
@@ -57,6 +58,7 @@ class SettingsViewModel @Inject constructor(
     private val syncLogDao: SyncLogDao,
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatchersProvider,
+    private val offlinePinStore: OfflinePinStore,
 ) : ViewModel() {
 
     private val _credsVersion = MutableStateFlow(0)
@@ -154,6 +156,7 @@ class SettingsViewModel @Inject constructor(
                 try { fileCacheDao.clear() } catch (t: Throwable) { Log.w("logout: fileCacheDao.clear failed", t) }
                 try { syncedFileDao.clear() } catch (t: Throwable) { Log.w("logout: syncedFileDao.clear failed", t) }
                 try { syncLogDao.clear() } catch (t: Throwable) { Log.w("logout: syncLogDao.clear failed", t) }
+                try { offlinePinStore.clearAll() } catch (t: Throwable) { Log.w("logout: offlinePinStore.clearAll failed", t) }
 
                 // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
                 try {
@@ -176,6 +179,8 @@ class SettingsViewModel @Inject constructor(
                             backupPaused = false,
                             backupStrictMode = false,
                             backupDeleteAfterUpload = false,
+                            backupZipIncremental = false,
+                            backupFolderTargetsJson = "{}",
                         )
                     }
                 } catch (t: Throwable) {
@@ -209,5 +214,13 @@ class SettingsViewModel @Inject constructor(
 
     fun clearCache() {
         viewModelScope.launch { clearCacheAndAwait() }
+    }
+
+    suspend fun offlinePinStats(): Pair<Int, Long> = offlinePinStore.stats()
+
+    suspend fun clearOfflinePins() {
+        withContext(dispatchers.io) {
+            offlinePinStore.clearAll()
+        }
     }
 }

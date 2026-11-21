@@ -27,6 +27,8 @@ import androidx.room.PrimaryKey
         Index("local_path"),
         Index("folder_id"),
         Index(value = ["local_path", "size"], unique = false),
+        Index("sha256"),
+        Index(value = ["local_path", "folder_id"], unique = true),
     ]
 )
 data class SyncedFileEntity(

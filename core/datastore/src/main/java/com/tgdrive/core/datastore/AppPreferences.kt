@@ -58,7 +58,9 @@ data class AppPreferencesData(
     val backupStrictMode: Boolean = false,
     val backupDeleteAfterUpload: Boolean = false,
     val backupZipFolders: Boolean = false,
+    val backupZipIncremental: Boolean = false,
     val backupExcludePatterns: String = "",  // comma-separated, e.g. "*.tmp,Thumbs.db,.DS_Store"
+    val backupFolderTargetsJson: String = "{}",
     val backupPaused: Boolean = false,
     val onboardingCompleted: Boolean = false,
 
@@ -68,7 +70,70 @@ data class AppPreferencesData(
     val scheduledUploadTargetFolderId: Long = -1L,
     val scheduledUploadHour: Int = 3, // 3 AM by default
     val scheduledUploadMinute: Int = 0,
-)
+) {
+    fun targetFolderFor(folderUri: String): Long =
+        parseFolderTargets()[folderUri] ?: backupTargetFolderId
+
+    fun customTargetFor(folderUri: String): Long? = parseFolderTargets()[folderUri]
+
+    fun parseFolderTargets(): Map<String, Long> = decodeLongMap(backupFolderTargetsJson)
+
+    fun withFolderTarget(folderUri: String, targetChatId: Long?): AppPreferencesData {
+        val next = parseFolderTargets().toMutableMap()
+        if (targetChatId == null) next.remove(folderUri) else next[folderUri] = targetChatId
+        return copy(backupFolderTargetsJson = encodeLongMap(next))
+    }
+
+    companion object {
+        private fun encodeLongMap(map: Map<String, Long>): String {
+            if (map.isEmpty()) return "{}"
+            return buildString {
+                append('{')
+                map.entries.forEachIndexed { idx, (k, v) ->
+                    if (idx > 0) append(',')
+                    append('"')
+                    append(k.replace("\\", "\\\\").replace("\"", "\\\""))
+                    append("\":")
+                    append(v)
+                }
+                append('}')
+            }
+        }
+
+        private fun decodeLongMap(json: String): Map<String, Long> {
+            val trimmed = json.trim()
+            if (trimmed.length < 2 || !trimmed.startsWith('{') || !trimmed.endsWith('}')) return emptyMap()
+            val body = trimmed.substring(1, trimmed.length - 1).trim()
+            if (body.isEmpty()) return emptyMap()
+            val result = LinkedHashMap<String, Long>()
+            var i = 0
+            while (i < body.length) {
+                while (i < body.length && (body[i] == ',' || body[i].isWhitespace())) i++
+                if (i >= body.length || body[i] != '"') break
+                i++
+                val keySb = StringBuilder()
+                while (i < body.length) {
+                    val c = body[i++]
+                    if (c == '\\' && i < body.length) {
+                        keySb.append(body[i++])
+                    } else if (c == '"') {
+                        break
+                    } else {
+                        keySb.append(c)
+                    }
+                }
+                while (i < body.length && (body[i] == ':' || body[i].isWhitespace())) i++
+                val numStart = i
+                while (i < body.length && (body[i] == '-' || body[i].isDigit())) i++
+                val parsedVal = body.substring(numStart, i).toLongOrNull()
+                if (parsedVal != null) {
+                    result[keySb.toString()] = parsedVal
+                }
+            }
+            return result
+        }
+    }
+}
 
 @Singleton
 class AppPreferences @Inject constructor(
@@ -94,7 +159,9 @@ class AppPreferences @Inject constructor(
         val BACKUP_STRICT = booleanPreferencesKey("backup_strict")
         val BACKUP_DELETE_AFTER = booleanPreferencesKey("backup_delete_after")
         val BACKUP_ZIP_FOLDERS = booleanPreferencesKey("backup_zip_folders")
+        val BACKUP_ZIP_INCREMENTAL = booleanPreferencesKey("backup_zip_incremental")
         val BACKUP_EXCLUDE_PATTERNS = stringPreferencesKey("backup_exclude_patterns")
+        val BACKUP_FOLDER_TARGETS = stringPreferencesKey("backup_folder_targets_json")
         val BACKUP_PAUSED = booleanPreferencesKey("backup_paused")
         val ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
         val SCHEDULED_UPLOAD_ENABLED = booleanPreferencesKey("scheduled_upload_enabled")
@@ -149,7 +216,9 @@ class AppPreferences @Inject constructor(
             backupStrictMode = get(Keys.BACKUP_STRICT) ?: false,
             backupDeleteAfterUpload = get(Keys.BACKUP_DELETE_AFTER) ?: false,
             backupZipFolders = get(Keys.BACKUP_ZIP_FOLDERS) ?: false,
+            backupZipIncremental = get(Keys.BACKUP_ZIP_INCREMENTAL) ?: false,
             backupExcludePatterns = get(Keys.BACKUP_EXCLUDE_PATTERNS) ?: "",
+            backupFolderTargetsJson = get(Keys.BACKUP_FOLDER_TARGETS) ?: "{}",
             backupPaused = get(Keys.BACKUP_PAUSED) ?: false,
             onboardingCompleted = get(Keys.ONBOARDING_COMPLETED) ?: false,
             scheduledUploadEnabled = get(Keys.SCHEDULED_UPLOAD_ENABLED) ?: false,
@@ -179,7 +248,9 @@ class AppPreferences @Inject constructor(
         this[Keys.BACKUP_STRICT] = d.backupStrictMode
         this[Keys.BACKUP_DELETE_AFTER] = d.backupDeleteAfterUpload
         this[Keys.BACKUP_ZIP_FOLDERS] = d.backupZipFolders
+        this[Keys.BACKUP_ZIP_INCREMENTAL] = d.backupZipIncremental
         this[Keys.BACKUP_EXCLUDE_PATTERNS] = d.backupExcludePatterns
+        this[Keys.BACKUP_FOLDER_TARGETS] = d.backupFolderTargetsJson
         this[Keys.BACKUP_PAUSED] = d.backupPaused
         this[Keys.ONBOARDING_COMPLETED] = d.onboardingCompleted
         this[Keys.SCHEDULED_UPLOAD_ENABLED] = d.scheduledUploadEnabled

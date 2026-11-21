@@ -74,10 +74,11 @@ import com.tgdrive.designsystem.theme.TgTypography
 @Composable
 fun HomeScreen(
     onOpenFolder: (Long, String) -> Unit = { _, _ -> },
-    onOpenVideo: (Long) -> Unit = {},
-    onOpenImage: (String) -> Unit = {},
+    onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
+    onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
+    onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenAnalytics: () -> Unit = {},
     onOpenSearch: () -> Unit = {},
     onOpenCategory: (FileFilter) -> Unit = {},
@@ -219,6 +220,7 @@ fun HomeScreen(
                                     onOpenImage = onOpenImage,
                                     onOpenPdf = onOpenPdf,
                                     onOpenZip = onOpenZip,
+                                    onOpenText = onOpenText,
                                     onOpenFolder = onOpenFolder,
                                 )
                             }
@@ -238,6 +240,7 @@ fun HomeScreen(
                             onOpenImage = onOpenImage,
                             onOpenPdf = onOpenPdf,
                             onOpenZip = onOpenZip,
+                            onOpenText = onOpenText,
                             onOpenFolder = onOpenFolder,
                         )
                     }

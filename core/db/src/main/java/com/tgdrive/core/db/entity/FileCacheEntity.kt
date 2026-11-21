@@ -7,7 +7,15 @@ import androidx.room.Index
 @Entity(
     tableName = "file_cache",
     primaryKeys = ["message_id", "chat_id"],
-    indices = [Index("chat_id"), Index("date"), Index("is_starred")]
+    indices = [
+        Index("chat_id"),
+        Index("date"),
+        Index("is_starred"),
+        Index(value = ["chat_id", "date"]),
+        Index(value = ["file_name", "file_size"]),
+        Index("last_accessed"),
+        Index("is_pinned_offline"),
+    ],
 )
 data class FileCacheEntity(
     @ColumnInfo(name = "message_id") val messageId: Long,
@@ -20,4 +28,5 @@ data class FileCacheEntity(
     @ColumnInfo(name = "date") val date: Long,
     @ColumnInfo(name = "is_starred") val isStarred: Boolean = false,
     @ColumnInfo(name = "last_accessed") val lastAccessed: Long = 0L,
+    @ColumnInfo(name = "is_pinned_offline") val isPinnedOffline: Boolean = false,
 )

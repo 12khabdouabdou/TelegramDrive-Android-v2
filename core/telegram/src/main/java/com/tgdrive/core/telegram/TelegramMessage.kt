@@ -1,6 +1,7 @@
 package com.tgdrive.core.telegram
 
 import org.drinkless.tdlib.TdApi
+import java.io.File
 
 data class TelegramMessage(
     val id: Long,
@@ -130,4 +131,16 @@ internal fun TdApi.Message.extractThumbnailFileId(): Int? = when (val c = conten
     is TdApi.MessageAnimation -> c.animation?.thumbnail?.file?.id
     is TdApi.MessageAudio -> c.audio?.albumCoverThumbnail?.file?.id
     else -> null
+}
+
+internal fun TdApi.Message.isThumbnailDownloaded(): Boolean {
+    val local = when (val c = content) {
+        is TdApi.MessageDocument -> c.document?.thumbnail?.file?.local
+        is TdApi.MessageVideo -> c.video?.thumbnail?.file?.local
+        is TdApi.MessageAnimation -> c.animation?.thumbnail?.file?.local
+        is TdApi.MessageAudio -> c.audio?.albumCoverThumbnail?.file?.local
+        else -> null
+    } ?: return false
+    val path = local.path.orEmpty()
+    return local.isDownloadingCompleted && path.isNotEmpty() && File(path).exists()
 }

@@ -32,6 +32,25 @@ private val VIDEO_EXTS = setOf("mp4", "mkv", "mov", "avi", "webm", "m4v", "3gp")
 private val AUDIO_EXTS = setOf("mp3", "wav", "flac", "aac", "m4a", "ogg", "opus")
 private val DOC_EXTS = setOf("txt", "doc", "docx", "rtf", "odt", "md", "csv", "xls", "xlsx", "ppt", "pptx")
 private val ARCHIVE_EXTS = setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz")
+private val TEXT_PREVIEW_EXTS = setOf(
+    "txt", "md", "markdown", "json", "log", "csv", "xml", "yaml", "yml",
+    "kt", "kts", "java", "py", "js", "ts", "tsx", "jsx", "sh", "bash",
+    "ini", "conf", "cfg", "toml", "gradle", "properties", "html", "htm",
+    "css", "c", "cpp", "cc", "h", "hpp", "rs", "go", "sql", "env",
+)
+
+fun isTextPreviewable(mimeType: String?, fileName: String): Boolean {
+    val mime = mimeType?.lowercase().orEmpty()
+    if (mime.startsWith("text/") ||
+        mime == "application/json" ||
+        mime == "application/xml" ||
+        mime == "application/x-yaml"
+    ) {
+        return true
+    }
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    return ext in TEXT_PREVIEW_EXTS
+}
 
 /**
  * Classify a file by its MIME type and/or extension into a [FileBucket].

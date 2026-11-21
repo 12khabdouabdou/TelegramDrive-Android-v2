@@ -106,6 +106,7 @@ import coil.compose.AsyncImage
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.core.datastore.FileFilter
@@ -125,10 +126,11 @@ fun FolderScreen(
     chatId: Long,
     title: String = "",
     initialFilter: FileFilter? = null,
-    onOpenVideo: (Long) -> Unit,
-    onOpenImage: (String) -> Unit = {},
+    onOpenVideo: (Long, Long) -> Unit,
+    onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
+    onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onBack: () -> Unit,
     vm: FolderViewModel = hiltViewModel(),
 ) {
@@ -504,6 +506,7 @@ fun FolderScreen(
                                             onOpenImage = onOpenImage,
                                             onOpenPdf = onOpenPdf,
                                             onOpenZip = onOpenZip,
+                                            onOpenText = onOpenText,
                                             context = context,
                                             noAppMessage = noAppMsg,
                                         )
@@ -532,6 +535,7 @@ fun FolderScreen(
                                             onOpenImage = onOpenImage,
                                             onOpenPdf = onOpenPdf,
                                             onOpenZip = onOpenZip,
+                                            onOpenText = onOpenText,
                                             context = context,
                                             noAppMessage = noAppMsg,
                                         )
@@ -567,6 +571,7 @@ fun FolderScreen(
         FileDetailsSheet(
             item = item,
             isDownloaded = vm.getLocalPath(item.messageId) != null,
+            isPinnedOffline = item.isPinnedOffline,
             onDownload = { vm.downloadFile(item) },
             onCopyToDownloads = { vm.copyToDownloads(item.messageId) },
             onMove = {
@@ -577,6 +582,7 @@ fun FolderScreen(
             },
             onDelete = { pendingDeleteSingle = item },
             onToggleStar = { vm.toggleStar(item.messageId) },
+            onTogglePinOffline = { vm.togglePinOffline(item) },
             onShareLink = if (isSavedMessages) null else ({ vm.shareLink(item) }),
             onDismiss = { detailsItem = null },
         )
@@ -1165,10 +1171,11 @@ private fun handleFileTap(
     messageId: Long,
     items: List<FileCacheEntity>,
     vm: FolderViewModel,
-    onOpenVideo: (Long) -> Unit,
-    onOpenImage: (String) -> Unit,
+    onOpenVideo: (Long, Long) -> Unit,
+    onOpenImage: (Long, Long) -> Unit,
     onOpenPdf: (Long) -> Unit,
     onOpenZip: (Long) -> Unit,
+    onOpenText: (Long, Long) -> Unit,
     context: Context,
     noAppMessage: String,
 ) {
@@ -1182,16 +1189,19 @@ private fun handleFileTap(
             onOpenZip(messageId)
         }
         bucket == FileBucket.VIDEOS -> {
-            if (localPath == null) vm.downloadFile(item)
-            onOpenVideo(messageId)
+            onOpenVideo(item.chatId, messageId)
         }
         bucket == FileBucket.IMAGES -> {
             if (localPath == null) vm.downloadFile(item)
-            onOpenImage(messageId.toString())
+            onOpenImage(item.chatId, messageId)
         }
         bucket == FileBucket.PDF -> {
             if (localPath == null) vm.downloadFile(item)
             onOpenPdf(messageId)
+        }
+        isTextPreviewable(item.mimeType, item.fileName) -> {
+            if (localPath == null) vm.downloadFile(item)
+            onOpenText(item.chatId, messageId)
         }
         bucket == FileBucket.AUDIO -> {
             if (localPath == null) {

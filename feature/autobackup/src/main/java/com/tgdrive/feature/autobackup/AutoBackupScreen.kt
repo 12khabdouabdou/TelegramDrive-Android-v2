@@ -98,6 +98,7 @@ fun AutoBackupScreen(
     val context = LocalContext.current
 
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+    var targetOverrideUri by remember { mutableStateOf<String?>(null) }
     var permissionVersion by remember { mutableIntStateOf(0) }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -160,19 +161,63 @@ fun AutoBackupScreen(
                         vm.setDeleteAfter(true)
                     },
                 ) {
-                    Text(
-                        stringResource(R.string.backup_delete_confirm_yes),
-                        color = MaterialTheme.colorScheme.error,
-                        fontWeight = FontWeight.Bold,
-                    )
+                    Text(stringResource(R.string.backup_delete_confirm_yes), color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirmDialog = false }) {
-                    Text(
-                        stringResource(R.string.backup_delete_confirm_no),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    Text(stringResource(R.string.backup_delete_confirm_no))
+                }
+            },
+        )
+    }
+
+    targetOverrideUri?.let { folderUri ->
+        val customTargetId = prefs.customTargetFor(folderUri)
+        AlertDialog(
+            onDismissRequest = { targetOverrideUri = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.backup_folder_target_dialog_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    EditorialRadioRow(
+                        title = stringResource(R.string.backup_folder_target_default),
+                        selected = customTargetId == null,
+                        onClick = {
+                            vm.setFolderTarget(folderUri, null)
+                            targetOverrideUri = null
+                        },
                     )
+                    EditorialRadioRow(
+                        title = stringResource(R.string.backup_target_saved),
+                        selected = customTargetId == -1L,
+                        onClick = {
+                            vm.setFolderTarget(folderUri, -1L)
+                            targetOverrideUri = null
+                        },
+                    )
+                    state.folders.forEach { folder ->
+                        EditorialRadioRow(
+                            title = folder.title,
+                            selected = customTargetId == folder.id,
+                            onClick = {
+                                vm.setFolderTarget(folderUri, folder.id)
+                                targetOverrideUri = null
+                            },
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { targetOverrideUri = null }) {
+                    Text(stringResource(R.string.backup_dismiss))
                 }
             },
         )
@@ -474,6 +519,26 @@ fun AutoBackupScreen(
                                             style = TgTypography.Caption,
                                             color = WarningAmber,
                                         )
+                                    } else {
+                                        val customId = prefs.customTargetFor(uriStr)
+                                        val targetLabel = when {
+                                            customId == null -> stringResource(R.string.backup_folder_target_default)
+                                            customId <= 0L -> stringResource(
+                                                R.string.backup_folder_target_custom,
+                                                stringResource(R.string.backup_target_saved),
+                                            )
+                                            else -> {
+                                                val folderTitle = state.folders.find { it.id == customId }?.title
+                                                    ?: stringResource(R.string.backup_target_saved)
+                                                stringResource(R.string.backup_folder_target_custom, folderTitle)
+                                            }
+                                        }
+                                        Text(
+                                            text = targetLabel,
+                                            style = TgTypography.Caption,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.clickable { targetOverrideUri = uriStr },
+                                        )
                                     }
                                 }
                                 IconButton(
@@ -614,6 +679,16 @@ fun AutoBackupScreen(
                         checked = prefs.backupZipFolders,
                         onChange = vm::setZipFolders,
                     )
+                    if (prefs.backupZipFolders) {
+                        EditorialSwitchRow(
+                            icon = Icons.Filled.Archive,
+                            iconTint = MaterialTheme.colorScheme.secondary,
+                            title = stringResource(R.string.backup_zip_incremental),
+                            description = stringResource(R.string.backup_zip_incremental_desc),
+                            checked = prefs.backupZipIncremental,
+                            onChange = vm::setZipIncremental,
+                        )
+                    }
                     SectionCard(stringResource(R.string.backup_exclude_patterns)) {
                         OutlinedTextField(
                             value = excludeDraft,

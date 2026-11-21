@@ -111,8 +111,20 @@ class AutoBackupViewModel @Inject constructor(
 
     fun removeFolderUri(uri: String) {
         viewModelScope.launch(dispatchers.io) {
-            try { preferences.update { it.copy(backupFolderUris = it.backupFolderUris - uri) } }
-            catch (t: Throwable) { Log.w("AutoBackup: removeFolderUri failed", t) }
+            try {
+                preferences.update {
+                    it.withFolderTarget(uri, null).copy(backupFolderUris = it.backupFolderUris - uri)
+                }
+                scheduler.rescheduleIfEnabled()
+            } catch (t: Throwable) { Log.w("AutoBackup: removeFolderUri failed", t) }
+        }
+    }
+
+    fun setFolderTarget(folderUri: String, targetFolderId: Long?) {
+        viewModelScope.launch(dispatchers.io) {
+            try {
+                preferences.update { it.withFolderTarget(folderUri, targetFolderId) }
+            } catch (t: Throwable) { Log.w("AutoBackup: setFolderTarget failed", t) }
         }
     }
 
@@ -168,6 +180,13 @@ class AutoBackupViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             try { preferences.update { it.copy(backupZipFolders = v) } }
             catch (t: Throwable) { Log.w("AutoBackup: setZipFolders failed", t) }
+        }
+    }
+
+    fun setZipIncremental(v: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            try { preferences.update { it.copy(backupZipIncremental = v) } }
+            catch (t: Throwable) { Log.w("AutoBackup: setZipIncremental failed", t) }
         }
     }
 

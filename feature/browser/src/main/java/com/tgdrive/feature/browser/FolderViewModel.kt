@@ -16,8 +16,12 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.UploadTracker
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.TelegramMessage
+import com.tgdrive.core.zip.UploadedZipPartRecord
+import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -30,6 +34,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -92,6 +97,8 @@ class FolderViewModel
         private val dispatchers: DispatchersProvider,
         val downloadManager: com.tgdrive.core.download.DownloadManager,
         val audioPlayerController: com.tgdrive.core.audio.AudioPlayerController,
+        private val uploadTracker: UploadTracker,
+        private val offlinePinStore: OfflinePinStore,
         private val savedStateHandle: SavedStateHandle,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
@@ -154,7 +161,7 @@ class FolderViewModel
                         fileSort = prefs.fileSort,
                         uploads = uploads,
                     )
-                }
+                }.flowOn(dispatchers.default)
             }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
 
         private data class FolderCoreState(
@@ -362,6 +369,40 @@ class FolderViewModel
             }
         }
 
+        fun togglePinOffline(item: FileCacheEntity) {
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    if (item.isPinnedOffline) {
+                        offlinePinStore.unpinFile(item.chatId, item.messageId)
+                        _snackbar.value = "Removed offline copy"
+                    } else {
+                        val local = getLocalPath(item.messageId)
+                        if (local != null) {
+                            offlinePinStore.pinFile(item.chatId, item.messageId, local, item.fileName)
+                            _snackbar.value = "Saved for offline access"
+                        } else if (item.remoteId.isNotEmpty()) {
+                            downloadManager.enqueue(
+                                DownloadItem(
+                                    id = item.messageId,
+                                    chatId = item.chatId,
+                                    remoteId = item.remoteId,
+                                    fileName = item.fileName,
+                                    totalBytes = item.fileSize,
+                                    pinOfflineWhenDone = true,
+                                ),
+                            )
+                            fileCacheDao.setPinnedOffline(item.chatId, item.messageId, true)
+                            _snackbar.value = "Downloading for offline access…"
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("togglePinOffline failed", t)
+                }
+            }
+        }
+
         fun markAccessed(messageId: Long) {
             val chatId = currentChatId ?: return
             viewModelScope.launch(dispatchers.io) {
@@ -513,18 +554,22 @@ class FolderViewModel
         fun uploadFromUris(uris: List<Uri>) {
             val chatId = currentChatId ?: return
             viewModelScope.launch(dispatchers.io) {
+                val maxLimit = runCatching { telegramClient.maxUploadSizeBytes() }
+                    .getOrDefault(TelegramClient.MAX_FILE_SIZE_STANDARD)
                 for (uri in uris) {
                     val id =
                         java.util.UUID
                             .randomUUID()
                             .mostSignificantBits and Long.MAX_VALUE
+                    val trackerKey = "folder_ul_$id"
                     val name = queryDisplayName(uri) ?: "file_$id"
 
                     val fileSize = queryFileSize(uri)
-                    if (fileSize != null && fileSize > TelegramClient.MAX_FILE_SIZE) {
+                    if (fileSize != null && fileSize > maxLimit) {
+                        val limitGb = maxLimit / (1024L * 1024 * 1024)
                         _uploads.update {
                             it +
-                                UploadProgress(id, name, fileSize, 0f, UploadStatus.FAILED, "File exceeds 2 GB limit")
+                                UploadProgress(id, name, fileSize, 0f, UploadStatus.FAILED, "File exceeds $limitGb GB limit")
                         }
                         continue
                     }
@@ -552,7 +597,8 @@ class FolderViewModel
                         }
                     }
 
-                    _uploads.update { it + UploadProgress(id, name, staging.length(), 0f, UploadStatus.UPLOADING) }
+                    _uploads.update { it + UploadProgress(id, name, realSize, 0f, UploadStatus.UPLOADING) }
+                    uploadTracker.beginUpload(trackerKey, chatId, name, realSize)
                     try {
                         val result =
                             telegramClient.uploadFile(
@@ -563,6 +609,7 @@ class FolderViewModel
                             ) { sent, total ->
                                 val p = if (total <= 0) 0f else sent.toFloat() / total.toFloat()
                                 _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
+                                uploadTracker.updateProgress(trackerKey, sent, total)
                             }
                         fileCacheDao.upsertAll(
                             listOf(
@@ -570,7 +617,7 @@ class FolderViewModel
                                     messageId = result.messageId,
                                     chatId = chatId,
                                     fileName = name,
-                                    fileSize = staging.length(),
+                                    fileSize = realSize,
                                     mimeType = guessMime(name),
                                     thumbnailPath = null,
                                     remoteId = result.remoteId,
@@ -578,6 +625,7 @@ class FolderViewModel
                                 ),
                             ),
                         )
+                        uploadTracker.completeUpload(trackerKey)
                         _uploads.update { list ->
                             list.map {
                                 if (it.id == id) {
@@ -590,9 +638,11 @@ class FolderViewModel
                         Log.i("uploadFromUris: uploaded '$name' → messageId=${result.messageId}")
                         refresh()
                     } catch (e: CancellationException) {
+                        uploadTracker.failUpload(trackerKey, "Cancelled")
                         throw e
                     } catch (t: Throwable) {
                         Log.w("Upload failed for $name", t)
+                        uploadTracker.failUpload(trackerKey, t.message ?: "Upload failed")
                         _uploads.update { list ->
                             list.map {
                                 if (it.id == id) {
@@ -633,88 +683,138 @@ class FolderViewModel
                             UploadStatus.UPLOADING,
                         )
                 }
+                val stagingDir = File(appContext.cacheDir, "upload_staging").apply { mkdirs() }
+                var manifestFile: File? = null
                 try {
-                    val stagingDir = File(appContext.cacheDir, "upload_staging").apply { mkdirs() }
-                    val zipPath =
-                        com.tgdrive.core.zip.ZipUploader.zipFolder(
-                            appContext,
-                            treeUri,
-                            stagingDir,
-                            name,
-                            password,
-                        )
-                    if (zipPath == null) {
+                    val maxPartBytes = runCatching { telegramClient.safeZipChunkLimitBytes() }
+                        .getOrDefault(TelegramClient.SAFE_CHUNK_LIMIT_STANDARD)
+                    val uploadedParts = mutableListOf<UploadedZipPartRecord>()
+                    val summary = ZipUploader.zipFolderInParts(
+                        context = appContext,
+                        treeUri = treeUri,
+                        workDir = stagingDir,
+                        baseZipName = name,
+                        maxPartBytes = maxPartBytes,
+                        password = password,
+                    ) { part ->
+                        val partFileName = part.partFile.name
+                        val partLen = part.partFile.length()
+                        val partTrackerKey = "folder_zip_${id}_${part.partIndex}"
                         _uploads.update { list ->
                             list.map {
                                 if (it.id == id) {
-                                    it.copy(status = UploadStatus.FAILED, errorMessage = "Failed to zip folder")
+                                    it.copy(name = partFileName, size = partLen, progress = 0f)
                                 } else {
                                     it
                                 }
                             }
                         }
-                        return@launch
-                    }
-                    val zipFile = File(zipPath)
-                    if (zipFile.length() > TelegramClient.MAX_FILE_SIZE) {
-                        _uploads.update { list ->
-                            list.map {
-                                if (it.id == id) {
-                                    it.copy(
-                                        status = UploadStatus.FAILED,
-                                        errorMessage = "ZIP exceeds 2 GB Telegram limit (${zipFile.length().toHumanSize()})",
-                                    )
-                                } else {
-                                    it
-                                }
-                            }
-                        }
-                        zipFile.delete()
-                        return@launch
-                    }
-                    _uploads.update { list ->
-                        list.map {
-                            if (it.id == id) {
-                                it.copy(name = "$name.zip", size = zipFile.length())
-                            } else {
-                                it
-                            }
-                        }
-                    }
-                    val result =
-                        telegramClient.uploadFile(
-                            chatId = chatId,
-                            localPath = zipPath,
-                            fileName = "$name.zip",
-                            mimeType = "application/zip",
-                        ) { sent, total ->
-                            val p = if (total <= 0) 0f else sent.toFloat() / total.toFloat()
-                            _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
-                        }
-                    fileCacheDao.upsertAll(
-                        listOf(
-                            FileCacheEntity(
-                                messageId = result.messageId,
+                        uploadTracker.beginUpload(partTrackerKey, chatId, partFileName, partLen)
+                        try {
+                            val result = telegramClient.uploadFile(
                                 chatId = chatId,
-                                fileName = "$name.zip",
-                                fileSize = zipFile.length(),
+                                localPath = part.partFile.absolutePath,
+                                fileName = partFileName,
                                 mimeType = "application/zip",
-                                thumbnailPath = null,
-                                remoteId = result.remoteId,
-                                date = System.currentTimeMillis(),
+                            ) { sent, total ->
+                                val p = if (total <= 0) 0f else sent.toFloat() / total.toFloat()
+                                _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
+                                uploadTracker.updateProgress(partTrackerKey, sent, total)
+                            }
+                            uploadTracker.completeUpload(partTrackerKey)
+                            fileCacheDao.upsertAll(
+                                listOf(
+                                    FileCacheEntity(
+                                        messageId = result.messageId,
+                                        chatId = chatId,
+                                        fileName = partFileName,
+                                        fileSize = partLen,
+                                        mimeType = "application/zip",
+                                        thumbnailPath = null,
+                                        remoteId = result.remoteId,
+                                        date = System.currentTimeMillis(),
+                                    ),
+                                ),
+                            )
+                            uploadedParts += UploadedZipPartRecord(
+                                fileName = partFileName,
+                                fileSizeBytes = partLen,
+                                partIndex = part.partIndex,
+                                isSplitVolume = part.isSplitVolume,
+                                messageId = result.messageId,
+                                entries = part.entries,
+                            )
+                        } catch (t: Throwable) {
+                            uploadTracker.failUpload(partTrackerKey, t.message)
+                            throw t
+                        }
+                    }
+
+                    if (summary.totalFilesProcessed == 0 || uploadedParts.isEmpty()) {
+                        _uploads.update { list ->
+                            list.map {
+                                if (it.id == id) {
+                                    it.copy(status = UploadStatus.FAILED, errorMessage = "No files found in selected folder")
+                                } else {
+                                    it
+                                }
+                            }
+                        }
+                        return@launch
+                    }
+
+                    if (uploadedParts.size > 1) {
+                        val mFile = ZipUploader.writeManifestJsonFile(
+                            outputDir = stagingDir,
+                            baseName = name,
+                            folderName = name,
+                            encrypted = !password.isNullOrBlank(),
+                            parts = uploadedParts,
+                        )
+                        manifestFile = mFile
+                        val mLen = mFile.length()
+                        val mKey = "folder_zip_${id}_manifest"
+                        uploadTracker.beginUpload(mKey, chatId, mFile.name, mLen)
+                        val mResult = telegramClient.uploadFile(
+                            chatId = chatId,
+                            localPath = mFile.absolutePath,
+                            fileName = mFile.name,
+                            mimeType = "application/json",
+                        ) { sent, total ->
+                            uploadTracker.updateProgress(mKey, sent, total)
+                        }
+                        uploadTracker.completeUpload(mKey)
+                        fileCacheDao.upsertAll(
+                            listOf(
+                                FileCacheEntity(
+                                    messageId = mResult.messageId,
+                                    chatId = chatId,
+                                    fileName = mFile.name,
+                                    fileSize = mLen,
+                                    mimeType = "application/json",
+                                    thumbnailPath = null,
+                                    remoteId = mResult.remoteId,
+                                    date = System.currentTimeMillis(),
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                        _snackbar.value = "Uploaded ${uploadedParts.size} ZIP parts + manifest"
+                    }
+
                     _uploads.update { list ->
                         list.map {
                             if (it.id == id) {
-                                it.copy(status = UploadStatus.DONE, progress = 1f)
+                                val finalLabel = if (uploadedParts.size > 1) {
+                                    "${name}_part001..${uploadedParts.size}.zip"
+                                } else {
+                                    uploadedParts.first().fileName
+                                }
+                                it.copy(name = finalLabel, status = UploadStatus.DONE, progress = 1f)
                             } else {
                                 it
                             }
                         }
                     }
-                    zipFile.delete()
                     refresh()
                 } catch (e: CancellationException) {
                     throw e
@@ -729,6 +829,8 @@ class FolderViewModel
                             }
                         }
                     }
+                } finally {
+                    runCatching { manifestFile?.delete() }
                 }
             }
         }
@@ -745,6 +847,7 @@ class FolderViewModel
             downloadManager.enqueue(
                 DownloadItem(
                     id = item.messageId,
+                    chatId = item.chatId,
                     remoteId = item.remoteId,
                     fileName = item.fileName,
                     totalBytes = item.fileSize,
@@ -789,6 +892,7 @@ class FolderViewModel
             downloadManager.enqueue(
                 DownloadItem(
                     id = item.messageId,
+                    chatId = item.chatId,
                     remoteId = item.remoteId,
                     fileName = item.fileName,
                     totalBytes = item.fileSize,
@@ -799,7 +903,11 @@ class FolderViewModel
                 viewModelScope.launch(dispatchers.io) {
                     val terminal =
                         downloadManager.state
-                            .map { state -> state.items.find { it.id == item.messageId } }
+                            .map { state ->
+                                state.items.find {
+                                    it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId)
+                                }
+                            }
                             .first { dlItem ->
                                 dlItem == null ||
                                     dlItem.status == DownloadStatus.DONE ||
@@ -824,9 +932,15 @@ class FolderViewModel
         }
 
         fun getLocalPath(messageId: Long): String? {
+            val chatId = currentChatId ?: 0L
+            if (chatId != 0L) {
+                offlinePinStore.getPinnedFilePathSync(chatId, messageId)?.let { pinned ->
+                    if (File(pinned).exists()) return pinned
+                }
+            }
             val path =
-                downloadManager.state.value.items
-                    .find { it.id == messageId && it.status == DownloadStatus.DONE }
+                downloadManager.findItem(chatId, messageId)
+                    ?.takeIf { it.status == DownloadStatus.DONE }
                     ?.localPath ?: return null
             if (!File(path).exists()) {
                 Log.w("getLocalPath: file evicted from cache → $path")

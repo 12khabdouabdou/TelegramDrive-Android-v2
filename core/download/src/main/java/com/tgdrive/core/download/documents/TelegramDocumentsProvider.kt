@@ -11,6 +11,7 @@ import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.OfflinePinStore
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
 import dagger.hilt.android.EntryPointAccessors
@@ -37,6 +38,7 @@ class TelegramDocumentsProvider : DocumentsProvider() {
         fun fileCacheDao(): FileCacheDao
         fun folderDao(): FolderDao
         fun appPreferences(): AppPreferences
+        fun offlinePinStore(): OfflinePinStore
     }
 
     private fun entryPoint(): DocumentsProviderEntryPoint? = try {
@@ -203,6 +205,13 @@ class TelegramDocumentsProvider : DocumentsProvider() {
         val safeName = File(rawName).name
         if (safeName.isBlank() || safeName == "." || safeName == "..") {
             throw FileNotFoundException("Invalid filename")
+        }
+
+        ep.offlinePinStore().getPinnedFilePathSync(chatId, messageId)?.let { pinnedPath ->
+            val pinnedFile = File(pinnedPath)
+            if (pinnedFile.isFile) {
+                return ParcelFileDescriptor.open(pinnedFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            }
         }
 
         val downloadsRoot = File(ctx.cacheDir, "downloads")

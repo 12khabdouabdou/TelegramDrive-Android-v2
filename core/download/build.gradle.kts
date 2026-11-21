@@ -23,9 +23,12 @@ dependencies {
     implementation(project(":core:datastore"))
 
     implementation(libs.coroutines.android)
+    implementation(libs.work.runtime.ktx)
+    implementation(libs.hilt.work)
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
+    ksp(libs.hilt.androidx.compiler)
 
     testImplementation(libs.junit5.jupiter.api)
     testImplementation(libs.junit5.jupiter.engine)

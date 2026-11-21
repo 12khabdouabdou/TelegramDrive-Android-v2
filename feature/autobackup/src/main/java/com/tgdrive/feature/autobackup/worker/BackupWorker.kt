@@ -9,6 +9,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.feature.autobackup.ActiveBackupRegistry
 import com.tgdrive.feature.autobackup.BackupNotifier
 import com.tgdrive.feature.autobackup.BackupOrchestrator
+import com.tgdrive.feature.autobackup.BackupScheduler
 import com.tgdrive.feature.autobackup.StagingManager
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
@@ -48,6 +49,7 @@ class BackupWorker @AssistedInject constructor(
     private val stagingManager: StagingManager,
     private val notifier: BackupNotifier,
     private val registry: ActiveBackupRegistry,
+    private val scheduler: BackupScheduler,
 ) : CoroutineWorker(ctx, params) {
 
     companion object {
@@ -141,6 +143,9 @@ class BackupWorker @AssistedInject constructor(
             try { notifier.cancelForeground() } catch (_: Throwable) {}
             try { stagingManager.purgeStale() } catch (_: Throwable) {}
             try { if (registry.active.value?.phase?.isTerminal != true) registry.finish() } catch (_: Throwable) {}
+            if (!isManual) {
+                try { scheduler.armContentUriTriggerIfEnabled() } catch (_: Throwable) {}
+            }
         }
     }
 }

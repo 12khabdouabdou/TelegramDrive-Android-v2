@@ -52,7 +52,12 @@
     <string name="backup_permission_lost">Permission lost — tap Add folder to re-grant access</string>
     <string name="backup_advanced">Advanced</string>
     <string name="backup_zip_folders">Archive folders into ZIP</string>
-    <string name="backup_zip_folders_desc">Compress each subfolder into a ZIP archive before uploading</string>
+    <string name="backup_zip_folders_desc">Compress each folder into standalone &lt;2 GB / &lt;4 GB ZIP parts before uploading</string>
+    <string name="backup_zip_incremental">Incremental ZIP backups</string>
+    <string name="backup_zip_incremental_desc">Only include new or changed files in each ZIP archive</string>
+    <string name="backup_folder_target_default">Target: Default destination</string>
+    <string name="backup_folder_target_custom">Target: %s</string>
+    <string name="backup_folder_target_dialog_title">Choose destination for folder</string>
     <string name="backup_exclude_patterns">Exclude patterns</string>
     <string name="backup_exclude_patterns_hint">Comma-separated globs, e.g. *.tmp,Thumbs.db,.DS_Store</string>
     <string name="backup_delete_confirm_title">Delete local files after upload?</string>

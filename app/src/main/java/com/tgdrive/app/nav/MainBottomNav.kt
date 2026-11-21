@@ -1,6 +1,7 @@
 package com.tgdrive.app.nav
 
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -42,11 +43,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
-import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tgdrive.app.R
 import com.tgdrive.app.RootViewModel
@@ -72,20 +73,26 @@ private enum class Tab(val route: String, val labelRes: Int) {
 @Composable
 fun MainBottomNav(
     rootVm: RootViewModel,
-    onOpenVideo: (Long) -> Unit,
-    onOpenImage: (String) -> Unit = {},
+    mainNav: NavHostController,
+    onOpenVideo: (Long, Long) -> Unit,
+    onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
+    onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenHistory: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
     onOpenCacheSettings: () -> Unit = {},
     onOpenAbout: () -> Unit = {},
 ) {
-    val nav = rememberNavController()
+    val nav = mainNav
     val backStack by nav.currentBackStackEntryAsState()
     val current = backStack?.destination?.route ?: Tab.HOME.route
     val isTopLevelTab = Tab.entries.any { it.route == current }
     val rootState by rootVm.state.collectAsStateWithLifecycle()
+
+    BackHandler(enabled = !isTopLevelTab) {
+        nav.popBackStack()
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -187,6 +194,7 @@ fun MainBottomNav(
                     onOpenImage = onOpenImage,
                     onOpenPdf = onOpenPdf,
                     onOpenZip = onOpenZip,
+                    onOpenText = onOpenText,
                     onOpenAnalytics = { nav.navigate("analytics") },
                     onOpenSearch = { nav.navigate("search") },
                     onOpenCategoryFolder = { chatId, title, filter ->
@@ -256,6 +264,7 @@ fun MainBottomNav(
                     onOpenImage = onOpenImage,
                     onOpenPdf = onOpenPdf,
                     onOpenZip = onOpenZip,
+                    onOpenText = onOpenText,
                     onBack = { nav.popBackStack() },
                 )
             }

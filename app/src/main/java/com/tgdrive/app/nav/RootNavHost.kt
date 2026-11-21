@@ -28,6 +28,7 @@ import com.tgdrive.feature.download.DownloadListScreen
 import com.tgdrive.feature.player.AudioPlayerScaffold
 import com.tgdrive.feature.player.ImagePlayerScreen
 import com.tgdrive.feature.player.PdfViewerScreen
+import com.tgdrive.feature.player.TextViewerScreen
 import com.tgdrive.feature.player.VideoPlayerScreen
 import com.tgdrive.feature.settings.AboutScreen
 import com.tgdrive.feature.settings.CacheSettingsScreen
@@ -56,6 +57,7 @@ fun RootNavHost(
     }
 
     val nav = rememberNavController()
+    val mainNav = rememberNavController()
     val targetRoute = when {
         !state.onboardingCompleted -> "onboarding"
         !state.isAuthorized -> "auth"
@@ -94,10 +96,12 @@ fun RootNavHost(
             composable("main") {
                 MainBottomNav(
                     rootVm = rootVm,
-                    onOpenVideo = { msgId -> nav.navigate("video/$msgId") },
-                    onOpenImage = { msgId -> nav.navigate("image/$msgId") },
+                    mainNav = mainNav,
+                    onOpenVideo = { chatId, msgId -> nav.navigate("video/$msgId?chatId=$chatId") },
+                    onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
                     onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
+                    onOpenText = { chatId, msgId -> nav.navigate("text/$msgId?chatId=$chatId") },
                     onOpenHistory = { nav.navigate("history") },
                     onOpenDownloads = { nav.navigate("downloads") },
                     onOpenCacheSettings = { nav.navigate("cache_settings") },
@@ -121,11 +125,18 @@ fun RootNavHost(
             }
 
             composable(
-                "video/{msgId}",
-                arguments = listOf(navArgument("msgId") { type = NavType.LongType }),
+                "video/{msgId}?chatId={chatId}",
+                arguments = listOf(
+                    navArgument("msgId") { type = NavType.LongType },
+                    navArgument("chatId") {
+                        type = NavType.LongType
+                        defaultValue = 0L
+                    },
+                ),
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
-                VideoPlayerScreen(messageId = msgId, onBack = { nav.popBackStack() })
+                val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                VideoPlayerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
             }
 
             composable(
@@ -137,11 +148,33 @@ fun RootNavHost(
             }
 
             composable(
-                "image/{msgId}",
-                arguments = listOf(navArgument("msgId") { type = NavType.LongType }),
+                "image/{msgId}?chatId={chatId}",
+                arguments = listOf(
+                    navArgument("msgId") { type = NavType.LongType },
+                    navArgument("chatId") {
+                        type = NavType.LongType
+                        defaultValue = 0L
+                    },
+                ),
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
-                ImagePlayerScreen(messageId = msgId, onBack = { nav.popBackStack() })
+                val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                ImagePlayerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
+            }
+
+            composable(
+                "text/{msgId}?chatId={chatId}",
+                arguments = listOf(
+                    navArgument("msgId") { type = NavType.LongType },
+                    navArgument("chatId") {
+                        type = NavType.LongType
+                        defaultValue = 0L
+                    },
+                ),
+            ) { entry ->
+                val msgId = entry.arguments?.getLong("msgId") ?: return@composable
+                val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                TextViewerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
             }
 
             composable(

@@ -7,6 +7,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncedFileDao
+import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
@@ -17,19 +18,8 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * ViewModel for the Storage Analytics dashboard.
- *
- * State model: a single [UiState] sealed class. This keeps the screen
- * composable trivial — it pattern-matches on the state and renders. All
- * mutation flows through [refresh], matching the project's "single source
- * of mutations" rule from `ARCHITECTURE.md`.
- *
- * Why a pull-to-refresh model instead of a Room Flow subscription? The
- * dashboard joins data from THREE DAOs (file_cache, folders, synced_files)
- * plus the Telegram user id. A reactive combine() over four sources would
- * re-emit on every cache write (e.g. during a backup), recomputing the
- * full report each time. A manual refresh is cheaper and the user can
- * always pull to refresh.
+ * ViewModel for the Storage Analytics dashboard, with interactive duplicate
+ * inspection & cleanup.
  */
 @HiltViewModel
 class StorageAnalyticsViewModel
@@ -43,6 +33,9 @@ class StorageAnalyticsViewModel
     ) : ViewModel() {
         private val _state = MutableStateFlow<UiState>(UiState.Loading)
         val state: StateFlow<UiState> = _state.asStateFlow()
+
+        private val _duplicateDialog = MutableStateFlow<DuplicateCleanupState?>(null)
+        val duplicateDialog: StateFlow<DuplicateCleanupState?> = _duplicateDialog.asStateFlow()
 
         init {
             refresh()
@@ -63,10 +56,83 @@ class StorageAnalyticsViewModel
             }
         }
 
+        fun inspectDuplicate(fileName: String, fileSize: Long) {
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    val copies = fileCacheDao.findAllDuplicates(fileName, fileSize)
+                        .sortedBy { it.date }
+                    if (copies.size < 2) {
+                        _duplicateDialog.value = null
+                        return@launch
+                    }
+                    val folderNames = folderDao.getAll().associate { it.channelId to it.title }
+                    val myId = runCatching { telegramClient.myUserId() }.getOrDefault(0L)
+                    val entries = copies.map { entity ->
+                        val folderLabel = when {
+                            folderNames.containsKey(entity.chatId) -> folderNames[entity.chatId]!!
+                            myId != 0L && entity.chatId == myId -> "Saved Messages"
+                            else -> "Chat ${entity.chatId}"
+                        }
+                        DuplicateCopyItem(entity = entity, folderName = folderLabel)
+                    }
+                    _duplicateDialog.value = DuplicateCleanupState(
+                        fileName = fileName,
+                        fileSize = fileSize,
+                        copies = entries,
+                        keepMessageId = entries.first().entity.messageId,
+                        keepChatId = entries.first().entity.chatId,
+                        deleting = false,
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("StorageAnalyticsVM: inspectDuplicate failed", t)
+                }
+            }
+        }
+
+        fun selectKeepCopy(chatId: Long, messageId: Long) {
+            _duplicateDialog.value = _duplicateDialog.value?.copy(
+                keepChatId = chatId,
+                keepMessageId = messageId,
+            )
+        }
+
+        fun confirmDeleteDuplicates() {
+            val cur = _duplicateDialog.value ?: return
+            if (cur.deleting) return
+            viewModelScope.launch(dispatchers.io) {
+                _duplicateDialog.value = cur.copy(deleting = true)
+                try {
+                    val toDelete = cur.copies
+                        .map { it.entity }
+                        .filterNot { it.chatId == cur.keepChatId && it.messageId == cur.keepMessageId }
+                    for (copy in toDelete) {
+                        try {
+                            telegramClient.deleteMessage(copy.chatId, copy.messageId)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            Log.w("StorageAnalyticsVM: deleteMessage failed for ${copy.chatId}/${copy.messageId}", t)
+                        }
+                        fileCacheDao.deleteById(copy.chatId, copy.messageId)
+                    }
+                    _duplicateDialog.value = null
+                    refresh()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("StorageAnalyticsVM: confirmDeleteDuplicates failed", t)
+                    _duplicateDialog.value = _duplicateDialog.value?.copy(deleting = false)
+                }
+            }
+        }
+
+        fun dismissDuplicateDialog() {
+            _duplicateDialog.value = null
+        }
+
         private suspend fun buildReport(): StorageAnalytics.Report {
-            // Resolve myUserId defensively — never let analytics crash because
-            // TDLib isn't ready yet. Treat 0L as "Saved Messages chatId unknown";
-            // the per-folder fallback still labels such chats as Saved Messages.
             val myUserId =
                 try {
                     telegramClient.myUserId()
@@ -80,14 +146,7 @@ class StorageAnalyticsViewModel
             val duplicateAggregates = fileCacheDao.duplicateAggregates()
             val folders = folderDao.getAll()
             val backupGrandTotal = syncedFileDao.grandTotal()
-
-            // For the per-type + starred breakdown we need the flat file list.
-            // Cheap because the cache is bounded (HomeViewModel already loads
-            // the same list for "Recent" + "Starred" rows).
-            val allCachedFiles = mutableListOf<com.tgdrive.core.db.entity.FileCacheEntity>()
-            for (chatId in fileCacheDao.getAllChatIds()) {
-                allCachedFiles += fileCacheDao.forChat(chatId)
-            }
+            val allCachedFiles = fileCacheDao.getAll()
 
             return StorageAnalytics.compute(
                 cacheAggregates = cacheAggregates,
@@ -100,8 +159,20 @@ class StorageAnalyticsViewModel
             )
         }
 
-        /** UI state. `Loading` is the initial state so the screen shows a
-         *  spinner before the first DB round-trip completes. */
+        data class DuplicateCopyItem(
+            val entity: FileCacheEntity,
+            val folderName: String,
+        )
+
+        data class DuplicateCleanupState(
+            val fileName: String,
+            val fileSize: Long,
+            val copies: List<DuplicateCopyItem>,
+            val keepChatId: Long,
+            val keepMessageId: Long,
+            val deleting: Boolean,
+        )
+
         sealed class UiState {
             data object Loading : UiState()
 
