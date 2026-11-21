@@ -46,14 +46,23 @@ jobs:
         run: ./gradlew ktlintCheck --no-daemon
         continue-on-error: true # ignoreFailures=true in build.gradle.kts for now
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Build debug APKs (arm64-v8a + universal)
+        run: |
+          ./gradlew :app:assembleDebug --no-daemon
+          ls -lh app/build/outputs/apk/debug/*.apk
+          if ls app/build/outputs/apk/debug/*armeabi-v7a* app/build/outputs/apk/debug/*x86* 2>/dev/null; then
+            echo "Unexpected non-ARMv8 ABI split APK produced" >&2
+            exit 1
+          fi
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: |
+            app/build/outputs/apk/debug/*-arm64-v8a-*.apk
+            app/build/outputs/apk/debug/*-universal-*.apk
+          if-no-files-found: error
           retention-days: 7
 
       - name: Decode optional release keystore
@@ -66,13 +75,19 @@ jobs:
             echo "path=${{ runner.temp }}/release.jks" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build release APK (R8 check)
+      - name: Build release APKs (arm64-v8a + universal, R8 check)
         env:
           RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          ls -lh app/build/outputs/apk/release/*.apk
+          if ls app/build/outputs/apk/release/*armeabi-v7a* app/build/outputs/apk/release/*x86* 2>/dev/null; then
+            echo "Unexpected non-ARMv8 ABI split APK produced" >&2
+            exit 1
+          fi
 
       - name: Clean up temporary keystore
         if: always() && steps.keystore.outputs.path != ''
@@ -82,7 +97,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: |
+            app/build/outputs/apk/release/*-arm64-v8a-*.apk
+            app/build/outputs/apk/release/*-universal-*.apk
+          if-no-files-found: error
           retention-days: 7
 
       - name: Upload test results

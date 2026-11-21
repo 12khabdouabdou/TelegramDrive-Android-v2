@@ -21,14 +21,13 @@ android {
         vectorDrawables { useSupportLibrary = true }
     }
 
-    // APK splits — produce one APK per ABI so users only download the .so
-    // files for their device's architecture. arm64-v8a APK is ~25MB vs 57MB
-    // for the universal APK.
+    // APK splits — produce only the arm64-v8a (ARMv8) split APK plus the
+    // universal APK (which bundles all ABIs for older/other architectures).
     splits {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            include("arm64-v8a")
             isUniversalApk = true
         }
     }
