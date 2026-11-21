@@ -84,6 +84,7 @@ import java.io.File
 private class PdfRendererSession(
     val fd: ParcelFileDescriptor,
     val renderer: PdfRenderer,
+    val pageCount: Int,
     val mutex: Mutex = Mutex(),
 ) {
     @Volatile var isClosed = false
@@ -151,14 +152,15 @@ fun PdfViewerScreen(
                 val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
                 try {
                     val renderer = PdfRenderer(fd)
-                    PdfRendererSession(fd = fd, renderer = renderer)
+                    val count = renderer.pageCount
+                    PdfRendererSession(fd = fd, renderer = renderer, pageCount = count)
                 } catch (t: Throwable) {
                     runCatching { fd.close() }
                     throw t
                 }
             }
             session = opened
-            pageCount = opened.renderer.pageCount
+            pageCount = opened.pageCount
             loading = false
         } catch (e: CancellationException) {
             throw e
@@ -252,7 +254,7 @@ fun PdfViewerScreen(
                     }
                 }
                 localPath == null || isDownloading -> {
-                    val clamped = (downloadItem?.progress ?: 0f).coerceIn(0f, 1f)
+                    val clamped = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.padding(32.dp),
@@ -293,75 +295,77 @@ fun PdfViewerScreen(
                         )
                     }
                 }
-                pageCount == 0 || session == null -> {
+                pageCount == 0 || session == null || localPath == null -> {
                     Text(
                         text = stringResource(R.string.player_pdf_empty),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 else -> {
-                    val activeSession = session!!
-                    val path = localPath!!
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(messageId) {
-                                detectTapGestures(
-                                    onDoubleTap = {
-                                        if (scale > 1.05f) {
-                                            scale = 1f
-                                            offset = Offset.Zero
-                                        } else {
-                                            scale = 2f
-                                        }
-                                    },
-                                )
-                            }
-                            .pointerInput(messageId) {
-                                awaitEachGesture {
-                                    awaitFirstDown(requireUnconsumed = false)
-                                    do {
-                                        val event = awaitPointerEvent()
-                                        val pointerCount = event.changes.count { it.pressed }
-                                        if (pointerCount >= 2 || scale > 1.02f) {
-                                            val zoom = event.calculateZoom()
-                                            val pan = event.calculatePan()
-                                            val nextScale = (scale * zoom).coerceIn(1f, 4f)
-                                            val maxX = ((containerSize.width * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
-                                            val maxY = ((containerSize.height * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
-                                            scale = nextScale
-                                            offset = if (nextScale <= 1.02f) {
-                                                Offset.Zero
+                    val activeSession = session
+                    val path = localPath
+                    if (activeSession != null && path != null) {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(messageId) {
+                                    detectTapGestures(
+                                        onDoubleTap = {
+                                            if (scale > 1.05f) {
+                                                scale = 1f
+                                                offset = Offset.Zero
                                             } else {
-                                                Offset(
-                                                    x = (offset.x + pan.x).coerceIn(-maxX, maxX),
-                                                    y = (offset.y + pan.y).coerceIn(-maxY, maxY),
-                                                )
+                                                scale = 2f
                                             }
-                                            if (pointerCount >= 2) {
-                                                event.changes.forEach { it.consume() }
-                                            }
-                                        }
-                                    } while (event.changes.any { it.pressed })
+                                        },
+                                    )
                                 }
-                            }
-                            .graphicsLayer(
-                                scaleX = scale,
-                                scaleY = scale,
-                                translationX = offset.x,
-                                translationY = offset.y,
+                                .pointerInput(messageId) {
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        do {
+                                            val event = awaitPointerEvent()
+                                            val pointerCount = event.changes.count { it.pressed }
+                                            if (pointerCount >= 2 || scale > 1.02f) {
+                                                val zoom = event.calculateZoom()
+                                                val pan = event.calculatePan()
+                                                val nextScale = (scale * zoom).coerceIn(1f, 4f)
+                                                val maxX = ((containerSize.width * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
+                                                val maxY = ((containerSize.height * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
+                                                scale = nextScale
+                                                offset = if (nextScale <= 1.02f) {
+                                                    Offset.Zero
+                                                } else {
+                                                    Offset(
+                                                        x = (offset.x + pan.x).coerceIn(-maxX, maxX),
+                                                        y = (offset.y + pan.y).coerceIn(-maxY, maxY),
+                                                    )
+                                                }
+                                                if (pointerCount >= 2) {
+                                                    event.changes.forEach { it.consume() }
+                                                }
+                                            }
+                                        } while (event.changes.any { it.pressed })
+                                    }
+                                }
+                                .graphicsLayer(
+                                    scaleX = scale,
+                                    scaleY = scale,
+                                    translationX = offset.x,
+                                    translationY = offset.y,
+                                ),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            contentPadding = PaddingValues(
+                                start = 12.dp,
+                                top = 12.dp,
+                                end = 12.dp,
+                                bottom = bottomNavPad + 16.dp,
                             ),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(
-                            start = 12.dp,
-                            top = 12.dp,
-                            end = 12.dp,
-                            bottom = bottomNavPad + 16.dp,
-                        ),
-                    ) {
-                        items(pageCount) { pageIndex ->
-                            PdfPage(session = activeSession, path = path, pageIndex = pageIndex)
+                        ) {
+                            items(pageCount) { pageIndex ->
+                                PdfPage(session = activeSession, path = path, pageIndex = pageIndex)
+                            }
                         }
                     }
                 }
@@ -376,9 +380,7 @@ private fun PdfPage(session: PdfRendererSession, path: String, pageIndex: Int) {
 
     DisposableEffect(session, path, pageIndex) {
         onDispose {
-            val old = bitmap
             bitmap = null
-            if (old != null && !old.isRecycled) old.recycle()
         }
     }
 

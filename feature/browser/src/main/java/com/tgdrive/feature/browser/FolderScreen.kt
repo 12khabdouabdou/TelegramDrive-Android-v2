@@ -1214,7 +1214,10 @@ private fun handleFileTap(
                 vm.showSnackbar(noAppMessage)
             }
         }
-        else -> vm.downloadFile(item)
+        else -> {
+            vm.downloadFile(item)
+            vm.showSnackbar(context.getString(R.string.browser_downloading_file, item.fileName))
+        }
     }
 }
 

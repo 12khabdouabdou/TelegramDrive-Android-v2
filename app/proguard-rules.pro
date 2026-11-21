@@ -1,8 +1,15 @@
 # Hilt
 -keep class dagger.hilt.** { *; }
 -keep class * extends javax.inject.Provider { *; }
+-keep @dagger.hilt.android.lifecycle.HiltViewModel class * extends androidx.lifecycle.ViewModel {
+    <init>(...);
+}
+-keepnames @dagger.hilt.android.lifecycle.HiltViewModel class * extends androidx.lifecycle.ViewModel
 -keep,allowobfuscation,allowshrinking class kotlin.coroutines.Continuation
 -keep,allowobfuscation,allowshrinking interface kotlin.coroutines.Continuation
+
+# Media3 / ExoPlayer UI
+-keep class androidx.media3.ui.** { *; }
 
 # Room
 -keep class * extends androidx.room.RoomDatabase { *; }

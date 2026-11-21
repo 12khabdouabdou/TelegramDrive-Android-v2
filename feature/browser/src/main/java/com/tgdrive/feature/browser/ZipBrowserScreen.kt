@@ -238,11 +238,12 @@ fun ZipBrowserScreen(
                     )
                 }
 
+                val loadError = state.error
                 when {
                     state.loading -> LoadingState()
-                    !state.zipReady && state.error != null ->
+                    !state.zipReady && loadError != null ->
                         LoadErrorState(
-                            error = state.error!!,
+                            error = loadError,
                             onRetry = if (localPath != null) {
                                 { vm.load(localPath) }
                             } else {
@@ -258,12 +259,14 @@ fun ZipBrowserScreen(
                             error = downloadItem.errorMessage,
                             onRetry = { vm.downloadManager.enqueue(downloadItem) },
                         )
-                    !state.zipReady && localPath == null ->
+                    !state.zipReady && localPath == null -> {
+                        val clamped = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
                         DownloadingState(
                             fileName = downloadItem?.fileName ?: "#$messageId",
-                            progress = downloadItem?.progress?.coerceIn(0f, 1f) ?: 0f,
+                            progress = clamped,
                             hasKnownSize = (downloadItem?.totalBytes ?: 0L) > 0L,
                         )
+                    }
                     state.entries.isEmpty() && state.zipReady ->
                         ArchiveEmptyState(stringResource(R.string.zip_browser_empty))
                     visibleItems.isEmpty() && state.zipReady ->
@@ -583,7 +586,8 @@ private fun EntriesList(
     onFolderClick: (ZipBrowserItem.FolderNode) -> Unit,
     onFileClick: (ZipBrowserItem.FileNode) -> Unit,
 ) {
-    val thumbnailGenerator = remember { ZipThumbnailGenerator() }
+    val context = LocalContext.current
+    val thumbnailGenerator = remember(context) { ZipThumbnailGenerator(cacheDir = context.cacheDir) }
     val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     DisposableEffect(thumbnailGenerator) {
         onDispose { thumbnailGenerator.clear() }
@@ -766,7 +770,14 @@ private fun EntryLeading(
         if (!showThumbnail || zipPath == null || thumbnailTried) return@LaunchedEffect
         thumbnailTried = true
         val bmp = withContext(kotlinx.coroutines.Dispatchers.IO) {
-            thumbnailGenerator.getThumbnail(zipPath, entry.name)
+            try {
+                thumbnailGenerator.getThumbnail(zipPath, entry.name)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.w("ZipBrowser: thumbnail decode failed", t)
+                null
+            }
         }
         thumbnail = bmp
     }

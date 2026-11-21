@@ -53,7 +53,9 @@ class DownloadManager @Inject constructor(
         val existing = _state.value.items.find { it.id == item.id }
         if (existing != null) {
             if (existing.status == DownloadStatus.DONE) {
-                val fileExists = existing.localPath != null && File(existing.localPath).exists()
+                val fileExists = runCatching {
+                    existing.localPath != null && File(existing.localPath).exists()
+                }.getOrDefault(false)
                 if (fileExists) return
                 updateItem(item.id) { it.copy(status = DownloadStatus.QUEUED, progress = 0f, errorMessage = null, localPath = null) }
             } else if (existing.status != DownloadStatus.FAILED && existing.status != DownloadStatus.CANCELLED) {
@@ -94,8 +96,12 @@ class DownloadManager @Inject constructor(
                     .collect { upd ->
                         when (upd) {
                             is DownloadUpdate.Progress -> {
-                                val p = if (upd.total <= 0) 0f else upd.downloaded.toFloat() / upd.total.toFloat()
-                                updateItem(item.id) { it.copy(progress = p, downloadedBytes = upd.downloaded, totalBytes = upd.total) }
+                                updateItem(item.id) { cur ->
+                                    val effectiveTotal = if (upd.total > 0L) upd.total else cur.totalBytes
+                                    val raw = if (effectiveTotal <= 0L) 0f else upd.downloaded.toFloat() / effectiveTotal.toFloat()
+                                    val safeProgress = if (raw.isFinite()) raw.coerceIn(0f, 1f) else 0f
+                                    cur.copy(progress = safeProgress, downloadedBytes = upd.downloaded, totalBytes = effectiveTotal)
+                                }
                                 updateNotification(force = false)
                             }
                             is DownloadUpdate.Done -> {
@@ -158,13 +164,13 @@ class DownloadManager @Inject constructor(
                 dismissNotifJob?.cancel()
                 dismissNotifJob = scope.launch {
                     kotlinx.coroutines.delay(3000)
-                    nm.cancel(DOWNLOAD_NOTIF_ID)
+                    runCatching { nm.cancel(DOWNLOAD_NOTIF_ID) }
                 }
             } else if (active.isNotEmpty()) {
                 dismissNotifJob?.cancel()
                 dismissNotifJob = null
                 val current = active.firstOrNull { it.status == DownloadStatus.DOWNLOADING } ?: active.first()
-                val progress = (current.progress * 100).toInt()
+                val progress = ((current.progress.takeIf { it.isFinite() } ?: 0f).coerceIn(0f, 1f) * 100f).toInt().coerceIn(0, 100)
                 val notif = androidx.core.app.NotificationCompat.Builder(ctx, "download.progress")
                     .setSmallIcon(android.R.drawable.stat_sys_download)
                     .setContentTitle("Downloading ${current.fileName}")

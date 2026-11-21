@@ -52,4 +52,8 @@
     <string name="settings_biometric_confirm_subtitle">Verify biometrics to change lock setting</string>
     <string name="settings_encryption_unavailable_title">Hardware encryption unavailable</string>
     <string name="settings_encryption_unavailable_desc">Android Keystore failed on this device; credentials are using unencrypted fallback storage.</string>
+    <string name="settings_crash_log_title">Last crash log</string>
+    <string name="settings_crash_log_copy">Copy log</string>
+    <string name="settings_crash_log_copied">Crash log copied</string>
+    <string name="settings_crash_log_clear">Clear</string>
 </resources>

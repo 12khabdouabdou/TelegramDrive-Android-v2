@@ -107,59 +107,63 @@ class TdLibTelegramClient(
 
     private fun createUpdateHandler(onClosed: (() -> Unit)? = null): Client.ResultHandler =
         Client.ResultHandler { update ->
-            when (update) {
-                is TdApi.UpdateAuthorizationState -> {
-                    val st = update.authorizationState
-                    _authState.value = st.toDomain()
-                    when (st) {
-                        is TdApi.AuthorizationStateWaitCode -> {
-                            _authCodeInfo.value = st.codeInfo.toDomain()
-                            Log.i("TDLib: WaitCode type=${st.codeInfo?.type?.javaClass?.simpleName} next=${st.codeInfo?.nextType?.javaClass?.simpleName} timeout=${st.codeInfo?.timeout}")
+            try {
+                when (update) {
+                    is TdApi.UpdateAuthorizationState -> {
+                        val st = update.authorizationState
+                        _authState.value = st.toDomain()
+                        when (st) {
+                            is TdApi.AuthorizationStateWaitCode -> {
+                                _authCodeInfo.value = st.codeInfo.toDomain()
+                                Log.i("TDLib: WaitCode type=${st.codeInfo?.type?.javaClass?.simpleName} next=${st.codeInfo?.nextType?.javaClass?.simpleName} timeout=${st.codeInfo?.timeout}")
+                            }
+                            is TdApi.AuthorizationStateReady -> {
+                                _authCodeInfo.value = null
+                                scope.launch { refreshMyUserId() }
+                            }
+                            is TdApi.AuthorizationStateWaitPhoneNumber -> {
+                                _authCodeInfo.value = null
+                            }
+                            is TdApi.AuthorizationStateClosed -> {
+                                _authCodeInfo.value = null
+                                onClosed?.invoke()
+                            }
+                            else -> Unit
                         }
-                        is TdApi.AuthorizationStateReady -> {
-                            _authCodeInfo.value = null
-                            scope.launch { refreshMyUserId() }
-                        }
-                        is TdApi.AuthorizationStateWaitPhoneNumber -> {
-                            _authCodeInfo.value = null
-                        }
-                        is TdApi.AuthorizationStateClosed -> {
-                            _authCodeInfo.value = null
-                            onClosed?.invoke()
-                        }
-                        else -> Unit
                     }
-                }
-                is TdApi.UpdateFile -> {
-                    val f = update.file
-                    downloadHandlers[f.id]?.forEach { it.invoke(f) }
-                    uploadHandlers[f.id]?.forEach { it.invoke(f) }
-                }
-                is TdApi.UpdateMessageSendSucceeded -> {
-                    val oldId = update.oldMessageId
-                    val newMsg = update.message
-                    Log.i("TDLib: UpdateMessageSendSucceeded oldId=$oldId → newId=${newMsg.id}")
-                    _messageIdUpdates.tryEmit(MessageIdUpdate(oldId, newMsg.id))
-                    val d = pendingSendConfirmations.remove(oldId)
-                    if (d != null) {
-                        d.complete(newMsg)
-                    } else {
-                        putBoundedOrphan(orphanedSendSucceeded, oldId, newMsg)
+                    is TdApi.UpdateFile -> {
+                        val f = update.file ?: return@ResultHandler
+                        downloadHandlers[f.id]?.forEach { it.invoke(f) }
+                        uploadHandlers[f.id]?.forEach { it.invoke(f) }
                     }
-                }
-                is TdApi.UpdateMessageSendFailed -> {
-                    val oldId = update.oldMessageId
-                    val err = update.error
-                    Log.w("TDLib: UpdateMessageSendFailed oldId=$oldId code=${err.code} msg=${err.message}")
-                    val d = pendingSendConfirmations.remove(oldId)
-                    if (d != null) {
-                        d.completeExceptionally(TelegramException.fromError(err))
-                    } else {
-                        putBoundedOrphan(orphanedSendFailed, oldId, err)
+                    is TdApi.UpdateMessageSendSucceeded -> {
+                        val oldId = update.oldMessageId
+                        val newMsg = update.message
+                        Log.i("TDLib: UpdateMessageSendSucceeded oldId=$oldId → newId=${newMsg.id}")
+                        _messageIdUpdates.tryEmit(MessageIdUpdate(oldId, newMsg.id))
+                        val d = pendingSendConfirmations.remove(oldId)
+                        if (d != null) {
+                            d.complete(newMsg)
+                        } else {
+                            putBoundedOrphan(orphanedSendSucceeded, oldId, newMsg)
+                        }
                     }
+                    is TdApi.UpdateMessageSendFailed -> {
+                        val oldId = update.oldMessageId
+                        val err = update.error
+                        Log.w("TDLib: UpdateMessageSendFailed oldId=$oldId code=${err.code} msg=${err.message}")
+                        val d = pendingSendConfirmations.remove(oldId)
+                        if (d != null) {
+                            d.completeExceptionally(TelegramException.fromError(err))
+                        } else {
+                            putBoundedOrphan(orphanedSendFailed, oldId, err)
+                        }
+                    }
+                    is TdApi.UpdateNewMessage -> Unit
+                    else -> Unit
                 }
-                is TdApi.UpdateNewMessage -> Unit
-                else -> Unit
+            } catch (t: Throwable) {
+                Log.w("TDLib update handler error", t)
             }
         }
 
@@ -673,68 +677,117 @@ class TdLibTelegramClient(
     }
 
     override fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate> = flow {
-        if (remoteId.isEmpty()) { emit(DownloadUpdate.Failed("File has no remote ID")); return@flow }
+        if (remoteId.isEmpty()) {
+            emit(DownloadUpdate.Failed("File has no remote ID"))
+            return@flow
+        }
+        val activeClient = client
+        if (activeClient == null) {
+            emit(DownloadUpdate.Failed("TDLib not initialised"))
+            return@flow
+        }
         Log.i("downloadFile: remoteId=${remoteId.take(30)}…")
-        val file = send<TdApi.File>(TdApi.GetRemoteFile(remoteId, TdApi.FileTypeNone()))
-
-        if (file.local.isDownloadingCompleted) {
-            val p = file.local.path
-            if (p.isNotEmpty() && File(p).exists()) { emit(DownloadUpdate.Done(p)); return@flow }
-            Log.i("downloadFile: stale cache, re-downloading")
-            try { send<TdApi.Ok>(TdApi.DeleteFile(file.id)) } catch (_: Throwable) {}
-        }
-
-        val channel = Channel<DownloadUpdate>(Channel.BUFFERED)
-        val dlHandler: (TdApi.File) -> Unit = { f ->
-            if (f.local.isDownloadingCompleted) {
-                val pp = f.local.path
-                if (pp.isNotEmpty() && File(pp).exists()) channel.trySend(DownloadUpdate.Done(pp))
-                else channel.trySend(DownloadUpdate.Failed("File missing after download"))
-                channel.close()
-            } else {
-                channel.trySend(DownloadUpdate.Progress(f.local.downloadedSize, f.size))
-            }
-        }
-        registerFileHandler(downloadHandlers, file.id, dlHandler)
-        var completed = false
 
         try {
-            client?.send(TdApi.DownloadFile(file.id, 8, 0, 0, false)) { result ->
-                when (result) {
-                    is TdApi.Error -> {
-                        channel.trySend(DownloadUpdate.Failed(result.message ?: "Error"))
-                        channel.close()
-                    }
-                    is TdApi.File -> {
-                        if (result.local.isDownloadingCompleted) {
-                            val pp = result.local.path
+            val file = send<TdApi.File>(TdApi.GetRemoteFile(remoteId, null))
+            val initialLocal = file.local
+            if (initialLocal?.isDownloadingCompleted == true) {
+                val p = initialLocal.path.orEmpty()
+                if (p.isNotEmpty() && File(p).exists()) {
+                    emit(DownloadUpdate.Done(p))
+                    return@flow
+                }
+                Log.i("downloadFile: stale cache, re-downloading")
+                try { send<TdApi.Ok>(TdApi.DeleteFile(file.id)) } catch (_: Throwable) {}
+            }
+
+            val channel = Channel<DownloadUpdate>(Channel.BUFFERED)
+            val dlHandler: (TdApi.File) -> Unit = { f ->
+                try {
+                    val fLocal = f.local
+                    if (fLocal != null) {
+                        if (fLocal.isDownloadingCompleted) {
+                            val pp = fLocal.path.orEmpty()
                             if (pp.isNotEmpty() && File(pp).exists()) {
                                 channel.trySend(DownloadUpdate.Done(pp))
                             } else {
                                 channel.trySend(DownloadUpdate.Failed("File missing after download"))
                             }
                             channel.close()
+                        } else {
+                            val total = if (f.size > 0L) f.size else f.expectedSize
+                            channel.trySend(DownloadUpdate.Progress(fLocal.downloadedSize, total))
                         }
                     }
+                } catch (t: Throwable) {
+                    Log.w("TDLib download handler error", t)
+                    channel.trySend(DownloadUpdate.Failed(t.message ?: "Download update error"))
+                    channel.close()
                 }
             }
-            withTimeoutOrNull(5 * 60 * 1000L) {
-                for (upd in channel) {
-                    if (upd is DownloadUpdate.Done) completed = true
-                    emit(upd)
-                    if (upd is DownloadUpdate.Done || upd is DownloadUpdate.Failed) break
+            registerFileHandler(downloadHandlers, file.id, dlHandler)
+            var completed = false
+
+            try {
+                activeClient.send(
+                    TdApi.DownloadFile(file.id, 8, 0, 0, false),
+                    { result ->
+                        try {
+                            when (result) {
+                                is TdApi.Error -> {
+                                    channel.trySend(DownloadUpdate.Failed(result.message ?: "Error"))
+                                    channel.close()
+                                }
+                                is TdApi.File -> {
+                                    val rLocal = result.local
+                                    if (rLocal?.isDownloadingCompleted == true) {
+                                        val pp = rLocal.path.orEmpty()
+                                        if (pp.isNotEmpty() && File(pp).exists()) {
+                                            channel.trySend(DownloadUpdate.Done(pp))
+                                        } else {
+                                            channel.trySend(DownloadUpdate.Failed("File missing after download"))
+                                        }
+                                        channel.close()
+                                    } else if (rLocal != null && !rLocal.isDownloadingActive && !rLocal.canBeDownloaded) {
+                                        channel.trySend(DownloadUpdate.Failed("File cannot be downloaded"))
+                                        channel.close()
+                                    }
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            Log.w("TDLib download result error", t)
+                            channel.trySend(DownloadUpdate.Failed(t.message ?: "Download callback error"))
+                            channel.close()
+                        }
+                    },
+                    { t ->
+                        Log.w("TDLib download request exception", t)
+                        channel.trySend(DownloadUpdate.Failed(t.message ?: "Download failed"))
+                        channel.close()
+                    },
+                )
+                withTimeoutOrNull(5 * 60 * 1000L) {
+                    for (upd in channel) {
+                        if (upd is DownloadUpdate.Done) completed = true
+                        emit(upd)
+                        if (upd is DownloadUpdate.Done || upd is DownloadUpdate.Failed) break
+                    }
+                } ?: emit(DownloadUpdate.Failed("Download timed out"))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                emit(DownloadUpdate.Failed(t.message ?: "Download failed"))
+            } finally {
+                unregisterFileHandler(downloadHandlers, file.id, dlHandler)
+                channel.close()
+                if (!completed) {
+                    try { activeClient.send(TdApi.CancelDownloadFile(file.id, false)) { } } catch (_: Throwable) {}
                 }
-            } ?: emit(DownloadUpdate.Failed("Download timed out"))
+            }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (t: Throwable) {
             emit(DownloadUpdate.Failed(t.message ?: "Download failed"))
-        } finally {
-            unregisterFileHandler(downloadHandlers, file.id, dlHandler)
-            channel.close()
-            if (!completed) {
-                try { client?.send(TdApi.CancelDownloadFile(file.id, false)) { } } catch (_: Throwable) {}
-            }
         }
     }.flowOn(dispatchers.io)
 

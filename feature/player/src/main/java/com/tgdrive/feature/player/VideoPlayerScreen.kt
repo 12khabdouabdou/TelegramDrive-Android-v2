@@ -1,6 +1,8 @@
 package com.tgdrive.feature.player
 
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -96,6 +98,13 @@ class VideoPlayerViewModel @Inject constructor(
     }
 }
 
+private tailrec fun Context.findActivity(): Activity? =
+    when (this) {
+        is Activity -> this
+        is ContextWrapper -> baseContext.findActivity()
+        else -> null
+    }
+
 /**
  * Video player screen with ExoPlayer, PiP button + PiP-aware chrome hiding,
  * Uri.fromFile safety, playback error recovery, and download retry.
@@ -107,7 +116,7 @@ fun VideoPlayerScreen(
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
     val ctx = LocalContext.current
-    val activity = ctx as? Activity
+    val activity = remember(ctx) { ctx.findActivity() }
     val config = LocalConfiguration.current
     val inPip = remember(config, activity) {
         activity != null && vm.pipController.isInPip(activity)
@@ -117,13 +126,14 @@ fun VideoPlayerScreen(
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var localPath by remember(messageId) { mutableStateOf<String?>(vm.getLocalPath(messageId)) }
     var playbackError by remember(messageId) { mutableStateOf<String?>(null) }
+    var playerInitError by remember(messageId) { mutableStateOf<String?>(null) }
 
     val downloadItem = downloadState.items.find { it.id == messageId }
     val isDownloading =
         downloadItem?.status == DownloadStatus.DOWNLOADING ||
             downloadItem?.status == DownloadStatus.QUEUED
     val isFailed = downloadItem?.status == DownloadStatus.FAILED
-    val downloadProgress = (downloadItem?.progress ?: 0f).coerceIn(0f, 1f)
+    val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
 
     LaunchedEffect(messageId, downloadState.items) {
         val path = vm.getLocalPath(messageId)
@@ -133,30 +143,52 @@ fun VideoPlayerScreen(
         }
     }
 
-    val exo = remember(messageId) { ExoPlayer.Builder(ctx).build() }
+    val exo = remember(messageId) {
+        try {
+            ExoPlayer.Builder(ctx.applicationContext).build()
+        } catch (t: Throwable) {
+            Log.w("VideoPlayer: failed to create ExoPlayer", t)
+            playerInitError = t.localizedMessage ?: "Video player initialization failed"
+            null
+        }
+    }
     var savedPositionMs by rememberSaveable(messageId) { mutableLongStateOf(0L) }
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    LaunchedEffect(localPath) {
+    LaunchedEffect(localPath, exo) {
+        val player = exo ?: return@LaunchedEffect
         val path = localPath ?: return@LaunchedEffect
-        val file = File(path)
-        if (!file.exists()) return@LaunchedEffect
-        playbackError = null
-        exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
-        if (savedPositionMs > 0L) {
-            exo.seekTo(savedPositionMs)
+        try {
+            val file = File(path)
+            if (!file.exists()) return@LaunchedEffect
+            playbackError = null
+            player.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+            if (savedPositionMs > 0L) {
+                player.seekTo(savedPositionMs)
+            }
+            player.prepare()
+            player.playWhenReady = true
+        } catch (t: Throwable) {
+            Log.w("VideoPlayer: failed to prepare media", t)
+            playbackError = t.localizedMessage ?: "Playback error"
         }
-        exo.prepare()
-        exo.playWhenReady = true
+    }
+
+    LaunchedEffect(localPath, playbackError, playerInitError) {
+        vm.pipController.setActive(
+            localPath != null && playbackError == null && playerInitError == null,
+        )
     }
 
     DisposableEffect(lifecycleOwner, exo, activity) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
-                savedPositionMs = exo.currentPosition.coerceAtLeast(0L)
-                val inPipNow = activity != null && vm.pipController.isInPip(activity)
-                if (!inPipNow) {
-                    exo.pause()
+            if (event == Lifecycle.Event.ON_STOP && exo != null) {
+                runCatching {
+                    savedPositionMs = exo.currentPosition.coerceAtLeast(0L)
+                    val inPipNow = activity != null && vm.pipController.isInPip(activity)
+                    if (!inPipNow) {
+                        exo.pause()
+                    }
                 }
             }
         }
@@ -173,15 +205,20 @@ fun VideoPlayerScreen(
                 playbackError = error.localizedMessage ?: "Playback error"
             }
         }
-        exo.addListener(listener)
-        vm.pipController.setActive(true)
+        exo?.let { runCatching { it.addListener(listener) } }
         onDispose {
-            savedPositionMs = exo.currentPosition.coerceAtLeast(0L)
-            exo.removeListener(listener)
+            runCatching {
+                exo?.let {
+                    savedPositionMs = it.currentPosition.coerceAtLeast(0L)
+                    it.removeListener(listener)
+                    it.release()
+                }
+            }
             vm.pipController.setActive(false)
-            exo.release()
         }
     }
+
+    val activeError = playerInitError ?: playbackError
 
     Box(
         modifier = Modifier
@@ -189,7 +226,7 @@ fun VideoPlayerScreen(
             .background(Color.Black),
     ) {
         when {
-            playbackError != null -> {
+            activeError != null -> {
                 Column(
                     modifier = Modifier.align(Alignment.Center).padding(24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -202,30 +239,42 @@ fun VideoPlayerScreen(
                     )
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        text = playbackError ?: stringResource(R.string.player_video_error),
+                        text = activeError.ifBlank { stringResource(R.string.player_video_error) },
                         color = Color.White,
                         style = TgTypography.Display.bodyMedium,
                     )
-                    Spacer(Modifier.height(16.dp))
-                    Button(onClick = {
-                        playbackError = null
-                        exo.prepare()
-                        exo.playWhenReady = true
-                    }) {
-                        Text(stringResource(R.string.player_retry))
+                    if (playerInitError == null && exo != null) {
+                        Spacer(Modifier.height(16.dp))
+                        Button(onClick = {
+                            playbackError = null
+                            runCatching {
+                                exo.prepare()
+                                exo.playWhenReady = true
+                            }.onFailure { err ->
+                                playbackError = err.localizedMessage ?: "Playback error"
+                            }
+                        }) {
+                            Text(stringResource(R.string.player_retry))
+                        }
                     }
                 }
             }
-            localPath != null -> {
+            localPath != null && exo != null -> {
                 AndroidView(
-                    factory = {
-                        PlayerView(it).apply {
+                    factory = { viewCtx ->
+                        PlayerView(viewCtx).apply {
                             player = exo
                             useController = !inPip
                         }
                     },
                     update = { view ->
+                        if (view.player !== exo) {
+                            view.player = exo
+                        }
                         view.useController = !inPip
+                    },
+                    onRelease = { view ->
+                        view.player = null
                     },
                     modifier = Modifier.fillMaxSize(),
                 )

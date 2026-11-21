@@ -8,6 +8,7 @@ import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.tgdrive.app.boot.NotificationChannels
+import com.tgdrive.core.common.CrashLogStore
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.BackupSchedule
@@ -52,6 +53,14 @@ class TelegramDriveApp :
     override fun onCreate() {
         super.onCreate()
         Log.isDebug = BuildConfig.DEBUG
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                CrashLogStore.save(this, thread, throwable)
+            } finally {
+                previousHandler?.uncaughtException(thread, throwable)
+            }
+        }
         NotificationChannels.ensureCreated(this)
 
         // NOTE: Do NOT install a global Thread.setDefaultUncaughtExceptionHandler.

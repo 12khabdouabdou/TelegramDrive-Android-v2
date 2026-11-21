@@ -67,7 +67,7 @@ fun ImagePlayerScreen(
         downloadItem?.status == DownloadStatus.DOWNLOADING ||
             downloadItem?.status == DownloadStatus.QUEUED
     val isFailed = downloadItem?.status == DownloadStatus.FAILED
-    val downloadProgress = (downloadItem?.progress ?: 0f).coerceIn(0f, 1f)
+    val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
 
     LaunchedEffect(messageId, downloadState.items) {
         val path = vm.getLocalPath(messageId)
@@ -76,15 +76,20 @@ fun ImagePlayerScreen(
         }
     }
 
+    val resolvedPath = localPath
+    val fileReady = remember(resolvedPath) {
+        resolvedPath != null && runCatching { File(resolvedPath).exists() }.getOrDefault(false)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
         when {
-            localPath != null && File(localPath!!).exists() -> {
+            resolvedPath != null && fileReady -> {
                 ImageViewer(
-                    imagePaths = listOf(localPath!!),
+                    imagePaths = listOf(resolvedPath),
                     onDismiss = onBack,
                     onToggleChrome = { showChrome = !showChrome },
                 )

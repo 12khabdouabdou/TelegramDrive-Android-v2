@@ -36,6 +36,7 @@ class ZipThumbnailGenerator(
     maxCacheEntries: Int = 64,
     private val targetSizePx: Int = 200,
     private val videoFrameExtractor: VideoFrameExtractor = DefaultVideoFrameExtractor(),
+    private val cacheDir: File? = null,
 ) {
     private val cache: LruCache<String, Bitmap> = LruCache(maxCacheEntries)
 
@@ -129,10 +130,13 @@ class ZipThumbnailGenerator(
         zipPath: String,
         entryName: String,
     ): Bitmap? {
-        val tempFile = File.createTempFile("tgdrive_thumb_", ".mp4")
+        var tempFile: File? = null
         return try {
             val zip = File(zipPath)
             if (!zip.exists()) return null
+            cacheDir?.mkdirs()
+            val outFile = File.createTempFile("tgdrive_thumb_", ".mp4", cacheDir)
+            tempFile = outFile
             ZipFile(zip).use { z ->
                 val entry = z.getEntry(entryName) ?: return null
                 if (entry.size > MAX_VIDEO_THUMB_BYTES) {
@@ -140,7 +144,7 @@ class ZipThumbnailGenerator(
                     return null
                 }
                 z.getInputStream(entry).use { input ->
-                    tempFile.outputStream().use { output ->
+                    outFile.outputStream().use { output ->
                         val buf = ByteArray(16 * 1024)
                         var copied = 0L
                         while (true) {
@@ -156,7 +160,7 @@ class ZipThumbnailGenerator(
                     }
                 }
             }
-            val raw = videoFrameExtractor.extractFrame(tempFile) ?: return null
+            val raw = videoFrameExtractor.extractFrame(outFile) ?: return null
             // Downsample if the frame is huge (MediaMetadataRetriever returns
             // full-resolution frames by default).
             downsampleIfNeeded(raw)
@@ -166,7 +170,7 @@ class ZipThumbnailGenerator(
             Log.w("ZipThumbnailGenerator: failed to decode video '$entryName'", t)
             null
         } finally {
-            tempFile.delete()
+            runCatching { tempFile?.delete() }
         }
     }
 

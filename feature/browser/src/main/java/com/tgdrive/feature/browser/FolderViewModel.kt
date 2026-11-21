@@ -810,7 +810,9 @@ class FolderViewModel
                         DownloadStatus.DONE -> {
                             val path = terminal.localPath
                             if (path != null && File(path).exists()) {
-                                audioPlayerController.playAudio(path, item.fileName)
+                                withContext(dispatchers.main) {
+                                    audioPlayerController.playAudio(path, item.fileName)
+                                }
                             }
                         }
                         DownloadStatus.FAILED -> {

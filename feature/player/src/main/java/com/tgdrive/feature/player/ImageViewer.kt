@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * Full-screen swipeable image viewer with bounded pinch-zoom, double-tap
@@ -197,7 +198,7 @@ private fun ZoomableImagePage(
     ) {
         val bmp = bitmap
         when {
-            bmp != null -> {
+            bmp != null && !bmp.isRecycled -> {
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = stringResource(R.string.player_image_desc),
@@ -236,23 +237,47 @@ private fun ZoomableImagePage(
     }
 }
 
+private const val MAX_DECODED_BITMAP_BYTES = 32 * 1024 * 1024
+
 private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
     return try {
+        val file = File(path)
+        if (!file.isFile) return null
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, opts)
-        var inSampleSize = 1
         val (h, w) = opts.outHeight to opts.outWidth
-        if (h > reqHeight || w > reqWidth) {
-            val halfH = h / 2
-            val halfW = w / 2
-            while (halfH / inSampleSize >= reqHeight && halfW / inSampleSize >= reqWidth) {
-                inSampleSize *= 2
-            }
+        if (h <= 0 || w <= 0) return null
+        var inSampleSize = 1
+        while (h / inSampleSize > reqHeight || w / inSampleSize > reqWidth) {
+            inSampleSize *= 2
         }
-        BitmapFactory.decodeFile(
+        val decoded = BitmapFactory.decodeFile(
             path,
-            BitmapFactory.Options().apply { this.inSampleSize = inSampleSize },
-        )
+            BitmapFactory.Options().apply {
+                this.inSampleSize = inSampleSize
+                this.inPreferredConfig = Bitmap.Config.ARGB_8888
+            },
+        ) ?: return null
+        if (
+            decoded.width > reqWidth ||
+            decoded.height > reqHeight ||
+            decoded.allocationByteCount > MAX_DECODED_BITMAP_BYTES
+        ) {
+            val scaleFactor = minOf(
+                reqWidth.toFloat() / decoded.width.coerceAtLeast(1).toFloat(),
+                reqHeight.toFloat() / decoded.height.coerceAtLeast(1).toFloat(),
+                1f,
+            )
+            val targetW = (decoded.width * scaleFactor).toInt().coerceAtLeast(1)
+            val targetH = (decoded.height * scaleFactor).toInt().coerceAtLeast(1)
+            val scaled = Bitmap.createScaledBitmap(decoded, targetW, targetH, true)
+            if (scaled !== decoded && !decoded.isRecycled) {
+                decoded.recycle()
+            }
+            scaled
+        } else {
+            decoded
+        }
     } catch (_: Throwable) {
         null
     }

@@ -233,6 +233,41 @@ class ZipThumbnailGeneratorTest {
         assertThat(capturedTempFile!!.exists()).isFalse()
     }
 
+    @Test
+    fun `temp video file uses explicit cacheDir and cleans up`() {
+        val customCache = File(tempDir, "custom_cache")
+        val expectedBitmap = createSolidColorBitmap(64, 64, 0xFF00FF00.toInt())
+        var capturedTempFile: File? = null
+        val gen = ZipThumbnailGenerator(
+            videoFrameExtractor = { f ->
+                capturedTempFile = f
+                expectedBitmap
+            },
+            cacheDir = customCache,
+        )
+        writeRawZip(zipFile, "clip.mp4" to "bytes".toByteArray())
+
+        val result = gen.getThumbnail(zipFile.absolutePath, "clip.mp4")
+
+        assertThat(result).isSameInstanceAs(expectedBitmap)
+        assertThat(capturedTempFile).isNotNull()
+        assertThat(capturedTempFile!!.parentFile).isEqualTo(customCache)
+        assertThat(capturedTempFile!!.exists()).isFalse()
+    }
+
+    @Test
+    fun `invalid cacheDir returns null safely instead of throwing`() {
+        val blockerFile = File(tempDir, "not_a_dir").apply { writeText("x") }
+        val gen = ZipThumbnailGenerator(
+            videoFrameExtractor = { _ -> createSolidColorBitmap(64, 64, 0xFF00FF00.toInt()) },
+            cacheDir = blockerFile,
+        )
+        writeRawZip(zipFile, "clip.mp4" to "bytes".toByteArray())
+
+        val result = gen.getThumbnail(zipFile.absolutePath, "clip.mp4")
+        assertThat(result).isNull()
+    }
+
     // ───────────────────────────────────────────────── test helpers ──
 
     private fun createSolidColorBitmap(

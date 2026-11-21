@@ -57,6 +57,7 @@
     <string name="browser_upload_done">Done</string>
     <string name="browser_upload_failed">Failed</string>
     <string name="browser_no_app_error">No app installed to open this file</string>
+    <string name="browser_downloading_file">Downloading %1$s…</string>
 
     <!-- Delete confirmation -->
     <string name="browser_delete_confirm_title_one">Delete file?</string>

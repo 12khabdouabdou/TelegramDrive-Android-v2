@@ -23,20 +23,28 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.tgdrive.core.common.CrashLogStore
 import com.tgdrive.designsystem.editorial.EditorialCard
 import com.tgdrive.designsystem.editorial.EditorialKeyValueRow
 import com.tgdrive.designsystem.theme.TgTypography
@@ -51,6 +59,9 @@ fun AboutScreen(
 ) {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
+    val clipboardManager = LocalClipboardManager.current
+    var crashLog by remember(context) { mutableStateOf(CrashLogStore.read(context)) }
+    var crashLogCopied by remember { mutableStateOf(false) }
     val versionName = remember(context) {
         try {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0.3"
@@ -162,6 +173,60 @@ fun AboutScreen(
                         label = stringResource(R.string.settings_about_license_label),
                         value = stringResource(R.string.settings_about_license_value),
                     )
+                }
+            }
+
+            crashLog?.let { logText ->
+                EditorialCard {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.settings_crash_log_title),
+                            style = TgTypography.Display.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            text = logText.take(1200),
+                            style = TgTypography.Mono,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 12,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(logText))
+                                    crashLogCopied = true
+                                },
+                            ) {
+                                Text(
+                                    stringResource(
+                                        if (crashLogCopied) {
+                                            R.string.settings_crash_log_copied
+                                        } else {
+                                            R.string.settings_crash_log_copy
+                                        },
+                                    ),
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    CrashLogStore.clear(context)
+                                    crashLog = null
+                                    crashLogCopied = false
+                                },
+                            ) {
+                                Text(stringResource(R.string.settings_crash_log_clear))
+                            }
+                        }
+                    }
                 }
             }
 
