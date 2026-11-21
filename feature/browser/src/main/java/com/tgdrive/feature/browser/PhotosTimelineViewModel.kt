@@ -14,6 +14,7 @@ import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.sync.CloudSyncManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -75,9 +76,33 @@ class PhotosTimelineViewModel @Inject constructor(
     private val downloadManager: DownloadManager,
     private val offlinePinStore: OfflinePinStore,
     private val cloudSyncManager: CloudSyncManager,
+    private val mediaThumbnailCache: MediaThumbnailCache,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
+
+    private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+
+    init {
+        viewModelScope.launch(dispatchers.io) {
+            fileCacheDao.observeMediaItems().collect { media ->
+                val toResolve = media
+                    .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+                    .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
+                    .take(60)
+                for (entity in toResolve) {
+                    launch {
+                        try {
+                            mediaThumbnailCache.ensureThumbnail(entity)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private val _filter = MutableStateFlow(MediaFilter.ALL)
     private val _columns = MutableStateFlow(3)

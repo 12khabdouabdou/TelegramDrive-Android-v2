@@ -3,6 +3,14 @@
 package com.tgdrive.core.telegram
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
+import android.media.MediaMetadataRetriever
+import android.os.ParcelFileDescriptor
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import kotlinx.coroutines.CompletableDeferred
@@ -32,6 +40,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
@@ -67,6 +76,38 @@ class TdLibTelegramClient(
 
     private val downloadHandlers = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
     private val uploadHandlers = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
+    private val pendingThumbnails = ConcurrentHashMap<Int, CopyOnWriteArrayList<Pair<Long, Long>>>()
+
+    private val _thumbnailUpdates = MutableSharedFlow<ThumbnailUpdate>(
+        extraBufferCapacity = 512,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    override val thumbnailUpdates: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate> =
+        _thumbnailUpdates.asSharedFlow()
+
+    private fun registerPendingThumbnail(
+        fileId: Int,
+        chatId: Long,
+        messageId: Long,
+    ) {
+        val list = pendingThumbnails.computeIfAbsent(fileId) { CopyOnWriteArrayList() }
+        val key = chatId to messageId
+        if (!list.contains(key)) {
+            list.add(key)
+        }
+    }
+
+    private fun emitThumbnailCompleted(file: TdApi.File) {
+        val local = file.local ?: return
+        val path = local.path.orEmpty()
+        if (!local.isDownloadingCompleted || path.isEmpty()) return
+        val f = File(path)
+        if (!f.isFile || f.length() <= 0L) return
+        val targets = pendingThumbnails.remove(file.id) ?: return
+        targets.forEach { (chatId, msgId) ->
+            _thumbnailUpdates.tryEmit(ThumbnailUpdate(chatId, msgId, path))
+        }
+    }
 
     private fun registerFileHandler(
         map: ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>,
@@ -140,6 +181,9 @@ class TdLibTelegramClient(
                         val f = update.file ?: return@ResultHandler
                         downloadHandlers[f.id]?.forEach { it.invoke(f) }
                         uploadHandlers[f.id]?.forEach { it.invoke(f) }
+                        if (f.local?.isDownloadingCompleted == true && pendingThumbnails.containsKey(f.id)) {
+                            emitThumbnailCompleted(f)
+                        }
                     }
                     is TdApi.UpdateMessageSendSucceeded -> {
                         val oldId = update.oldMessageId
@@ -397,6 +441,7 @@ class TdLibTelegramClient(
                 orphanedSendFailed.clear()
                 downloadHandlers.clear()
                 uploadHandlers.clear()
+                pendingThumbnails.clear()
                 withTimeoutOrNull(5_000) {
                     try { send<TdApi.Ok>(TdApi.Close()) } catch (_: Throwable) {}
                 }
@@ -406,28 +451,60 @@ class TdLibTelegramClient(
     }
 
     // File ops
+    private fun prepareMessageThumbnails(
+        tdMessages: Array<TdApi.Message>,
+        domainMsgs: List<TelegramMessage>,
+    ): List<TelegramMessage> {
+        val msgById = tdMessages.associateBy { it.id }
+        val miniDir = File(appContext.cacheDir, "minithumbs")
+        return domainMsgs.map { msg ->
+            val tdMsg = msgById[msg.id]
+            val thumbFileId = tdMsg?.extractThumbnailFileId()
+            if (thumbFileId != null && thumbFileId != 0 && tdMsg != null && !tdMsg.isThumbnailDownloaded()) {
+                try {
+                    registerPendingThumbnail(thumbFileId, msg.chatId, msg.id)
+                    client?.send(TdApi.DownloadFile(thumbFileId, 16, 0, 0, false)) { res ->
+                        if (res is TdApi.File) {
+                            emitThumbnailCompleted(res)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            if (msg.thumbnailPath == null && msg.minithumbnailBytes != null && msg.minithumbnailBytes.isNotEmpty()) {
+                val miniFile = File(miniDir, "${msg.chatId}_${msg.id}.jpg")
+                if (!miniFile.isFile || miniFile.length() <= 0L) {
+                    runCatching {
+                        miniDir.mkdirs()
+                        val tmp = File(miniDir, "${msg.chatId}_${msg.id}.tmp")
+                        tmp.writeBytes(msg.minithumbnailBytes)
+                        if (miniFile.exists()) miniFile.delete()
+                        if (!tmp.renameTo(miniFile)) {
+                            tmp.copyTo(miniFile, overwrite = true)
+                            tmp.delete()
+                        }
+                    }
+                }
+                if (miniFile.isFile && miniFile.length() > 0L) {
+                    return@map msg.copy(thumbnailPath = miniFile.absolutePath)
+                }
+            }
+            msg
+        }
+    }
+
     override suspend fun fetchMessages(chatId: Long, fromMessageId: Long, limit: Int): List<TelegramMessage> = withContext(dispatchers.io) {
         val resp = send<TdApi.Messages>(TdApi.GetChatHistory(chatId, fromMessageId, 0, limit, false))
         val msgs = resp.messages.mapNotNull { it.toDomainFile() }
-        val msgById = resp.messages.associateBy { it.id }
-        for (msg in msgs) {
-            try {
-                val tdMsg = msgById[msg.id]
-                val thumbFileId = tdMsg?.extractThumbnailFileId()
-                if (thumbFileId != null && thumbFileId != 0 && tdMsg.isThumbnailDownloaded().not()) {
-                    client?.send(TdApi.DownloadFile(thumbFileId, 5, 0, 0, false)) { _ -> }
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (_: Throwable) {}
-        }
-        msgs
+        prepareMessageThumbnails(resp.messages, msgs)
     }
 
     override suspend fun searchMessages(chatId: Long, query: String, limit: Int): List<TelegramMessage> = withContext(dispatchers.io) {
         if (query.isBlank()) return@withContext emptyList()
         try {
             val resp = send<TdApi.FoundChatMessages>(TdApi.SearchChatMessages(chatId, null, query, null, 0L, 0, limit, null))
-            resp.messages.mapNotNull { it.toDomainFile() }
+            val msgs = resp.messages.mapNotNull { it.toDomainFile() }
+            prepareMessageThumbnails(resp.messages, msgs)
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (t: Throwable) { Log.w("searchMessages failed", t); emptyList() }
     }
@@ -438,7 +515,8 @@ class TdLibTelegramClient(
             // TDLib 1.8.65: SearchMessages(chatList, query, offset, limit, filter, chatTypeFilter, minDate, maxDate)
             val safeLimit = limit.coerceIn(1, 100)
             val resp = send<TdApi.FoundMessages>(TdApi.SearchMessages(null, query, "", safeLimit, null, null, 0, 0))
-            resp.messages.mapNotNull { it.toDomainFile() }
+            val msgs = resp.messages.mapNotNull { it.toDomainFile() }
+            prepareMessageThumbnails(resp.messages, msgs)
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (t: Throwable) { Log.w("searchMessagesGlobal failed", t); emptyList() }
     }
@@ -555,114 +633,258 @@ class TdLibTelegramClient(
             Log.w("uploadFile: GetChat failed (continuing anyway)", t)
         }
 
+        val thumbTriple = buildUploadThumbnail(localPath, fileName, mimeType)
+        val uploadThumbFile = thumbTriple?.first
+        val inputThumb = thumbTriple?.let { (f, w, h) ->
+            TdApi.InputThumbnail(TdApi.InputFileLocal(f.absolutePath), w, h)
+        }
         val inputContent = TdApi.InputMessageDocument(
-            TdApi.InputDocument(TdApi.InputFileLocal(localPath), null, false),
+            TdApi.InputDocument(TdApi.InputFileLocal(localPath), inputThumb, false),
             TdApi.FormattedText(),
         )
 
         val sendConfirmation = CompletableDeferred<TdApi.Message>()
-        val msg = try {
-            send<TdApi.Message>(TdApi.SendMessage(chatId, null, null, null, null, inputContent))
-        } catch (t: Throwable) {
-            Log.w("uploadFile: SendMessage failed for '$fileName'", t)
-            throw t
-        }
-
-        val localMsgId = msg.id
-        val fileId = msg.extractFileId()
-
-        pendingSendConfirmations[localMsgId] = sendConfirmation
-
-        orphanedSendSucceeded.remove(localMsgId)?.let { orphaned ->
-            pendingSendConfirmations.remove(localMsgId)
-            onProgress(totalSize, totalSize)
-            return@withContext UploadResult(orphaned.id, orphaned.extractRemoteId())
-        }
-        orphanedSendFailed.remove(localMsgId)?.let { err ->
-            pendingSendConfirmations.remove(localMsgId)
-            throw TelegramException.fromError(err)
-        }
-
-        if (sendConfirmation.isCompleted) {
-            val serverMsg = sendConfirmation.await()
-            onProgress(totalSize, totalSize)
-            return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
-        }
-
-        if (fileId != null) {
-            val progressChannel = Channel<TdApi.File>(Channel.BUFFERED)
-            val uploadHandler: (TdApi.File) -> Unit = { f -> progressChannel.trySend(f) }
-            registerFileHandler(uploadHandlers, fileId, uploadHandler)
-            val lastActivityMs = AtomicLong(System.currentTimeMillis())
-            val lastUploadedBytes = AtomicLong(-1L)
-
-            val progressJob = launch {
-                for (f in progressChannel) {
-                    if (f.remote.isUploadingActive || f.remote.uploadedSize > 0L) {
-                        val uploaded = f.remote.uploadedSize
-                        if (uploaded > lastUploadedBytes.get()) {
-                            lastUploadedBytes.set(uploaded)
-                            lastActivityMs.set(System.currentTimeMillis())
-                        }
-                        onProgress(uploaded, f.size.coerceAtLeast(totalSize))
-                    }
-                }
-            }
-            val watchdogJob = launch {
-                while (!sendConfirmation.isCompleted) {
-                    delay(2_000L)
-                    if (System.currentTimeMillis() - lastActivityMs.get() >= UPLOAD_STALL_TIMEOUT_MS) {
-                        sendConfirmation.completeExceptionally(
-                            TelegramException(-1, "Upload stalled (no progress for ${UPLOAD_STALL_TIMEOUT_MS / 1000}s) for $fileName"),
-                        )
-                        break
-                    }
-                }
-            }
-
-            try {
-                val serverMsg = sendConfirmation.await()
-                val serverId = serverMsg.id
-                val remoteId = serverMsg.extractRemoteId()
-                onProgress(totalSize, totalSize)
-                return@withContext UploadResult(serverId, remoteId)
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                try {
-                    client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
-                } catch (_: Throwable) {}
-                throw e
+        try {
+            val msg = try {
+                send<TdApi.Message>(TdApi.SendMessage(chatId, null, null, null, null, inputContent))
             } catch (t: Throwable) {
-                try {
-                    client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
-                } catch (_: Throwable) {}
+                Log.w("uploadFile: SendMessage failed for '$fileName'", t)
                 throw t
-            } finally {
-                watchdogJob.cancel()
-                progressChannel.close()
-                progressJob.cancelAndJoin()
-                unregisterFileHandler(uploadHandlers, fileId, uploadHandler)
-                pendingSendConfirmations.remove(localMsgId)
             }
-        } else {
-            try {
-                val serverMsg = withTimeoutOrNull(UPLOAD_NO_FILE_ID_TIMEOUT_MS) { sendConfirmation.await() }
-                if (serverMsg != null) {
-                    onProgress(totalSize, totalSize)
-                    return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
-                }
-                try {
-                    client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
-                } catch (_: Throwable) {}
-                throw TelegramException(-1, "Upload timed out for $fileName")
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                try {
-                    client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
-                } catch (_: Throwable) {}
-                throw e
-            } finally {
+
+            val localMsgId = msg.id
+            val fileId = msg.extractFileId()
+
+            pendingSendConfirmations[localMsgId] = sendConfirmation
+
+            orphanedSendSucceeded.remove(localMsgId)?.let { orphaned ->
                 pendingSendConfirmations.remove(localMsgId)
+                onProgress(totalSize, totalSize)
+                return@withContext UploadResult(orphaned.id, orphaned.extractRemoteId())
+            }
+            orphanedSendFailed.remove(localMsgId)?.let { err ->
+                pendingSendConfirmations.remove(localMsgId)
+                throw TelegramException.fromError(err)
+            }
+
+            if (sendConfirmation.isCompleted) {
+                val serverMsg = sendConfirmation.await()
+                onProgress(totalSize, totalSize)
+                return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
+            }
+
+            if (fileId != null) {
+                val progressChannel = Channel<TdApi.File>(Channel.BUFFERED)
+                val uploadHandler: (TdApi.File) -> Unit = { f -> progressChannel.trySend(f) }
+                registerFileHandler(uploadHandlers, fileId, uploadHandler)
+                val lastActivityMs = AtomicLong(System.currentTimeMillis())
+                val lastUploadedBytes = AtomicLong(-1L)
+
+                val progressJob = launch {
+                    for (f in progressChannel) {
+                        if (f.remote.isUploadingActive || f.remote.uploadedSize > 0L) {
+                            val uploaded = f.remote.uploadedSize
+                            if (uploaded > lastUploadedBytes.get()) {
+                                lastUploadedBytes.set(uploaded)
+                                lastActivityMs.set(System.currentTimeMillis())
+                            }
+                            onProgress(uploaded, f.size.coerceAtLeast(totalSize))
+                        }
+                    }
+                }
+                val watchdogJob = launch {
+                    while (!sendConfirmation.isCompleted) {
+                        delay(2_000L)
+                        if (System.currentTimeMillis() - lastActivityMs.get() >= UPLOAD_STALL_TIMEOUT_MS) {
+                            sendConfirmation.completeExceptionally(
+                                TelegramException(-1, "Upload stalled (no progress for ${UPLOAD_STALL_TIMEOUT_MS / 1000}s) for $fileName"),
+                            )
+                            break
+                        }
+                    }
+                }
+
+                try {
+                    val serverMsg = sendConfirmation.await()
+                    val serverId = serverMsg.id
+                    val remoteId = serverMsg.extractRemoteId()
+                    onProgress(totalSize, totalSize)
+                    return@withContext UploadResult(serverId, remoteId)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    try {
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                    } catch (_: Throwable) {}
+                    throw e
+                } catch (t: Throwable) {
+                    try {
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                    } catch (_: Throwable) {}
+                    throw t
+                } finally {
+                    watchdogJob.cancel()
+                    progressChannel.close()
+                    progressJob.cancelAndJoin()
+                    unregisterFileHandler(uploadHandlers, fileId, uploadHandler)
+                    pendingSendConfirmations.remove(localMsgId)
+                }
+            } else {
+                try {
+                    val serverMsg = withTimeoutOrNull(UPLOAD_NO_FILE_ID_TIMEOUT_MS) { sendConfirmation.await() }
+                    if (serverMsg != null) {
+                        onProgress(totalSize, totalSize)
+                        return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
+                    }
+                    try {
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                    } catch (_: Throwable) {}
+                    throw TelegramException(-1, "Upload timed out for $fileName")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    try {
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                    } catch (_: Throwable) {}
+                    throw e
+                } finally {
+                    pendingSendConfirmations.remove(localMsgId)
+                }
+            }
+        } finally {
+            runCatching { uploadThumbFile?.delete() }
+        }
+    }
+
+    private fun buildUploadThumbnail(
+        localPath: String,
+        fileName: String,
+        mimeType: String,
+    ): Triple<File, Int, Int>? {
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val mime = mimeType.lowercase()
+        val rawBmp: Bitmap? = try {
+            when {
+                mime.startsWith("image/") || ext in IMAGE_THUMB_EXTS -> decodeUploadImageThumb(localPath)
+                mime.startsWith("video/") || ext in VIDEO_THUMB_EXTS -> decodeUploadVideoThumb(localPath)
+                mime == "application/pdf" || ext == "pdf" -> decodeUploadPdfThumb(localPath)
+                else -> null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+        if (rawBmp == null || rawBmp.isRecycled) return null
+
+        val dir = File(appContext.cacheDir, "upload_thumbs").apply { mkdirs() }
+        val outFile = File(dir, "thumb_${System.nanoTime()}.jpg")
+        return try {
+            val scaled = scaleDownBitmap(rawBmp, 320)
+            val w = scaled.width.coerceAtLeast(1)
+            val h = scaled.height.coerceAtLeast(1)
+            FileOutputStream(outFile).use { fos ->
+                scaled.compress(Bitmap.CompressFormat.JPEG, 80, fos)
+            }
+            if (outFile.length() > 180 * 1024) {
+                FileOutputStream(outFile).use { fos ->
+                    scaled.compress(Bitmap.CompressFormat.JPEG, 60, fos)
+                }
+            }
+            if (scaled !== rawBmp && !rawBmp.isRecycled) rawBmp.recycle()
+            if (!scaled.isRecycled) scaled.recycle()
+            if (outFile.isFile && outFile.length() > 0L) Triple(outFile, w, h) else {
+                outFile.delete()
+                null
+            }
+        } catch (_: Throwable) {
+            runCatching { outFile.delete() }
+            if (!rawBmp.isRecycled) rawBmp.recycle()
+            null
+        }
+    }
+
+    private fun decodeUploadImageThumb(localPath: String): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(localPath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / sample > 640 || bounds.outHeight / sample > 640) {
+            sample *= 2
+        }
+        val decoded = BitmapFactory.decodeFile(
+            localPath,
+            BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            },
+        ) ?: return null
+        val orientation = runCatching {
+            ExifInterface(localPath).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL,
+            )
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
+            else -> return decoded
+        }
+        return try {
+            val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+            if (rotated !== decoded && !decoded.isRecycled) decoded.recycle()
+            rotated
+        } catch (_: Throwable) {
+            decoded
+        }
+    }
+
+    private fun decodeUploadVideoThumb(localPath: String): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(localPath)
+            retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    private fun decodeUploadPdfThumb(localPath: String): Bitmap? {
+        val pfd = ParcelFileDescriptor.open(File(localPath), ParcelFileDescriptor.MODE_READ_ONLY)
+        return pfd.use { fd ->
+            PdfRenderer(fd).use { renderer ->
+                if (renderer.pageCount <= 0) return@use null
+                renderer.openPage(0).use { page ->
+                    val maxDim = 320f
+                    val scale = minOf(maxDim / page.width.coerceAtLeast(1), maxDim / page.height.coerceAtLeast(1))
+                    val w = (page.width * scale).toInt().coerceIn(80, 320)
+                    val h = (page.height * scale).toInt().coerceIn(80, 320)
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    Canvas(bmp).drawColor(android.graphics.Color.WHITE)
+                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    bmp
+                }
             }
         }
+    }
+
+    private fun scaleDownBitmap(src: Bitmap, maxDim: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= maxDim && h <= maxDim) return src
+        val ratio = minOf(maxDim.toFloat() / w.coerceAtLeast(1), maxDim.toFloat() / h.coerceAtLeast(1))
+        val targetW = (w * ratio).toInt().coerceAtLeast(1)
+        val targetH = (h * ratio).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, targetW, targetH, true)
     }
 
     override suspend fun deleteMessage(chatId: Long, messageId: Long) = withContext(dispatchers.io) {
@@ -1044,6 +1266,7 @@ class TdLibTelegramClient(
             orphanedSendFailed.clear()
             downloadHandlers.clear()
             uploadHandlers.clear()
+            pendingThumbnails.clear()
             scope.cancel()
             client = null
             initializedApiId = null
@@ -1062,6 +1285,8 @@ class TdLibTelegramClient(
         private const val UPLOAD_STALL_TIMEOUT_MS = 90_000L
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256
+        private val IMAGE_THUMB_EXTS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
+        private val VIDEO_THUMB_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
     }
 }
 

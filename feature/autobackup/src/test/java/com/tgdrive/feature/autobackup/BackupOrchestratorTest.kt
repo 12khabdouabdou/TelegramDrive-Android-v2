@@ -8,6 +8,7 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.SyncedFileDao
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
@@ -61,6 +62,7 @@ class BackupOrchestratorTest {
     private lateinit var registry: ActiveBackupRegistry
     private lateinit var zipIndexService: ZipIndexService
     private lateinit var cloudSyncManager: CloudSyncManager
+    private lateinit var mediaThumbnailCache: MediaThumbnailCache
 
     private lateinit var orchestrator: BackupOrchestrator
 
@@ -82,13 +84,14 @@ class BackupOrchestratorTest {
         registry = ActiveBackupRegistry()
         zipIndexService = mockk(relaxed = true)
         cloudSyncManager = mockk(relaxed = true)
+        mediaThumbnailCache = mockk(relaxed = true)
 
         every { preferences.data } returns prefsFlow
 
         orchestrator = BackupOrchestrator(
             ctx, telegramClient, preferences, folderScanner, stagingManager,
             diffEngine, syncedFileDao, syncLogDao, folderDao, fileCacheDao,
-            notifier, registry, zipIndexService, cloudSyncManager,
+            notifier, registry, zipIndexService, cloudSyncManager, mediaThumbnailCache,
         )
     }
 

@@ -8,6 +8,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipEntryInfo
@@ -41,6 +42,8 @@ data class ZipBrowserUiState(
     val passwordRequired: Boolean = false,
     val extractedPath: String? = null,
     val extractingEntry: String? = null,
+    val unlockedPassword: String? = null,
+    val resolvedLocalPath: String? = null,
 )
 
 @HiltViewModel
@@ -55,6 +58,7 @@ class ZipBrowserViewModel
         private val zipLister: ZipLister,
         private val zipExtractor: ZipExtractor,
         private val zipIndexService: ZipIndexService,
+        private val offlinePinStore: OfflinePinStore,
     ) : ViewModel() {
         private val _state = MutableStateFlow(ZipBrowserUiState())
         val state: StateFlow<ZipBrowserUiState> = _state.asStateFlow()
@@ -71,6 +75,14 @@ class ZipBrowserViewModel
          * the UI should prompt for a password before allowing extraction.
          */
         fun ensureArchiveQueued(chatId: Long, messageId: Long) {
+            if (chatId != 0L) {
+                val pinned = offlinePinStore.getPinnedFilePathSync(chatId, messageId)
+                    ?.takeIf { File(it).isFile }
+                if (pinned != null) {
+                    _state.update { it.copy(resolvedLocalPath = pinned) }
+                    return
+                }
+            }
             if (downloadManager.findItem(chatId, messageId) != null) return
             viewModelScope.launch(dispatchers.io) {
                 val cached = if (chatId != 0L) {
@@ -78,6 +90,12 @@ class ZipBrowserViewModel
                 } else {
                     runCatching { fileCacheDao.getAllZips().firstOrNull { it.messageId == messageId } }.getOrNull()
                 } ?: return@launch
+                offlinePinStore.getPinnedFilePathSync(cached.chatId, cached.messageId)
+                    ?.takeIf { File(it).isFile }
+                    ?.let { pinned ->
+                        _state.update { it.copy(resolvedLocalPath = pinned) }
+                        return@launch
+                    }
                 if (cached.remoteId.isNotEmpty()) {
                     downloadManager.enqueue(
                         DownloadItem(
@@ -100,6 +118,7 @@ class ZipBrowserViewModel
         ) {
             if (currentZipPath != zipPath) {
                 cachedPassword = null
+                _state.update { it.copy(unlockedPassword = null) }
             }
             currentZipPath = zipPath
             viewModelScope.launch(dispatchers.io) {
@@ -148,10 +167,22 @@ class ZipBrowserViewModel
                     val path = zipExtractor.extractEntry(zipPath, entryName, outDir, effectivePassword)
                     if (path != null) {
                         if (password != null) cachedPassword = password
-                        _state.update { it.copy(extractingEntry = null, extractedPath = path) }
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                extractedPath = path,
+                                unlockedPassword = cachedPassword,
+                            )
+                        }
                     } else {
                         if (effectivePassword != null) cachedPassword = null
-                        _state.update { it.copy(extractingEntry = null, error = "Failed to extract '$entryName'") }
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                unlockedPassword = null,
+                                error = "Failed to extract '$entryName'",
+                            )
+                        }
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     _state.update { it.copy(extractingEntry = null) }
@@ -161,7 +192,13 @@ class ZipBrowserViewModel
                     if (effectivePassword != null && t.message?.contains("password", ignoreCase = true) == true) {
                         cachedPassword = null
                     }
-                    _state.update { it.copy(extractingEntry = null, error = t.message ?: "Extraction failed") }
+                    _state.update {
+                        it.copy(
+                            extractingEntry = null,
+                            unlockedPassword = cachedPassword,
+                            error = t.message ?: "Extraction failed",
+                        )
+                    }
                 }
             }
         }

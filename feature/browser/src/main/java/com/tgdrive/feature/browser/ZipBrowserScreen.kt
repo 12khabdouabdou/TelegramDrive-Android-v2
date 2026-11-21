@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -65,6 +67,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -87,6 +90,8 @@ import com.tgdrive.designsystem.components.EmptyState as DsEmptyState
 import com.tgdrive.designsystem.components.GlassPanel
 import com.tgdrive.designsystem.theme.TgTypography
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -135,8 +140,9 @@ fun ZipBrowserScreen(
             }
         }
     val localPath =
-        remember(downloadItem) {
-            downloadItem?.takeIf { it.status == DownloadStatus.DONE }?.localPath
+        remember(state.resolvedLocalPath, downloadItem) {
+            state.resolvedLocalPath
+                ?: downloadItem?.takeIf { it.status == DownloadStatus.DONE }?.localPath
         }
 
     var currentPath by remember(localPath, initialEntryPath) {
@@ -343,7 +349,7 @@ fun ZipBrowserScreen(
                             items = visibleItems,
                             extractingEntry = state.extractingEntry,
                             zipPath = localPath,
-                            passwordRequired = state.passwordRequired,
+                            unlockedPassword = state.unlockedPassword,
                             onFolderClick = { folder -> currentPath = folder.fullPrefix },
                             onFileClick = { fileNode ->
                                 val entry = fileNode.entry
@@ -649,12 +655,13 @@ private fun EntriesList(
     items: List<ZipBrowserItem>,
     extractingEntry: String?,
     zipPath: String?,
-    passwordRequired: Boolean,
+    unlockedPassword: String?,
     onFolderClick: (ZipBrowserItem.FolderNode) -> Unit,
     onFileClick: (ZipBrowserItem.FileNode) -> Unit,
 ) {
     val context = LocalContext.current
     val thumbnailGenerator = remember(context) { ZipThumbnailGenerator(cacheDir = context.cacheDir) }
+    val thumbSemaphore = remember { Semaphore(3) }
     val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     DisposableEffect(thumbnailGenerator) {
         onDispose { thumbnailGenerator.clear() }
@@ -683,8 +690,10 @@ private fun EntriesList(
                         entry = item.entry,
                         isExtracting = extractingEntry == item.entry.name,
                         zipPath = zipPath,
-                        showThumbnail = !passwordRequired && !item.entry.isEncrypted,
+                        password = unlockedPassword,
+                        showThumbnail = !item.entry.isEncrypted || unlockedPassword != null,
                         thumbnailGenerator = thumbnailGenerator,
+                        thumbSemaphore = thumbSemaphore,
                         onClick = { onFileClick(item) },
                     )
             }
@@ -759,8 +768,10 @@ private fun ZipEntryRow(
     entry: ZipEntryInfo,
     isExtracting: Boolean,
     zipPath: String?,
+    password: String?,
     showThumbnail: Boolean,
     thumbnailGenerator: ZipThumbnailGenerator,
+    thumbSemaphore: Semaphore,
     onClick: () -> Unit,
 ) {
     GlassPanel(
@@ -776,8 +787,10 @@ private fun ZipEntryRow(
             EntryLeading(
                 entry = entry,
                 zipPath = zipPath,
+                password = password,
                 showThumbnail = showThumbnail,
                 thumbnailGenerator = thumbnailGenerator,
+                thumbSemaphore = thumbSemaphore,
             )
 
             Column(modifier = Modifier.weight(1f)) {
@@ -827,18 +840,22 @@ private fun ZipEntryRow(
 private fun EntryLeading(
     entry: ZipEntryInfo,
     zipPath: String?,
+    password: String?,
     showThumbnail: Boolean,
     thumbnailGenerator: ZipThumbnailGenerator,
+    thumbSemaphore: Semaphore,
 ) {
-    var thumbnail by remember(entry.name, zipPath) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    var thumbnailTried by remember(entry.name, zipPath) { mutableStateOf(false) }
+    var thumbnail by remember(entry.name, zipPath, password) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var thumbnailTried by remember(entry.name, zipPath, password) { mutableStateOf(false) }
 
-    LaunchedEffect(entry.name, zipPath, showThumbnail) {
+    LaunchedEffect(entry.name, zipPath, showThumbnail, password) {
         if (!showThumbnail || zipPath == null || thumbnailTried) return@LaunchedEffect
         thumbnailTried = true
         val bmp = withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                thumbnailGenerator.getThumbnail(zipPath, entry.name)
+                thumbSemaphore.withPermit {
+                    thumbnailGenerator.getThumbnail(zipPath, entry.name, password)
+                }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -849,22 +866,43 @@ private fun EntryLeading(
         thumbnail = bmp
     }
 
+    val isVideo = remember(entry.name) {
+        entry.name.substringAfterLast('.', "").lowercase() in ZipThumbnailGenerator.VIDEO_EXTS
+    }
+
     Box(
         modifier = Modifier
-            .size(44.dp)
+            .size(52.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) {
         val bmp = thumbnail
         when {
-            bmp != null ->
+            bmp != null -> {
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),
                 )
+                if (isVideo) {
+                    Box(
+                        modifier = Modifier
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
             else ->
                 Icon(
                     Icons.AutoMirrored.Filled.InsertDriveFile,

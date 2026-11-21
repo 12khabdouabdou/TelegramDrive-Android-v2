@@ -191,6 +191,50 @@ class ZipThumbnailGeneratorTest {
     }
 
     @Test
+    fun `aes256 encrypted zip entry returns null without password and bitmap with password`() {
+        val bmp = createSolidColorBitmap(64, 64, 0xFF112233.toInt())
+        val pngFile = File(tempDir, "secret.png")
+        FileOutputStream(pngFile).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+
+        val encryptedZip = File(tempDir, "encrypted.zip")
+        val params = net.lingala.zip4j.model.ZipParameters().apply {
+            isEncryptFiles = true
+            encryptionMethod = net.lingala.zip4j.model.enums.EncryptionMethod.AES
+            aesKeyStrength = net.lingala.zip4j.model.enums.AesKeyStrength.KEY_STRENGTH_256
+            fileNameInZip = "nested/secret.png"
+        }
+        net.lingala.zip4j.ZipFile(encryptedZip, "secret-pass".toCharArray()).use { zf ->
+            zf.addFile(pngFile, params)
+        }
+
+        assertThat(generator.getThumbnail(encryptedZip.absolutePath, "nested/secret.png")).isNull()
+        val unlocked = generator.getThumbnail(encryptedZip.absolutePath, "nested/secret.png", "secret-pass")
+        assertThat(unlocked).isNotNull()
+    }
+
+    @Test
+    fun `zip4j outputstream entry with data descriptor decodes thumbnail`() {
+        val bmp = createSolidColorBitmap(120, 90, 0xFFAA4400.toInt())
+        val pngBytes = java.io.ByteArrayOutputStream().apply {
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, this)
+        }.toByteArray()
+
+        val streamedZip = File(tempDir, "zip4j_streamed.zip")
+        net.lingala.zip4j.io.outputstream.ZipOutputStream(FileOutputStream(streamedZip)).use { zos ->
+            val p = net.lingala.zip4j.model.ZipParameters().apply {
+                fileNameInZip = "photos/snap.png"
+                isEncryptFiles = false
+            }
+            zos.putNextEntry(p)
+            zos.write(pngBytes)
+            zos.closeEntry()
+        }
+
+        val thumb = generator.getThumbnail(streamedZip.absolutePath, "photos/snap.png")
+        assertThat(thumb).isNotNull()
+    }
+
+    @Test
     fun `video thumbnail is cached like image thumbnails`() {
         val expectedBitmap = createSolidColorBitmap(64, 64, 0xFF00FF00.toInt())
         var extractorCallCount = 0

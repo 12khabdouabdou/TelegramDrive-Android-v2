@@ -782,6 +782,44 @@ object ZipUploader {
         val slice = tailBytes.copyOfRange(relStart.toInt(), (relStart + range.size).toInt())
         return parseCentralDirectoryEntries(slice)
     }
+
+    /**
+     * Reads the bytes of the first unencrypted image entry in [zipPath] (for ZIP cover thumbnails).
+     */
+    fun readFirstImageEntryBytes(
+        zipPath: String,
+        maxBytes: Int = 10 * 1024 * 1024,
+    ): ByteArray? {
+        return try {
+            val zipFile = File(zipPath)
+            if (!zipFile.isFile) return null
+            ZipFile(zipFile).use { zip ->
+                val header = zip.fileHeaders.firstOrNull { h ->
+                    !h.isDirectory &&
+                        !h.isEncrypted &&
+                        (h.uncompressedSize <= 0L || h.uncompressedSize <= maxBytes.toLong()) &&
+                        h.fileName.substringAfterLast('.', "").lowercase() in IMAGE_COVER_EXTS
+                } ?: return null
+                zip.getInputStream(header).use { input ->
+                    val out = java.io.ByteArrayOutputStream()
+                    val buf = ByteArray(16 * 1024)
+                    var total = 0
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        total += n
+                        if (total > maxBytes) return null
+                        out.write(buf, 0, n)
+                    }
+                    out.toByteArray()
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private val IMAGE_COVER_EXTS = setOf("jpg", "jpeg", "png", "webp", "bmp", "heic", "heif", "gif")
 }
 
 data class ZipCentralDirectoryRange(

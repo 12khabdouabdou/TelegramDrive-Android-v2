@@ -216,7 +216,7 @@ class SettingsViewModel @Inject constructor(
                 }
 
                 // 5. Purge all local cache / staging directories.
-                for (dirName in listOf("backup_staging", "upload_staging", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync")) {
+                for (dirName in listOf("backup_staging", "upload_staging", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs")) {
                     try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
                 }
 

@@ -10,6 +10,7 @@ import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
@@ -68,6 +69,7 @@ class BackupOrchestrator @Inject constructor(
     private val registry: ActiveBackupRegistry,
     private val zipIndexService: ZipIndexService,
     private val cloudSyncManager: CloudSyncManager,
+    private val mediaThumbnailCache: MediaThumbnailCache,
 ) {
 
     /**
@@ -444,11 +446,24 @@ class BackupOrchestrator @Inject constructor(
                         throw t
                     }
 
+                    val msgId = uploadResult.messageId
+                    val generatedThumb = try {
+                        mediaThumbnailCache.generateFromLocalFile(
+                            chatId = fileTargetChatId,
+                            messageId = msgId,
+                            localPath = stagingPath,
+                            mimeType = file.mimeType,
+                            fileName = file.name,
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        null
+                    }
+
                     // Upload succeeded — safe to delete the staging file.
                     stagingManager.release(stagingPath)
                     lastStagingPath = null
-
-                    val msgId = uploadResult.messageId
 
                     // Record in synced_files.
                     syncedFileDao.upsert(SyncedFileEntity(
@@ -468,7 +483,7 @@ class BackupOrchestrator @Inject constructor(
                             fileName = file.name,
                             fileSize = file.size,
                             mimeType = file.mimeType,
-                            thumbnailPath = null,
+                            thumbnailPath = generatedThumb,
                             remoteId = uploadResult.remoteId,
                             date = System.currentTimeMillis(),
                             isStarred = false,
@@ -758,6 +773,19 @@ class BackupOrchestrator @Inject constructor(
                         }
                     }
 
+                    val zipThumb = try {
+                        mediaThumbnailCache.generateFromLocalFile(
+                            chatId = destChatId,
+                            messageId = uploadResult.messageId,
+                            localPath = part.partFile.absolutePath,
+                            mimeType = "application/zip",
+                            fileName = partName,
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        null
+                    }
                     fileCacheDao.upsertAll(
                         listOf(
                             FileCacheEntity(
@@ -766,7 +794,7 @@ class BackupOrchestrator @Inject constructor(
                                 fileName = partName,
                                 fileSize = partSize,
                                 mimeType = "application/zip",
-                                thumbnailPath = null,
+                                thumbnailPath = zipThumb,
                                 remoteId = uploadResult.remoteId,
                                 date = System.currentTimeMillis(),
                             ),

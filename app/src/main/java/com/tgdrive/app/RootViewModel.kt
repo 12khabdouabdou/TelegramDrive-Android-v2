@@ -7,6 +7,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
+import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.AuthorizationState
@@ -70,6 +71,7 @@ class RootViewModel @Inject constructor(
     private val networkMonitor: NetworkMonitor,
     private val keystoreHelper: KeystoreHelper,
     private val cloudSyncManager: CloudSyncManager,
+    private val fileCacheDao: FileCacheDao,
     private val dispatchers: DispatchersProvider,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -85,10 +87,25 @@ class RootViewModel @Inject constructor(
 
     init {
         observeAuth()
+        observeThumbnailUpdates()
         observePrefs()
         observeNetwork()
         startSplashTimer()
         checkStoredCreds()
+    }
+
+    private fun observeThumbnailUpdates() {
+        viewModelScope.launch(dispatchers.io) {
+            telegramClient.thumbnailUpdates.collect { upd ->
+                try {
+                    fileCacheDao.updateThumbnailPath(upd.chatId, upd.messageId, upd.localPath)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("RootViewModel: updateThumbnailPath failed", t)
+                }
+            }
+        }
     }
 
     /**

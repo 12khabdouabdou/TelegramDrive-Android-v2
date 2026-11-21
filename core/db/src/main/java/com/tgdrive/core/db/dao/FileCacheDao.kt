@@ -30,7 +30,15 @@ interface FileCacheDao {
         UPDATE file_cache
         SET file_size = :fileSize,
             mime_type = COALESCE(:mimeType, mime_type),
-            thumbnail_path = COALESCE(:thumbnailPath, thumbnail_path),
+            thumbnail_path = CASE
+                WHEN :thumbnailPath IS NOT NULL
+                    AND (:thumbnailPath NOT LIKE '%/minithumbs/%'
+                        OR thumbnail_path IS NULL
+                        OR thumbnail_path = ''
+                        OR thumbnail_path LIKE '%/minithumbs/%')
+                THEN :thumbnailPath
+                ELSE thumbnail_path
+            END,
             remote_id = CASE WHEN :remoteId != '' THEN :remoteId ELSE remote_id END,
             date = :date
         WHERE message_id = :messageId AND chat_id = :chatId
@@ -209,6 +217,9 @@ interface FileCacheDao {
 
     @Query("UPDATE file_cache SET file_name = :newName WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun updateFileName(chatId: Long, messageId: Long, newName: String)
+
+    @Query("UPDATE file_cache SET thumbnail_path = :thumbnailPath WHERE message_id = :messageId AND chat_id = :chatId")
+    suspend fun updateThumbnailPath(chatId: Long, messageId: Long, thumbnailPath: String?)
 
     @Query("DELETE FROM file_cache WHERE message_id = :newId AND chat_id = :chatId")
     suspend fun deleteByMessageId(chatId: Long, newId: Long): Int

@@ -98,6 +98,7 @@ import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -551,6 +552,9 @@ private fun MemoriesStrip(
         ) {
             items(memories, key = { it.title }) { mem ->
                 val lead = mem.items.firstOrNull()
+                val leadThumbFile = remember(lead?.thumbnailPath) {
+                    lead?.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+                }
                 Box(
                     modifier = Modifier
                         .width(140.dp)
@@ -559,9 +563,9 @@ private fun MemoriesStrip(
                         .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                         .clickable { onOpenMemory(mem) },
                 ) {
-                    if (lead?.thumbnailPath != null) {
+                    if (leadThumbFile != null) {
                         AsyncImage(
-                            model = lead.thumbnailPath,
+                            model = leadThumbFile,
                             contentDescription = mem.title,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
@@ -620,6 +624,9 @@ private fun MediaGridTile(
     onLongClick: () -> Unit,
 ) {
     val isVideo = classifyFile(item.mimeType, item.fileName) == FileBucket.VIDEOS
+    val thumbFile = remember(item.thumbnailPath) {
+        item.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    }
     Box(
         modifier = Modifier
             .aspectRatio(1f)
@@ -634,9 +641,9 @@ private fun MediaGridTile(
             )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
-        if (item.thumbnailPath != null) {
+        if (thumbFile != null) {
             AsyncImage(
-                model = item.thumbnailPath,
+                model = thumbFile,
                 contentDescription = item.fileName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier

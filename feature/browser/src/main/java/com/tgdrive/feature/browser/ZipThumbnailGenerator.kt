@@ -2,35 +2,25 @@ package com.tgdrive.feature.browser
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import androidx.collection.LruCache
 import com.tgdrive.core.common.Log
+import net.lingala.zip4j.ZipFile
+import net.lingala.zip4j.model.FileHeader
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.zip.ZipFile
 
 /**
- * Generates + caches thumbnails for entries inside a ZIP archive.
+ * Generates + caches thumbnails for entries inside a ZIP archive using Zip4j
+ * (supporting plain, ZIP64, backslash paths, and password-unlocked AES/ZipCrypto entries).
  *
- * - **Image entries** (jpg/png/gif/webp/…) → decode a downsampled bitmap
- *   straight from the zip's input stream (no temp file needed).
- * - **Video entries** (mp4/mkv/mov/…) → extract to a temp file, then ask
- *   the injected [VideoFrameExtractor] for a frame bitmap. The temp file
- *   is deleted after extraction (success or failure).
- * - **Other entries** → returns null (caller falls back to a file-type icon).
- *
- * Results are cached in a process-LruCache keyed by `zipPath + entryName`
- * so scrolling the ZIP browser list doesn't re-decode visible rows.
- * Failed decodes aren't cached — the row will retry on next scroll into
- * view. This is intentional: a transient IO failure shouldn't permanently
- * kill the thumbnail for an otherwise-decodable image.
- *
- * Encrypted zips: video frame extraction needs a real file path (it's
- * backed by [android.media.MediaMetadataRetriever] which only accepts
- * files, not streams). The temp-file extraction here uses `java.util.zip`
- * which can't read encrypted entries — so video thumbnails silently
- * return null for encrypted zips, and the UI falls back to the file-type
- * icon. Image thumbnails use the same stream path and have the same
- * limitation. This matches the existing UI gating
- * (`showThumbnail = !passwordRequired && !entry.isEncrypted`).
+ * - **Image entries** (jpg/png/gif/webp/heic/...) -> read entry bytes once and decode a downsampled
+ *   EXIF-oriented bitmap via `BitmapFactory.decodeByteArray`.
+ * - **Video entries** (mp4/mkv/mov/...) -> extract to a temp file preserving extension, then ask
+ *   the injected [VideoFrameExtractor] for a frame bitmap. The temp file is deleted in `finally`.
+ * - **Other entries** -> returns null (caller falls back to a file-type icon).
  */
 class ZipThumbnailGenerator(
     maxCacheEntries: Int = 64,
@@ -43,23 +33,20 @@ class ZipThumbnailGenerator(
     /**
      * Get a thumbnail bitmap for [entryName] inside [zipPath], or null if
      * the entry is not an image/video or cannot be decoded.
-     *
-     * Safe to call from any thread. Returns the same bitmap instance on
-     * repeated calls (cache hit). Non-thumbnailable extensions short-circuit
-     * without touching the zip file.
      */
     fun getThumbnail(
         zipPath: String,
         entryName: String,
+        password: String? = null,
     ): Bitmap? {
         if (!isThumbnailable(entryName)) return null
-        val key = "$zipPath|$entryName"
+        val key = "$zipPath|$entryName|${password.orEmpty()}"
         cache.get(key)?.let { return it }
 
         val bitmap =
             when (thumbnailKind(entryName)) {
-                ThumbnailKind.IMAGE -> decodeImageEntry(zipPath, entryName)
-                ThumbnailKind.VIDEO -> decodeVideoEntry(zipPath, entryName)
+                ThumbnailKind.IMAGE -> decodeImageEntry(zipPath, entryName, password)
+                ThumbnailKind.VIDEO -> decodeVideoEntry(zipPath, entryName, password)
                 ThumbnailKind.NONE -> null
             }
         if (bitmap != null) cache.put(key, bitmap)
@@ -82,34 +69,63 @@ class ZipThumbnailGenerator(
         }
     }
 
+    private fun openZip(zipFile: File, password: String?): ZipFile =
+        if (!password.isNullOrEmpty()) {
+            ZipFile(zipFile, password.toCharArray())
+        } else {
+            ZipFile(zipFile)
+        }
+
+    private fun findEntryHeader(zip: ZipFile, entryName: String): FileHeader? {
+        zip.getFileHeader(entryName)?.let { return it }
+        val normalized = entryName.replace('\\', '/').trimStart('/')
+        zip.getFileHeader(normalized)?.let { return it }
+        return zip.fileHeaders.firstOrNull {
+            it.fileName == entryName || it.fileName.replace('\\', '/').trimStart('/') == normalized
+        }
+    }
+
     private fun decodeImageEntry(
         zipPath: String,
         entryName: String,
+        password: String?,
     ): Bitmap? {
         return try {
             val zipFile = File(zipPath)
             if (!zipFile.exists()) return null
-            ZipFile(zipFile).use { zip ->
-                val entry = zip.getEntry(entryName) ?: return null
+            val bytes = openZip(zipFile, password).use { zip ->
+                val header = findEntryHeader(zip, entryName) ?: return null
+                if (header.isDirectory) return null
+                if (header.isEncrypted && password.isNullOrEmpty()) return null
+                if (header.uncompressedSize > MAX_IMAGE_THUMB_BYTES) return null
 
-                // Pass 1: decode bounds only (no allocation).
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                zip.getInputStream(entry).use { s ->
-                    BitmapFactory.decodeStream(s, null, bounds)
-                }
-                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
-                // Pass 2: decode for real, downsampled.
-                val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, targetSizePx)
-                val opts =
-                    BitmapFactory.Options().apply {
-                        inSampleSize = sample
-                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                zip.getInputStream(header).use { input ->
+                    val baos = ByteArrayOutputStream()
+                    val buf = ByteArray(16 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        copied += n
+                        if (copied > MAX_IMAGE_THUMB_BYTES) return null
+                        baos.write(buf, 0, n)
                     }
-                zip.getInputStream(entry).use { s ->
-                    BitmapFactory.decodeStream(s, null, opts)
+                    baos.toByteArray()
                 }
             }
+            if (bytes.isEmpty()) return null
+
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+            val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, targetSizePx)
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+            applyExifOrientation(bytes, decoded)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (t: Throwable) {
@@ -118,32 +134,65 @@ class ZipThumbnailGenerator(
         }
     }
 
-    /**
-     * Extract the video entry to a temp file, ask [videoFrameExtractor]
-     * for a frame bitmap, then delete the temp file.
-     *
-     * The temp file lives in `java.io.tmpdir` (per-OS) with a `tgdrive_thumb_`
-     * prefix. It's deleted in a `finally` block — if the extractor throws,
-     * we still clean up.
-     */
+    private fun applyExifOrientation(bytes: ByteArray, bitmap: Bitmap): Bitmap {
+        val orientation = runCatching {
+            ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL,
+            )
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
+            else -> return bitmap
+        }
+        return try {
+            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated !== bitmap && !bitmap.isRecycled) bitmap.recycle()
+            rotated
+        } catch (_: Throwable) {
+            bitmap
+        }
+    }
+
     private fun decodeVideoEntry(
         zipPath: String,
         entryName: String,
+        password: String?,
     ): Bitmap? {
         var tempFile: File? = null
         return try {
-            val zip = File(zipPath)
-            if (!zip.exists()) return null
+            val zipFile = File(zipPath)
+            if (!zipFile.exists()) return null
             cacheDir?.mkdirs()
-            val outFile = File.createTempFile("tgdrive_thumb_", ".mp4", cacheDir)
+            val ext = entryName.substringAfterLast('.', "mp4")
+                .lowercase()
+                .replace(Regex("[^a-z0-9]"), "")
+                .ifBlank { "mp4" }
+            val outFile = File.createTempFile("tgdrive_thumb_", ".$ext", cacheDir)
             tempFile = outFile
-            ZipFile(zip).use { z ->
-                val entry = z.getEntry(entryName) ?: return null
-                if (entry.size > MAX_VIDEO_THUMB_BYTES) {
-                    Log.w("ZipThumbnailGenerator: skipping oversized video thumbnail for '$entryName' (${entry.size} bytes)")
+            val extractedOk = openZip(zipFile, password).use { zip ->
+                val header = findEntryHeader(zip, entryName) ?: return null
+                if (header.isDirectory) return null
+                if (header.isEncrypted && password.isNullOrEmpty()) return null
+                if (header.uncompressedSize > MAX_VIDEO_THUMB_BYTES) {
+                    Log.w("ZipThumbnailGenerator: skipping oversized video thumbnail for '$entryName' (${header.uncompressedSize} bytes)")
                     return null
                 }
-                z.getInputStream(entry).use { input ->
+                zip.getInputStream(header).use { input ->
                     outFile.outputStream().use { output ->
                         val buf = ByteArray(16 * 1024)
                         var copied = 0L
@@ -159,10 +208,10 @@ class ZipThumbnailGenerator(
                         }
                     }
                 }
+                true
             }
+            if (!extractedOk) return null
             val raw = videoFrameExtractor.extractFrame(outFile) ?: return null
-            // Downsample if the frame is huge (MediaMetadataRetriever returns
-            // full-resolution frames by default).
             downsampleIfNeeded(raw)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -203,20 +252,17 @@ class ZipThumbnailGenerator(
 
     private enum class ThumbnailKind { IMAGE, VIDEO, NONE }
 
-    private companion object {
+    companion object {
+        private const val MAX_IMAGE_THUMB_BYTES = 25L * 1024 * 1024
         private const val MAX_VIDEO_THUMB_BYTES = 50L * 1024 * 1024
-        // HEIC needs platform support that varies by Android version; skip it.
-        private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heif", "avif")
-        private val VIDEO_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
+        private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif")
+        internal val VIDEO_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
     }
 }
 
 /**
  * Extract a single frame bitmap from a video file. Used by
  * [ZipThumbnailGenerator] for video entry thumbnails.
- *
- * Production implementation: [DefaultVideoFrameExtractor] (uses
- * [android.media.MediaMetadataRetriever]). Tests inject a fake.
  */
 fun interface VideoFrameExtractor {
     fun extractFrame(videoFile: File): Bitmap?
@@ -224,17 +270,14 @@ fun interface VideoFrameExtractor {
 
 /**
  * Default [VideoFrameExtractor] backed by [android.media.MediaMetadataRetriever].
- *
- * Returns the frame at time 0 (first frame). Returns null if the retriever
- * fails (corrupt video, unsupported codec, etc.). Always releases the
- * retriever to avoid leaking native resources.
  */
 class DefaultVideoFrameExtractor : VideoFrameExtractor {
     override fun extractFrame(videoFile: File): Bitmap? {
         val retriever = android.media.MediaMetadataRetriever()
         return try {
             retriever.setDataSource(videoFile.absolutePath)
-            retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            retriever.getFrameAtTime(1_000_000L, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (t: Throwable) {
@@ -244,8 +287,6 @@ class DefaultVideoFrameExtractor : VideoFrameExtractor {
             try {
                 retriever.release()
             } catch (_: Throwable) {
-                // release() can throw on some OEM implementations; swallow
-                // to avoid masking the real bitmap result.
             }
         }
     }

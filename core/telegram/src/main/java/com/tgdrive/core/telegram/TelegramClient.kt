@@ -86,6 +86,8 @@ interface TelegramClient : TelegramAuthObserver {
     suspend fun cancelFileStream(fileId: Int) {}
     suspend fun getOrCreateSystemChannel(): Long? = null
     suspend fun downloadFileRangeBytes(remoteId: String, offset: Long, length: Long): ByteArray? = null
+    val thumbnailUpdates: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate>
+        get() = EMPTY_THUMBNAIL_UPDATES
     suspend fun close()
 
     /**
@@ -102,6 +104,16 @@ interface TelegramClient : TelegramAuthObserver {
      */
     suspend fun generateShareLink(chatId: Long, messageId: Long): String?
 }
+
+private val EMPTY_THUMBNAIL_UPDATES: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate> =
+    MutableSharedFlow<ThumbnailUpdate>().asSharedFlow()
+
+/** Fired when a Telegram thumbnail download completes with a verified local path. */
+data class ThumbnailUpdate(
+    val chatId: Long,
+    val messageId: Long,
+    val localPath: String,
+)
 
 /** Result of uploading a file — contains both the server message ID and remote file ID. */
 data class UploadResult(

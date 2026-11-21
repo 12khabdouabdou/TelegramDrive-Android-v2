@@ -812,6 +812,9 @@ private fun FileGridCell(
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
     val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
+    val thumbFile = remember(thumbModel) {
+        thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    }
     val partBadge = remember(item.fileName) {
         PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
     }
@@ -846,9 +849,9 @@ private fun FileGridCell(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                if (thumbModel != null) {
+                if (thumbFile != null) {
                     AsyncImage(
-                        model = thumbModel,
+                        model = thumbFile,
                         contentDescription = item.fileName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
@@ -937,7 +940,7 @@ private fun FileGridCell(
                         Icon(
                             Icons.Filled.MoreVert,
                             contentDescription = stringResource(R.string.browser_more),
-                            tint = if (thumbModel != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (thumbFile != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(18.dp),
                         )
                     }
@@ -1035,6 +1038,9 @@ private fun FileListRow(
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
     val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
+    val thumbFile = remember(thumbModel) {
+        thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    }
     val partBadge = remember(item.fileName) {
         PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
     }
@@ -1075,9 +1081,9 @@ private fun FileListRow(
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp),
                 )
-            } else if (thumbModel != null) {
+            } else if (thumbFile != null) {
                 AsyncImage(
-                    model = thumbModel,
+                    model = thumbFile,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier

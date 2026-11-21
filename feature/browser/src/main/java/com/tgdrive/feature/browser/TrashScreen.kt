@@ -64,6 +64,7 @@ import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgTypography
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -276,6 +277,9 @@ private fun TrashEntryRow(
             .padding(start = 12.dp, end = 6.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        val thumbFile = remember(entry.thumbnailPath) {
+            entry.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+        }
         Box(
             modifier = Modifier
                 .size(44.dp)
@@ -283,9 +287,9 @@ private fun TrashEntryRow(
                 .background(MaterialTheme.colorScheme.surfaceContainerHigh),
             contentAlignment = Alignment.Center,
         ) {
-            if (entry.thumbnailPath != null) {
+            if (thumbFile != null) {
                 AsyncImage(
-                    model = entry.thumbnailPath,
+                    model = thumbFile,
                     contentDescription = entry.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),

@@ -20,6 +20,7 @@ import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadTracker
 import com.tgdrive.core.download.index.ZipIndexService
@@ -116,10 +117,11 @@ class FolderViewModel
         private val trashEntryDao: TrashEntryDao,
         private val zipIndexService: ZipIndexService,
         private val cloudSyncManager: CloudSyncManager,
-        private val pdfThumbnailCache: PdfThumbnailCache,
+        private val mediaThumbnailCache: MediaThumbnailCache,
         private val savedStateHandle: SavedStateHandle,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
+        private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
         private val _selected = MutableStateFlow<Set<Long>>(emptySet())
         private val _loading = MutableStateFlow(false)
         private val _refreshing = MutableStateFlow(false)
@@ -217,6 +219,7 @@ class FolderViewModel
             bindJob?.cancel()
             pdfWatchJob?.cancel()
             refreshJob?.cancel()
+            attemptedThumbKeys.clear()
             _items.value = emptyList()
             _selected.value = emptySet()
             _pdfThumbnails.value = emptyMap()
@@ -226,16 +229,34 @@ class FolderViewModel
                 viewModelScope.launch(dispatchers.io) {
                     fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
                         _items.value = entities
-                        launch { refreshPdfThumbnails(chatId, entities) }
+                        val toWarm =
+                            entities
+                                .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+                                .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
+                                .take(50)
+                        for (entity in toWarm) {
+                            launch {
+                                try {
+                                    mediaThumbnailCache.ensureThumbnail(entity)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                        launch { refreshLocalThumbnails(chatId, entities) }
                     }
                 }
             pdfWatchJob =
                 viewModelScope.launch(dispatchers.io) {
                     downloadManager.state
-                        .map { st -> st.items.count { it.chatId == chatId && it.status == DownloadStatus.DONE } }
-                        .distinctUntilChanged()
+                        .map { st ->
+                            st.items
+                                .filter { it.chatId == chatId && it.status == DownloadStatus.DONE }
+                                .map { it.messageId to it.localPath }
+                        }.distinctUntilChanged()
                         .collect {
-                            refreshPdfThumbnails(chatId, _items.value)
+                            refreshLocalThumbnails(chatId, _items.value)
                         }
                 }
             viewModelScope.launch(dispatchers.io) {
@@ -244,33 +265,29 @@ class FolderViewModel
             refresh()
         }
 
-        private suspend fun refreshPdfThumbnails(
+        private suspend fun refreshLocalThumbnails(
             chatId: Long,
             entities: List<FileCacheEntity>,
         ) {
-            val pdfs = entities.filter {
-                it.thumbnailPath == null && classifyFile(it.mimeType, it.fileName) == FileBucket.PDF
-            }
-            if (pdfs.isEmpty()) return
-            val map = LinkedHashMap(_pdfThumbnails.value)
-            var changed = false
-            for (pdf in pdfs) {
-                if (map.containsKey(pdf.messageId)) continue
-                val cached = pdfThumbnailCache.getCachedThumbnailPath(chatId, pdf.messageId)
+            val candidates =
+                entities.filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+            if (candidates.isEmpty()) return
+            for (entity in candidates) {
+                val cached = mediaThumbnailCache.getCachedThumbnailPath(chatId, entity.messageId)
                 if (cached != null) {
-                    map[pdf.messageId] = cached
-                    changed = true
+                    if (entity.thumbnailPath != cached) {
+                        runCatching { fileCacheDao.updateThumbnailPath(chatId, entity.messageId, cached) }
+                    }
                     continue
                 }
-                val localPath = getLocalPath(pdf.messageId) ?: continue
-                val generated = pdfThumbnailCache.getOrCreateThumbnail(chatId, pdf.messageId, localPath)
-                if (generated != null) {
-                    map[pdf.messageId] = generated
-                    changed = true
-                }
-            }
-            if (changed && currentChatId == chatId) {
-                _pdfThumbnails.value = map
+                val localPath = getLocalPath(entity.messageId) ?: continue
+                mediaThumbnailCache.generateFromLocalFile(
+                    chatId = chatId,
+                    messageId = entity.messageId,
+                    localPath = localPath,
+                    mimeType = entity.mimeType,
+                    fileName = entity.fileName,
+                )
             }
         }
 
@@ -307,7 +324,10 @@ class FolderViewModel
                                 try {
                                     val current = _items.value
                                     if (current.isNotEmpty() &&
-                                        current.all { it.thumbnailPath != null || !hasThumbnailableKind(it) }
+                                        current.all {
+                                            !mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) ||
+                                                !hasThumbnailableKind(it)
+                                        }
                                     ) {
                                         break
                                     }
@@ -737,6 +757,14 @@ class FolderViewModel
                                 _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
                                 uploadTracker.updateProgress(trackerKey, sent, total)
                             }
+                        val localThumb =
+                            mediaThumbnailCache.generateFromLocalFile(
+                                chatId = chatId,
+                                messageId = result.messageId,
+                                localPath = staging.absolutePath,
+                                mimeType = guessMime(name),
+                                fileName = name,
+                            )
                         fileCacheDao.upsertAll(
                             listOf(
                                 FileCacheEntity(
@@ -745,7 +773,7 @@ class FolderViewModel
                                     fileName = name,
                                     fileSize = realSize,
                                     mimeType = guessMime(name),
-                                    thumbnailPath = null,
+                                    thumbnailPath = localThumb,
                                     remoteId = result.remoteId,
                                     date = System.currentTimeMillis(),
                                 ),
@@ -848,6 +876,18 @@ class FolderViewModel
                                 uploadTracker.updateProgress(partTrackerKey, sent, total)
                             }
                             uploadTracker.completeUpload(partTrackerKey)
+                            val partThumb =
+                                if (password.isNullOrBlank()) {
+                                    mediaThumbnailCache.generateFromLocalFile(
+                                        chatId = chatId,
+                                        messageId = result.messageId,
+                                        localPath = part.partFile.absolutePath,
+                                        mimeType = "application/zip",
+                                        fileName = partFileName,
+                                    )
+                                } else {
+                                    null
+                                }
                             fileCacheDao.upsertAll(
                                 listOf(
                                     FileCacheEntity(
@@ -856,7 +896,7 @@ class FolderViewModel
                                         fileName = partFileName,
                                         fileSize = partLen,
                                         mimeType = "application/zip",
-                                        thumbnailPath = null,
+                                        thumbnailPath = partThumb,
                                         remoteId = result.remoteId,
                                         date = System.currentTimeMillis(),
                                     ),

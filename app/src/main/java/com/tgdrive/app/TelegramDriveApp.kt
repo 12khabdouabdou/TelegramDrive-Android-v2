@@ -5,6 +5,7 @@ import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
 import coil.ImageLoader
 import coil.ImageLoaderFactory
+import coil.decode.VideoFrameDecoder
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.tgdrive.app.boot.NotificationChannels
@@ -170,6 +171,9 @@ class TelegramDriveApp :
 
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
+            .components {
+                add(VideoFrameDecoder.Factory())
+            }
             .memoryCache {
                 MemoryCache.Builder(this)
                     .maxSizePercent(0.25)
