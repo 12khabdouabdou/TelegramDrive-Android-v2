@@ -281,6 +281,7 @@ class CategoryFilesViewModel @Inject constructor(
             FileSort.DATE_DESC -> list.sortedByDescending { it.date }
             FileSort.DATE_ASC -> list.sortedBy { it.date }
             FileSort.NAME_ASC -> list.sortedBy { it.fileName.lowercase() }
+            FileSort.NAME_DESC -> list.sortedByDescending { it.fileName.lowercase() }
             FileSort.SIZE_DESC -> list.sortedByDescending { it.fileSize }
             FileSort.SIZE_ASC -> list.sortedBy { it.fileSize }
         }
