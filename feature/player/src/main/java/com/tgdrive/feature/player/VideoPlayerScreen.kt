@@ -10,7 +10,6 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -398,7 +397,8 @@ private tailrec fun Context.findActivity(): Activity? =
  * streaming with speed control, aspect-ratio cycling, embedded & external subtitles,
  * tap/swipe seek/brightness/volume gestures, cloud-synced resume position, and PiP.
  */
-@OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
+@androidx.annotation.OptIn(UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VideoPlayerScreen(
     messageId: Long,
@@ -481,10 +481,12 @@ fun VideoPlayerScreen(
                     .setLabel(subLabel)
                     .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                     .build()
-                exo?.trackSelectionParameters = exo?.trackSelectionParameters
-                    ?.buildUpon()
-                    ?.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                    ?.build() ?: return@launch
+                exo?.let { player ->
+                    player.trackSelectionParameters = player.trackSelectionParameters
+                        .buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .build()
+                }
             }
         }
     }
@@ -722,19 +724,20 @@ fun VideoPlayerScreen(
                 }
             }
             hasActiveVideo && exo != null -> {
+                val targetResizeMode = resizeMode
                 AndroidView(
                     factory = { viewCtx ->
                         PlayerView(viewCtx).apply {
                             player = exo
                             useController = !inPip
-                            this.resizeMode = resizeMode
+                            this.resizeMode = targetResizeMode
                             playerViewRef = this
                         }
                     },
                     update = { view ->
                         if (view.player !== exo) view.player = exo
                         view.useController = !inPip
-                        view.resizeMode = resizeMode
+                        view.resizeMode = targetResizeMode
                         playerViewRef = view
                     },
                     onRelease = { view ->
