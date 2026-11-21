@@ -21,6 +21,7 @@ dependencies {
     implementation(project(":core:telegram"))
     implementation(project(":core:db"))
     implementation(project(":core:datastore"))
+    implementation(project(":core:zip"))
 
     implementation(libs.coroutines.android)
     implementation(libs.work.runtime.ktx)

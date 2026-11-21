@@ -1,5 +1,6 @@
 package com.tgdrive.app.nav
 
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,7 +23,9 @@ import com.tgdrive.app.RootViewModel
 import com.tgdrive.app.onboarding.OnboardingScreen
 import com.tgdrive.feature.auth.AuthFlow
 import com.tgdrive.feature.autobackup.BackupHistoryScreen
+import com.tgdrive.feature.autobackup.FreeUpSpaceScreen
 import com.tgdrive.feature.autobackup.SyncLogDetailsScreen
+import com.tgdrive.feature.browser.TrashScreen
 import com.tgdrive.feature.browser.ZipBrowserScreen
 import com.tgdrive.feature.download.DownloadListScreen
 import com.tgdrive.feature.player.AudioPlayerScaffold
@@ -32,6 +35,7 @@ import com.tgdrive.feature.player.TextViewerScreen
 import com.tgdrive.feature.player.VideoPlayerScreen
 import com.tgdrive.feature.settings.AboutScreen
 import com.tgdrive.feature.settings.CacheSettingsScreen
+import com.tgdrive.feature.settings.SettingsScreen
 
 /**
  * Root navigation host.
@@ -101,11 +105,17 @@ fun RootNavHost(
                     onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
                     onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
+                    onOpenZipEntry = { chatId, zipMsgId, entryPath ->
+                        nav.navigate("zip/$zipMsgId?chatId=$chatId&entry=${Uri.encode(entryPath)}")
+                    },
                     onOpenText = { chatId, msgId -> nav.navigate("text/$msgId?chatId=$chatId") },
                     onOpenHistory = { nav.navigate("history") },
                     onOpenDownloads = { nav.navigate("downloads") },
                     onOpenCacheSettings = { nav.navigate("cache_settings") },
                     onOpenAbout = { nav.navigate("about") },
+                    onOpenSettings = { nav.navigate("settings") },
+                    onOpenTrash = { nav.navigate("trash") },
+                    onOpenFreeUpSpace = { nav.navigate("free_up_space") },
                 )
             }
 
@@ -178,15 +188,49 @@ fun RootNavHost(
             }
 
             composable(
-                "zip/{msgId}",
-                arguments = listOf(navArgument("msgId") { type = NavType.LongType }),
+                "zip/{msgId}?chatId={chatId}&entry={entry}",
+                arguments = listOf(
+                    navArgument("msgId") { type = NavType.LongType },
+                    navArgument("chatId") {
+                        type = NavType.LongType
+                        defaultValue = 0L
+                    },
+                    navArgument("entry") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                ),
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
-                ZipBrowserScreen(messageId = msgId, onBack = { nav.popBackStack() })
+                val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                val entryPath = entry.arguments?.getString("entry").orEmpty()
+                ZipBrowserScreen(
+                    messageId = msgId,
+                    chatId = chatId,
+                    initialEntryPath = Uri.decode(entryPath),
+                    onBack = { nav.popBackStack() },
+                )
             }
 
             composable("downloads") {
                 DownloadListScreen(showBack = true, onBack = { nav.popBackStack() })
+            }
+
+            composable("settings") {
+                SettingsScreen(
+                    showBack = true,
+                    onBack = { nav.popBackStack() },
+                    onOpenCache = { nav.navigate("cache_settings") },
+                    onOpenAbout = { nav.navigate("about") },
+                )
+            }
+
+            composable("trash") {
+                TrashScreen(onBack = { nav.popBackStack() })
+            }
+
+            composable("free_up_space") {
+                FreeUpSpaceScreen(onBack = { nav.popBackStack() })
             }
 
             composable("cache_settings") {

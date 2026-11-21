@@ -7,10 +7,12 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.AuthorizationState
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -67,6 +69,7 @@ class RootViewModel @Inject constructor(
     private val preferences: AppPreferences,
     private val networkMonitor: NetworkMonitor,
     private val keystoreHelper: KeystoreHelper,
+    private val cloudSyncManager: CloudSyncManager,
     private val dispatchers: DispatchersProvider,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -78,6 +81,7 @@ class RootViewModel @Inject constructor(
     private var biometricPrefEnabled = false
     private var biometricLastBgTimeMs = 0L
     private var initialPrefSynced = false
+    private var cloudSyncedForSession = false
 
     init {
         observeAuth()
@@ -107,6 +111,20 @@ class RootViewModel @Inject constructor(
                         // exit" path for returning users.
                         isInitializing = current.isInitializing && st is AuthorizationState.WaitInitialization,
                     )
+                }
+                if (st is AuthorizationState.Ready && !cloudSyncedForSession) {
+                    cloudSyncedForSession = true
+                    launch {
+                        try {
+                            cloudSyncManager.syncFromCloud()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            Log.w("RootViewModel: initial cloudSync failed", t)
+                        }
+                    }
+                } else if (st !is AuthorizationState.Ready) {
+                    cloudSyncedForSession = false
                 }
             }
         }

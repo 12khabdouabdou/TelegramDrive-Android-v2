@@ -60,4 +60,11 @@
     <string name="settings_cache_pins_desc">%1$d file(s) · preserved when clearing temporary cache</string>
     <string name="settings_cache_pins_clear">Clear offline pins</string>
     <string name="settings_cache_pins_cleared">Offline pins removed</string>
+    <string name="settings_back">Back</string>
+    <string name="settings_cloud_sync">Telegram Cloud Sync</string>
+    <string name="settings_cloud_sync_desc">Stars, renames, folder colors, Trash, and ZIP index sync privately in your TelegramDrive System channel</string>
+    <string name="settings_cloud_sync_now">Sync now</string>
+    <string name="settings_cloud_syncing">Syncing…</string>
+    <string name="settings_cloud_sync_last">Last synced: %1$s</string>
+    <string name="settings_cloud_sync_never">Not synced yet</string>
 </resources>

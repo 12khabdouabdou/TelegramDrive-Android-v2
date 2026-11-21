@@ -10,6 +10,8 @@ import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
+import com.tgdrive.core.download.index.ZipIndexService
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.UploadedZipPartRecord
 import com.tgdrive.core.zip.ZipUploader
@@ -64,6 +66,8 @@ class BackupOrchestrator @Inject constructor(
     private val fileCacheDao: FileCacheDao,
     private val notifier: BackupNotifier,
     private val registry: ActiveBackupRegistry,
+    private val zipIndexService: ZipIndexService,
+    private val cloudSyncManager: CloudSyncManager,
 ) {
 
     /**
@@ -768,6 +772,18 @@ class BackupOrchestrator @Inject constructor(
                             ),
                         ),
                     )
+                    try {
+                        zipIndexService.indexPartEntries(
+                            chatId = destChatId,
+                            zipMessageId = uploadResult.messageId,
+                            zipFileName = partName,
+                            entryPaths = part.entries,
+                            encrypted = false,
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                    }
                     uploadedParts += UploadedZipPartRecord(
                         fileName = partName,
                         fileSizeBytes = partSize,
@@ -914,6 +930,9 @@ class BackupOrchestrator @Inject constructor(
                 )
             )
             syncLogDao.deleteOlderThan(System.currentTimeMillis() - (30L * 24 * 60 * 60 * 1000))
+            if (uploaded > 0) {
+                cloudSyncManager.schedulePushMetadata()
+            }
         } catch (t: CancellationException) {
             // Re-throw cancellation — NEVER swallow it. Swallowing
             // CancellationException is a coroutine anti-pattern that leaves

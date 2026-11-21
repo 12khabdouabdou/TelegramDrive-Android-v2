@@ -110,6 +110,30 @@ interface FileCacheDao {
     @Query("SELECT * FROM file_cache ORDER BY date DESC")
     suspend fun getAll(): List<FileCacheEntity>
 
+    @Query(
+        """
+        SELECT * FROM file_cache
+        WHERE mime_type LIKE 'image/%'
+           OR mime_type LIKE 'video/%'
+           OR lower(file_name) LIKE '%.jpg'
+           OR lower(file_name) LIKE '%.jpeg'
+           OR lower(file_name) LIKE '%.png'
+           OR lower(file_name) LIKE '%.webp'
+           OR lower(file_name) LIKE '%.gif'
+           OR lower(file_name) LIKE '%.heic'
+           OR lower(file_name) LIKE '%.heif'
+           OR lower(file_name) LIKE '%.mp4'
+           OR lower(file_name) LIKE '%.mkv'
+           OR lower(file_name) LIKE '%.mov'
+           OR lower(file_name) LIKE '%.webm'
+        ORDER BY date DESC
+        """,
+    )
+    fun observeMediaItems(): Flow<List<FileCacheEntity>>
+
+    @Query("SELECT * FROM file_cache WHERE lower(file_name) LIKE '%.zip' ORDER BY date DESC")
+    suspend fun getAllZips(): List<FileCacheEntity>
+
     /**
      * Per-chat aggregate used by the Storage Analytics dashboard.
      * Returns one row per chat that has at least one cached file.

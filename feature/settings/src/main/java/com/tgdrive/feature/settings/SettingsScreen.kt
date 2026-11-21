@@ -16,20 +16,25 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -62,6 +67,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.common.toHumanSize
+import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.core.datastore.ThemeMode
 import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.designsystem.editorial.EditorialHeader
@@ -78,6 +84,8 @@ import com.tgdrive.designsystem.theme.TgTypography
 fun SettingsScreen(
     onOpenCache: () -> Unit = {},
     onOpenAbout: () -> Unit = {},
+    showBack: Boolean = false,
+    onBack: () -> Unit = {},
     vm: SettingsViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -241,7 +249,23 @@ fun SettingsScreen(
             .padding(horizontal = 24.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        EditorialHeader(title = stringResource(R.string.settings_title))
+        if (showBack) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = stringResource(R.string.settings_back),
+                        tint = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+                EditorialHeader(title = stringResource(R.string.settings_title))
+            }
+        } else {
+            EditorialHeader(title = stringResource(R.string.settings_title))
+        }
 
         // Appearance
         EditorialSection(title = stringResource(R.string.settings_appearance)) {
@@ -261,6 +285,47 @@ fun SettingsScreen(
                     selected = state.themeMode == mode,
                     onClick = { vm.setTheme(mode) },
                 )
+            }
+        }
+
+        // Telegram Cloud Sync
+        EditorialSection(title = stringResource(R.string.settings_cloud_sync)) {
+            Text(
+                text = stringResource(R.string.settings_cloud_sync_desc),
+                style = TgTypography.Display.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = if (state.lastCloudSyncMs > 0L) {
+                    stringResource(R.string.settings_cloud_sync_last, state.lastCloudSyncMs.toLocalShort())
+                } else {
+                    stringResource(R.string.settings_cloud_sync_never)
+                },
+                style = TgTypography.Mono,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp, bottom = 10.dp),
+            )
+            OutlinedButton(
+                onClick = vm::syncNow,
+                enabled = !state.cloudSyncing,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (state.cloudSyncing) {
+                    CircularProgressIndicator(
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.settings_cloud_syncing))
+                } else {
+                    Icon(
+                        Icons.Filled.Sync,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.settings_cloud_sync_now))
+                }
             }
         }
 

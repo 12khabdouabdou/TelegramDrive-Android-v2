@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
@@ -59,7 +60,6 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -72,8 +72,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -91,14 +93,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -140,10 +145,12 @@ fun FolderScreen(
     }
 
     val state by vm.state.collectAsStateWithLifecycle()
-    val snackbarMsg by vm.snackbarMessage.collectAsStateWithLifecycle()
+    val snackbarEvent by vm.snackbarEvent.collectAsStateWithLifecycle()
     val isSavedMessages by vm.isSavedMessages.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val haptics = LocalHapticFeedback.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val undoLabel = stringResource(R.string.trash_undo)
 
     val selectionMode = state.selectedIds.isNotEmpty()
     var searchOpen by remember { mutableStateOf(false) }
@@ -153,12 +160,17 @@ fun FolderScreen(
     var showSortMenu by remember { mutableStateOf(false) }
     var showMovePicker by remember { mutableStateOf(false) }
     var moveFromDetails by remember { mutableStateOf(false) }
-    var showDeleteSelectedConfirm by remember { mutableStateOf(false) }
-    var pendingDeleteSingle by remember { mutableStateOf<FileCacheEntity?>(null) }
 
-    LaunchedEffect(snackbarMsg) {
-        val msg = snackbarMsg ?: return@LaunchedEffect
-        snackbarHostState.showSnackbar(msg)
+    LaunchedEffect(snackbarEvent?.id) {
+        val ev = snackbarEvent ?: return@LaunchedEffect
+        val result = snackbarHostState.showSnackbar(
+            message = ev.message,
+            actionLabel = if (ev.canUndoTrash) undoLabel else null,
+            duration = if (ev.canUndoTrash) SnackbarDuration.Long else SnackbarDuration.Short,
+        )
+        if (result == SnackbarResult.ActionPerformed && ev.canUndoTrash) {
+            vm.undoLastTrash()
+        }
         vm.clearSnackbar()
     }
 
@@ -302,7 +314,7 @@ fun FolderScreen(
                                 tint = MaterialTheme.colorScheme.primary,
                             )
                         }
-                        IconButton(onClick = { showDeleteSelectedConfirm = true }) {
+                        IconButton(onClick = { vm.deleteSelected() }) {
                             Icon(
                                 Icons.Filled.Delete,
                                 contentDescription = stringResource(R.string.browser_action_delete),
@@ -492,8 +504,12 @@ fun FolderScreen(
                         FileViewMode.GRID ->
                             FileGrid(
                                 items = state.items,
+                                pdfThumbnails = state.pdfThumbnails,
                                 selectedIds = state.selectedIds,
-                                onLongClick = { id -> vm.toggleSelection(id) },
+                                onLongClick = { id ->
+                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    vm.toggleSelection(id)
+                                },
                                 onClick = { id ->
                                     if (selectionMode) {
                                         vm.toggleSelection(id)
@@ -521,8 +537,12 @@ fun FolderScreen(
                         FileViewMode.LIST ->
                             FileList(
                                 items = state.items,
+                                pdfThumbnails = state.pdfThumbnails,
                                 selectedIds = state.selectedIds,
-                                onLongClick = { id -> vm.toggleSelection(id) },
+                                onLongClick = { id ->
+                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    vm.toggleSelection(id)
+                                },
                                 onClick = { id ->
                                     if (selectionMode) {
                                         vm.toggleSelection(id)
@@ -580,7 +600,7 @@ fun FolderScreen(
                 moveFromDetails = true
                 showMovePicker = true
             },
-            onDelete = { pendingDeleteSingle = item },
+            onDelete = { vm.deleteSingle(item.messageId) },
             onToggleStar = { vm.toggleStar(item.messageId) },
             onTogglePinOffline = { vm.togglePinOffline(item) },
             onShareLink = if (isSavedMessages) null else ({ vm.shareLink(item) }),
@@ -602,85 +622,6 @@ fun FolderScreen(
                 if (moveFromDetails) {
                     vm.clearSelection()
                     moveFromDetails = false
-                }
-            },
-        )
-    }
-
-    if (showDeleteSelectedConfirm) {
-        val count = state.selectedIds.size
-        AlertDialog(
-            onDismissRequest = { showDeleteSelectedConfirm = false },
-            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-            title = {
-                Text(
-                    if (count == 1) {
-                        stringResource(R.string.browser_delete_confirm_title_one)
-                    } else {
-                        stringResource(R.string.browser_delete_confirm_title_many, count)
-                    },
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-            },
-            text = {
-                Text(
-                    stringResource(R.string.browser_delete_confirm_body_many, count),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showDeleteSelectedConfirm = false
-                        vm.deleteSelected()
-                    },
-                ) {
-                    Text(
-                        stringResource(R.string.browser_action_delete),
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteSelectedConfirm = false }) {
-                    Text(stringResource(R.string.browser_cancel))
-                }
-            },
-        )
-    }
-
-    pendingDeleteSingle?.let { item ->
-        AlertDialog(
-            onDismissRequest = { pendingDeleteSingle = null },
-            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-            title = {
-                Text(
-                    stringResource(R.string.browser_delete_confirm_title_one),
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-            },
-            text = {
-                Text(
-                    stringResource(R.string.browser_delete_confirm_body_one, item.fileName),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        pendingDeleteSingle = null
-                        vm.deleteSingle(item.messageId)
-                    },
-                ) {
-                    Text(
-                        stringResource(R.string.browser_action_delete),
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingDeleteSingle = null }) {
-                    Text(stringResource(R.string.browser_cancel))
                 }
             },
         )
@@ -795,9 +736,12 @@ private fun UploadsStrip(
 
 private fun other(mode: FileViewMode) = if (mode == FileViewMode.GRID) FileViewMode.LIST else FileViewMode.GRID
 
+private val PART_ZIP_REGEX = Regex("_part(\\d+)\\.zip$", RegexOption.IGNORE_CASE)
+
 @Composable
 private fun FileGrid(
     items: List<FileCacheEntity>,
+    pdfThumbnails: Map<Long, String>,
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -830,6 +774,7 @@ private fun FileGrid(
         items(items, key = { it.messageId }) { item ->
             FileGridCell(
                 item = item,
+                pdfThumbnailPath = pdfThumbnails[item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -859,12 +804,17 @@ private fun FileGrid(
 @Composable
 private fun FileGridCell(
     item: FileCacheEntity,
+    pdfThumbnailPath: String? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
+    val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
+    val partBadge = remember(item.fileName) {
+        PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
+    }
     Box(
         modifier = Modifier
             .aspectRatio(0.78f)
@@ -896,9 +846,9 @@ private fun FileGridCell(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                if (item.thumbnailPath != null) {
+                if (thumbModel != null) {
                     AsyncImage(
-                        model = item.thumbnailPath,
+                        model = thumbModel,
                         contentDescription = item.fileName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
@@ -937,6 +887,38 @@ private fun FileGridCell(
                         )
                     }
                 }
+                if (item.isPinnedOffline) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(6.dp)
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.OfflinePin,
+                            contentDescription = stringResource(R.string.details_pin_offline),
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+                if (partBadge != null) {
+                    Text(
+                        text = partBadge,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(6.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color.Black.copy(alpha = 0.65f))
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
                 if (isSelected) {
                     Icon(
                         Icons.Filled.CheckCircle,
@@ -955,7 +937,7 @@ private fun FileGridCell(
                         Icon(
                             Icons.Filled.MoreVert,
                             contentDescription = stringResource(R.string.browser_more),
-                            tint = if (item.thumbnailPath != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (thumbModel != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(18.dp),
                         )
                     }
@@ -984,6 +966,7 @@ private fun FileGridCell(
 @Composable
 private fun FileList(
     items: List<FileCacheEntity>,
+    pdfThumbnails: Map<Long, String>,
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -1014,6 +997,7 @@ private fun FileList(
         items(items, key = { it.messageId }) { item ->
             FileListRow(
                 item = item,
+                pdfThumbnailPath = pdfThumbnails[item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -1043,12 +1027,17 @@ private fun FileList(
 @Composable
 private fun FileListRow(
     item: FileCacheEntity,
+    pdfThumbnailPath: String? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
+    val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
+    val partBadge = remember(item.fileName) {
+        PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1086,9 +1075,9 @@ private fun FileListRow(
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp),
                 )
-            } else if (item.thumbnailPath != null) {
+            } else if (thumbModel != null) {
                 AsyncImage(
-                    model = item.thumbnailPath,
+                    model = thumbModel,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -1123,6 +1112,29 @@ private fun FileListRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (partBadge != null) {
+            Text(
+                text = partBadge,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier
+                    .padding(end = 6.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            )
+        }
+        if (item.isPinnedOffline) {
+            Icon(
+                Icons.Filled.OfflinePin,
+                contentDescription = stringResource(R.string.details_pin_offline),
+                tint = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier
+                    .padding(end = 4.dp)
+                    .size(16.dp),
             )
         }
         if (item.isStarred) {

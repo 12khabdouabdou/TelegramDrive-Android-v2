@@ -3,6 +3,8 @@ package com.tgdrive.feature.player
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.BitmapFactory
+import android.media.ExifInterface
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
@@ -69,20 +71,38 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
+import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.pip.PipController
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.designsystem.theme.TgTypography
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import javax.inject.Inject
+
+data class ImageExifInfo(
+    val fileName: String,
+    val fileSize: Long,
+    val width: Int,
+    val height: Int,
+    val dateTaken: String? = null,
+    val camera: String? = null,
+    val exposure: String? = null,
+    val location: String? = null,
+)
 
 @HiltViewModel
 class VideoPlayerViewModel @Inject constructor(
@@ -91,6 +111,9 @@ class VideoPlayerViewModel @Inject constructor(
     private val fileCacheDao: FileCacheDao,
     val telegramClient: TelegramClient,
     private val offlinePinStore: OfflinePinStore,
+    private val trashEntryDao: TrashEntryDao,
+    private val cloudSyncManager: CloudSyncManager,
+    private val dispatchers: DispatchersProvider,
 ) : ViewModel() {
 
     fun getLocalPath(messageId: Long, chatId: Long = 0L): String? {
@@ -149,6 +172,140 @@ class VideoPlayerViewModel @Inject constructor(
         viewModelScope.launch {
             runCatching { telegramClient.cancelFileStream(fileId) }
         }
+    }
+
+    suspend fun toggleStar(entry: FileCacheEntity): Boolean = withContext(dispatchers.io) {
+        val next = !entry.isStarred
+        fileCacheDao.setStarred(entry.chatId, entry.messageId, next)
+        cloudSyncManager.noteStarChanged(entry.chatId, entry.messageId, next)
+        next
+    }
+
+    suspend fun togglePinOffline(entry: FileCacheEntity): Boolean = withContext(dispatchers.io) {
+        if (entry.isPinnedOffline) {
+            offlinePinStore.unpinFile(entry.chatId, entry.messageId)
+            false
+        } else {
+            val local = getLocalPath(entry.messageId, entry.chatId)
+            if (local != null) {
+                offlinePinStore.pinFile(entry.chatId, entry.messageId, local, entry.fileName)
+            } else if (entry.remoteId.isNotEmpty()) {
+                downloadManager.enqueue(
+                    DownloadItem(
+                        id = entry.messageId,
+                        chatId = entry.chatId,
+                        remoteId = entry.remoteId,
+                        fileName = entry.fileName,
+                        totalBytes = entry.fileSize,
+                        pinOfflineWhenDone = true,
+                    ),
+                )
+                fileCacheDao.setPinnedOffline(entry.chatId, entry.messageId, true)
+            }
+            true
+        }
+    }
+
+    suspend fun moveToTrash(entry: FileCacheEntity) = withContext(dispatchers.io) {
+        try {
+            trashEntryDao.upsert(
+                TrashEntryEntity(
+                    messageId = entry.messageId,
+                    chatId = entry.chatId,
+                    fileName = entry.fileName,
+                    fileSize = entry.fileSize,
+                    mimeType = entry.mimeType,
+                    thumbnailPath = entry.thumbnailPath,
+                    remoteId = entry.remoteId,
+                    originalDate = entry.date,
+                    isStarred = entry.isStarred,
+                    deletedAt = System.currentTimeMillis(),
+                ),
+            )
+            fileCacheDao.deleteById(entry.chatId, entry.messageId)
+            cloudSyncManager.schedulePushMetadata()
+        } catch (e: CancellationException) {
+            throw e
+        }
+    }
+
+    suspend fun readImageExif(localPath: String?, entry: FileCacheEntity?): ImageExifInfo = withContext(dispatchers.io) {
+        var width = 0
+        var height = 0
+        var dateTaken: String? = null
+        var camera: String? = null
+        var exposure: String? = null
+        var location: String? = null
+
+        if (localPath != null && File(localPath).isFile) {
+            runCatching {
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(localPath, opts)
+                width = opts.outWidth.coerceAtLeast(0)
+                height = opts.outHeight.coerceAtLeast(0)
+            }
+            runCatching {
+                val exif = ExifInterface(localPath)
+                dateTaken = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+
+                val make = exif.getAttribute(ExifInterface.TAG_MAKE)?.trim().orEmpty()
+                val model = exif.getAttribute(ExifInterface.TAG_MODEL)?.trim().orEmpty()
+                camera = when {
+                    make.isNotEmpty() && model.isNotEmpty() && !model.startsWith(make, ignoreCase = true) -> "$make $model"
+                    model.isNotEmpty() -> model
+                    make.isNotEmpty() -> make
+                    else -> null
+                }
+
+                val parts = mutableListOf<String>()
+                exif.getAttribute(ExifInterface.TAG_F_NUMBER)?.takeIf { it.isNotBlank() }?.let { ap ->
+                    parts += "f/$ap"
+                }
+                exif.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)?.toDoubleOrNull()?.let { sec ->
+                    if (sec > 0.0 && sec < 1.0) {
+                        parts += "1/${Math.round(1.0 / sec)}s"
+                    } else if (sec >= 1.0) {
+                        parts += "${String.format(Locale.US, "%.1f", sec)}s"
+                    }
+                }
+                exif.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.takeIf { it.isNotBlank() }?.let { iso ->
+                    parts += "ISO $iso"
+                }
+                exif.getAttribute(ExifInterface.TAG_FOCAL_LENGTH)?.let { raw ->
+                    val segs = raw.split('/')
+                    val mm = if (segs.size == 2) {
+                        val a = segs[0].toDoubleOrNull()
+                        val b = segs[1].toDoubleOrNull()
+                        if (a != null && b != null && b != 0.0) a / b else null
+                    } else {
+                        raw.toDoubleOrNull()
+                    }
+                    if (mm != null && mm > 0.0) {
+                        parts += "${String.format(Locale.US, "%.1f", mm)}mm"
+                    }
+                }
+                if (parts.isNotEmpty()) {
+                    exposure = parts.joinToString(" · ")
+                }
+
+                val latLong = FloatArray(2)
+                if (exif.getLatLong(latLong)) {
+                    location = "${String.format(Locale.US, "%.5f", latLong[0])}, ${String.format(Locale.US, "%.5f", latLong[1])}"
+                }
+            }
+        }
+
+        ImageExifInfo(
+            fileName = entry?.fileName ?: localPath?.let { File(it).name }.orEmpty(),
+            fileSize = entry?.fileSize ?: localPath?.let { File(it).length() } ?: 0L,
+            width = width,
+            height = height,
+            dateTaken = dateTaken,
+            camera = camera,
+            exposure = exposure,
+            location = location,
+        )
     }
 
     override fun onCleared() {

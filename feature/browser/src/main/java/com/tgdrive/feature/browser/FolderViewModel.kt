@@ -6,18 +6,24 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileSort
 import com.tgdrive.core.datastore.FileViewMode
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadTracker
+import com.tgdrive.core.download.index.ZipIndexService
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.TelegramMessage
 import com.tgdrive.core.zip.UploadedZipPartRecord
@@ -33,6 +39,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -74,6 +81,13 @@ data class FolderUiState(
     val fileFilter: FileFilter = FileFilter.ALL,
     val fileSort: FileSort = FileSort.DATE_DESC,
     val uploads: List<UploadProgress> = emptyList(),
+    val pdfThumbnails: Map<Long, String> = emptyMap(),
+)
+
+data class FolderSnackbarEvent(
+    val id: Long,
+    val message: String,
+    val canUndoTrash: Boolean = false,
 )
 
 data class UploadProgress(
@@ -99,6 +113,10 @@ class FolderViewModel
         val audioPlayerController: com.tgdrive.core.audio.AudioPlayerController,
         private val uploadTracker: UploadTracker,
         private val offlinePinStore: OfflinePinStore,
+        private val trashEntryDao: TrashEntryDao,
+        private val zipIndexService: ZipIndexService,
+        private val cloudSyncManager: CloudSyncManager,
+        private val pdfThumbnailCache: PdfThumbnailCache,
         private val savedStateHandle: SavedStateHandle,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
@@ -108,8 +126,9 @@ class FolderViewModel
         private val _error = MutableStateFlow<String?>(null)
         private val _search = MutableStateFlow("")
         private val _uploads = MutableStateFlow<List<UploadProgress>>(emptyList())
-        private val _snackbar = MutableStateFlow<String?>(null)
-        val snackbarMessage: StateFlow<String?> = _snackbar.asStateFlow()
+        private val _pdfThumbnails = MutableStateFlow<Map<Long, String>>(emptyMap())
+        private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
+        val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
         private val _isSavedMessages = MutableStateFlow(false)
         val isSavedMessages: StateFlow<Boolean> = _isSavedMessages.asStateFlow()
 
@@ -117,9 +136,11 @@ class FolderViewModel
         private var pendingZipPassword: String? = null
         private var bindResolveJob: Job? = null
         private var bindJob: Job? = null
+        private var pdfWatchJob: Job? = null
         private var refreshJob: Job? = null
         private var searchJob: Job? = null
         private var audioPlayWaitJob: Job? = null
+        private var lastTrashedBatch: List<TrashEntryEntity> = emptyList()
 
         private val _items = MutableStateFlow<List<FileCacheEntity>>(emptyList())
         private var oldestMessageId: Long = 0L
@@ -135,7 +156,7 @@ class FolderViewModel
             ) { items, selected, loading, refreshing, error ->
                 FolderCoreState(items, selected, loading, refreshing, error)
             }.let { core ->
-                combine(core, _search, preferences.data, _uploads) { c, search, prefs, uploads ->
+                combine(core, _search, preferences.data, _uploads, _pdfThumbnails) { c, search, prefs, uploads, pdfThumbs ->
                     val searched =
                         if (search.isBlank()) {
                             c.items
@@ -160,6 +181,7 @@ class FolderViewModel
                         fileFilter = prefs.fileFilter,
                         fileSort = prefs.fileSort,
                         uploads = uploads,
+                        pdfThumbnails = pdfThumbs,
                     )
                 }.flowOn(dispatchers.default)
             }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
@@ -193,19 +215,74 @@ class FolderViewModel
             if (chatId == currentChatId) return
             currentChatId = chatId
             bindJob?.cancel()
+            pdfWatchJob?.cancel()
             refreshJob?.cancel()
             _items.value = emptyList()
             _selected.value = emptySet()
+            _pdfThumbnails.value = emptyMap()
             oldestMessageId = 0L
             hasMoreMessages = true
             bindJob =
                 viewModelScope.launch(dispatchers.io) {
-                    fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities -> _items.value = entities }
+                    fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
+                        _items.value = entities
+                        launch { refreshPdfThumbnails(chatId, entities) }
+                    }
+                }
+            pdfWatchJob =
+                viewModelScope.launch(dispatchers.io) {
+                    downloadManager.state
+                        .map { st -> st.items.count { it.chatId == chatId && it.status == DownloadStatus.DONE } }
+                        .distinctUntilChanged()
+                        .collect {
+                            refreshPdfThumbnails(chatId, _items.value)
+                        }
                 }
             viewModelScope.launch(dispatchers.io) {
                 _isSavedMessages.value = runCatching { telegramClient.myUserId() == chatId }.getOrDefault(false)
             }
             refresh()
+        }
+
+        private suspend fun refreshPdfThumbnails(
+            chatId: Long,
+            entities: List<FileCacheEntity>,
+        ) {
+            val pdfs = entities.filter {
+                it.thumbnailPath == null && classifyFile(it.mimeType, it.fileName) == FileBucket.PDF
+            }
+            if (pdfs.isEmpty()) return
+            val map = LinkedHashMap(_pdfThumbnails.value)
+            var changed = false
+            for (pdf in pdfs) {
+                if (map.containsKey(pdf.messageId)) continue
+                val cached = pdfThumbnailCache.getCachedThumbnailPath(chatId, pdf.messageId)
+                if (cached != null) {
+                    map[pdf.messageId] = cached
+                    changed = true
+                    continue
+                }
+                val localPath = getLocalPath(pdf.messageId) ?: continue
+                val generated = pdfThumbnailCache.getOrCreateThumbnail(chatId, pdf.messageId, localPath)
+                if (generated != null) {
+                    map[pdf.messageId] = generated
+                    changed = true
+                }
+            }
+            if (changed && currentChatId == chatId) {
+                _pdfThumbnails.value = map
+            }
+        }
+
+        private suspend fun filterOutTrashed(
+            chatId: Long,
+            msgs: List<TelegramMessage>,
+        ): List<TelegramMessage> {
+            val trashedIds = trashEntryDao.getAll()
+                .asSequence()
+                .filter { it.chatId == chatId }
+                .mapTo(HashSet()) { it.messageId }
+            return if (trashedIds.isEmpty()) msgs else msgs.filter { it.id !in trashedIds }
         }
 
         fun refresh() {
@@ -218,7 +295,7 @@ class FolderViewModel
                     _refreshing.value = true
                     _error.value = null
                     try {
-                        val msgs = telegramClient.fetchMessages(chatId, 0, 100)
+                        val msgs = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
                         val entities = msgs.map { it.toCacheEntity(chatId) }
                         fileCacheDao.upsertAll(entities)
                         oldestMessageId = msgs.minOfOrNull { it.id } ?: 0L
@@ -234,7 +311,7 @@ class FolderViewModel
                                     ) {
                                         break
                                     }
-                                    val msgs2 = telegramClient.fetchMessages(chatId, 0, 100)
+                                    val msgs2 = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
                                     val withThumbs =
                                         msgs2.map { it.toCacheEntity(chatId) }.filter {
                                             it.thumbnailPath != null
@@ -263,13 +340,16 @@ class FolderViewModel
             viewModelScope.launch(dispatchers.io) {
                 _loading.value = true
                 try {
-                    val msgs = telegramClient.fetchMessages(chatId, oldestMessageId, 100)
-                    if (msgs.isEmpty()) {
+                    val raw = telegramClient.fetchMessages(chatId, oldestMessageId, 100)
+                    if (raw.isEmpty()) {
                         hasMoreMessages = false
                     } else {
-                        fileCacheDao.upsertAll(msgs.map { it.toCacheEntity(chatId) })
-                        oldestMessageId = msgs.minOfOrNull { it.id } ?: oldestMessageId
-                        hasMoreMessages = msgs.size >= 50
+                        val msgs = filterOutTrashed(chatId, raw)
+                        if (msgs.isNotEmpty()) {
+                            fileCacheDao.upsertAll(msgs.map { it.toCacheEntity(chatId) })
+                        }
+                        oldestMessageId = raw.minOfOrNull { it.id } ?: oldestMessageId
+                        hasMoreMessages = raw.size >= 50
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -290,7 +370,7 @@ class FolderViewModel
                 viewModelScope.launch(dispatchers.io) {
                     delay(400)
                     try {
-                        val results = telegramClient.searchMessages(chatId, v, 50)
+                        val results = filterOutTrashed(chatId, telegramClient.searchMessages(chatId, v, 50))
                         if (results.isNotEmpty()) {
                             fileCacheDao.upsertAll(
                                 results.map { it.toCacheEntity(chatId) },
@@ -322,11 +402,11 @@ class FolderViewModel
         }
 
         fun clearSnackbar() {
-            _snackbar.value = null
+            _snackbarEvent.value = null
         }
 
         fun showSnackbar(message: String) {
-            _snackbar.value = message
+            _snackbarEvent.value = FolderSnackbarEvent(System.nanoTime(), message, canUndoTrash = false)
         }
 
         fun setPendingZipOptions(zipName: String?, password: String?) {
@@ -360,7 +440,9 @@ class FolderViewModel
             viewModelScope.launch(dispatchers.io) {
                 try {
                     val item = _items.value.find { it.messageId == messageId } ?: return@launch
-                    fileCacheDao.setStarred(chatId, messageId, !item.isStarred)
+                    val nextStar = !item.isStarred
+                    fileCacheDao.setStarred(chatId, messageId, nextStar)
+                    cloudSyncManager.noteStarChanged(chatId, messageId, nextStar)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
@@ -374,12 +456,12 @@ class FolderViewModel
                 try {
                     if (item.isPinnedOffline) {
                         offlinePinStore.unpinFile(item.chatId, item.messageId)
-                        _snackbar.value = "Removed offline copy"
+                        showSnackbar("Removed offline copy")
                     } else {
                         val local = getLocalPath(item.messageId)
                         if (local != null) {
                             offlinePinStore.pinFile(item.chatId, item.messageId, local, item.fileName)
-                            _snackbar.value = "Saved for offline access"
+                            showSnackbar("Saved for offline access")
                         } else if (item.remoteId.isNotEmpty()) {
                             downloadManager.enqueue(
                                 DownloadItem(
@@ -392,7 +474,7 @@ class FolderViewModel
                                 ),
                             )
                             fileCacheDao.setPinnedOffline(item.chatId, item.messageId, true)
-                            _snackbar.value = "Downloading for offline access…"
+                            showSnackbar("Downloading for offline access…")
                         }
                     }
                 } catch (e: CancellationException) {
@@ -423,7 +505,10 @@ class FolderViewModel
             viewModelScope.launch(dispatchers.io) {
                 try {
                     fileCacheDao.updateFileName(chatId, messageId, newName)
+                    cloudSyncManager.noteFileRenamed(chatId, messageId, newName)
                     Log.i("renameFile: updated local cache for msgId=$messageId → '$newName'")
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (t: Throwable) {
                     Log.w("renameFile failed", t)
                     _error.value = "Rename failed: ${t.message}"
@@ -452,48 +537,89 @@ class FolderViewModel
             val chatId = currentChatId ?: return
             val toDelete = _selected.value.toList()
             if (toDelete.isEmpty()) return
-            viewModelScope.launch(dispatchers.io) {
-                _loading.value = true
-                var deleted = 0
-                var lastError: String? = null
-                try {
-                    for (id in toDelete) {
-                        try {
-                            telegramClient.deleteMessage(chatId, id)
-                            fileCacheDao.deleteById(chatId, id)
-                            deleted++
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (t: Throwable) {
-                            lastError = t.message
-                            break
-                        }
-                    }
-                    _selected.value = emptySet()
-                    if (lastError != null) _error.value = "Deleted $deleted/${toDelete.size}. Error: $lastError"
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (t: Throwable) {
-                    _error.value = t.message ?: "Delete failed"
-                } finally {
-                    _loading.value = false
-                    refresh()
-                }
-            }
+            moveIdsToTrash(chatId, toDelete)
         }
 
         fun deleteSingle(messageId: Long) {
             val chatId = currentChatId ?: return
+            moveIdsToTrash(chatId, listOf(messageId))
+        }
+
+        private fun moveIdsToTrash(
+            chatId: Long,
+            ids: List<Long>,
+        ) {
             viewModelScope.launch(dispatchers.io) {
                 try {
-                    telegramClient.deleteMessage(chatId, messageId)
-                    fileCacheDao.deleteById(chatId, messageId)
-                    _selected.update { it - messageId }
+                    val now = System.currentTimeMillis()
+                    val byId = _items.value.associateBy { it.messageId }
+                    val entities = ids.mapNotNull { id -> byId[id] ?: fileCacheDao.getById(chatId, id) }
+                    if (entities.isEmpty()) return@launch
+
+                    val trashed = entities.map { item ->
+                        TrashEntryEntity(
+                            messageId = item.messageId,
+                            chatId = item.chatId,
+                            fileName = item.fileName,
+                            fileSize = item.fileSize,
+                            mimeType = item.mimeType,
+                            thumbnailPath = item.thumbnailPath,
+                            remoteId = item.remoteId,
+                            originalDate = item.date,
+                            isStarred = item.isStarred,
+                            deletedAt = now,
+                        )
+                    }
+                    trashEntryDao.upsertAll(trashed)
+                    for (item in entities) {
+                        fileCacheDao.deleteById(chatId, item.messageId)
+                    }
+                    _selected.update { current -> current - ids.toSet() }
+                    lastTrashedBatch = trashed
+                    cloudSyncManager.schedulePushMetadata()
+                    _snackbarEvent.value = FolderSnackbarEvent(
+                        id = System.nanoTime(),
+                        message = appContext.getString(R.string.trash_moved_snackbar, trashed.size),
+                        canUndoTrash = true,
+                    )
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
-                    Log.w("deleteSingle failed", t)
-                    _error.value = "Delete failed: ${t.message}"
+                    Log.w("moveIdsToTrash failed", t)
+                    _error.value = t.message ?: "Delete failed"
+                }
+            }
+        }
+
+        fun undoLastTrash() {
+            val batch = lastTrashedBatch
+            if (batch.isEmpty()) return
+            lastTrashedBatch = emptyList()
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    fileCacheDao.upsertAll(
+                        batch.map { entry ->
+                            FileCacheEntity(
+                                messageId = entry.messageId,
+                                chatId = entry.chatId,
+                                fileName = entry.fileName,
+                                fileSize = entry.fileSize,
+                                mimeType = entry.mimeType,
+                                thumbnailPath = entry.thumbnailPath,
+                                remoteId = entry.remoteId,
+                                date = entry.originalDate,
+                                isStarred = entry.isStarred,
+                            )
+                        },
+                    )
+                    for (entry in batch) {
+                        trashEntryDao.deleteById(entry.chatId, entry.messageId)
+                        cloudSyncManager.noteTrashRemoved(entry.chatId, entry.messageId)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("undoLastTrash failed", t)
                 }
             }
         }
@@ -736,6 +862,18 @@ class FolderViewModel
                                     ),
                                 ),
                             )
+                            try {
+                                zipIndexService.indexPartEntries(
+                                    chatId = chatId,
+                                    zipMessageId = result.messageId,
+                                    zipFileName = partFileName,
+                                    entryPaths = part.entries,
+                                    encrypted = !password.isNullOrBlank(),
+                                )
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Throwable) {
+                            }
                             uploadedParts += UploadedZipPartRecord(
                                 fileName = partFileName,
                                 fileSizeBytes = partLen,
@@ -798,7 +936,7 @@ class FolderViewModel
                                 ),
                             ),
                         )
-                        _snackbar.value = "Uploaded ${uploadedParts.size} ZIP parts + manifest"
+                        showSnackbar("Uploaded ${uploadedParts.size} ZIP parts + manifest")
                     }
 
                     _uploads.update { list ->
@@ -870,7 +1008,7 @@ class FolderViewModel
                             ).setPrimaryClip(clipboard)
                         }
                         _error.value = null
-                        _snackbar.value = "Share link copied to clipboard"
+                        showSnackbar("Share link copied to clipboard")
                         Log.i("shareLink: copied → $link")
                     } else {
                         _error.value = "Share links are only available for channel folders (not Saved Messages)"
@@ -988,7 +1126,7 @@ class FolderViewModel
                         val safeName = item.fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
                         source.copyTo(File(dir, safeName), overwrite = true)
                     }
-                    _snackbar.value = "Saved to Downloads"
+                    showSnackbar("Saved to Downloads")
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {

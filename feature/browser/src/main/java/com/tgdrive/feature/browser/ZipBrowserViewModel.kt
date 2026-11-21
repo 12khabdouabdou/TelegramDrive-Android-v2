@@ -6,7 +6,9 @@ import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipEntryInfo
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -52,6 +54,7 @@ class ZipBrowserViewModel
         @ApplicationContext private val appContext: Context,
         private val zipLister: ZipLister,
         private val zipExtractor: ZipExtractor,
+        private val zipIndexService: ZipIndexService,
     ) : ViewModel() {
         private val _state = MutableStateFlow(ZipBrowserUiState())
         val state: StateFlow<ZipBrowserUiState> = _state.asStateFlow()
@@ -67,7 +70,34 @@ class ZipBrowserViewModel
          * Sets [ZipBrowserUiState.passwordRequired] when any entry is encrypted —
          * the UI should prompt for a password before allowing extraction.
          */
-        fun load(zipPath: String) {
+        fun ensureArchiveQueued(chatId: Long, messageId: Long) {
+            if (downloadManager.findItem(chatId, messageId) != null) return
+            viewModelScope.launch(dispatchers.io) {
+                val cached = if (chatId != 0L) {
+                    runCatching { fileCacheDao.getById(chatId, messageId) }.getOrNull()
+                } else {
+                    runCatching { fileCacheDao.getAllZips().firstOrNull { it.messageId == messageId } }.getOrNull()
+                } ?: return@launch
+                if (cached.remoteId.isNotEmpty()) {
+                    downloadManager.enqueue(
+                        DownloadItem(
+                            id = cached.messageId,
+                            chatId = cached.chatId,
+                            remoteId = cached.remoteId,
+                            fileName = cached.fileName,
+                            totalBytes = cached.fileSize,
+                        ),
+                    )
+                }
+            }
+        }
+
+        fun load(
+            zipPath: String,
+            chatId: Long = 0L,
+            messageId: Long = 0L,
+            zipFileName: String = "",
+        ) {
             if (currentZipPath != zipPath) {
                 cachedPassword = null
             }
@@ -76,6 +106,12 @@ class ZipBrowserViewModel
                 _state.update { it.copy(loading = true, error = null) }
                 try {
                     val entries = zipLister.listEntries(zipPath)
+                    if (chatId != 0L && messageId != 0L && entries.isNotEmpty()) {
+                        val safeTitle = zipFileName.ifBlank { File(zipPath).name }
+                        runCatching {
+                            zipIndexService.indexLocalEntries(chatId, messageId, safeTitle, entries)
+                        }
+                    }
                     _state.update {
                         it.copy(
                             entries = entries,

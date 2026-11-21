@@ -50,6 +50,9 @@ interface SyncedFileDao {
     @Query("DELETE FROM synced_files")
     suspend fun clear()
 
+    @Query("SELECT * FROM synced_files ORDER BY synced_at DESC")
+    suspend fun getAll(): List<SyncedFileEntity>
+
     /**
      * Aggregate stats across every file AutoBackup has ever synced.
      * Used by the Storage Analytics dashboard to show how much local

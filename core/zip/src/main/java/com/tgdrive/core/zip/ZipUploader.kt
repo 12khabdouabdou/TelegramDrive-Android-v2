@@ -17,6 +17,8 @@ import java.io.FileOutputStream
 import java.io.FilterOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 
 /**
@@ -665,7 +667,127 @@ object ZipUploader {
             emptyList()
         }
     }
+
+    /**
+     * Locates the byte range `(offset, size)` of a ZIP file's Central Directory given
+     * [tailBytes] read from offset [tailFileOffset] near the end of the archive.
+     * Supports both standard ZIP32 EOCD and ZIP64 EOCD records.
+     */
+    fun findCentralDirectoryRange(
+        tailBytes: ByteArray,
+        tailFileOffset: Long,
+    ): ZipCentralDirectoryRange? {
+        if (tailBytes.size < 22) return null
+        val buf = ByteBuffer.wrap(tailBytes).order(ByteOrder.LITTLE_ENDIAN)
+        var eocdPos = -1
+        for (i in (tailBytes.size - 22) downTo 0) {
+            if (tailBytes[i] == 0x50.toByte() &&
+                tailBytes[i + 1] == 0x4b.toByte() &&
+                tailBytes[i + 2] == 0x05.toByte() &&
+                tailBytes[i + 3] == 0x06.toByte()
+            ) {
+                val commentLen = buf.getShort(i + 20).toInt() and 0xFFFF
+                if (i + 22 + commentLen <= tailBytes.size) {
+                    eocdPos = i
+                    break
+                }
+            }
+        }
+        if (eocdPos < 0) return null
+
+        var cdSize = buf.getInt(eocdPos + 12).toLong() and 0xFFFFFFFFL
+        var cdOffset = buf.getInt(eocdPos + 16).toLong() and 0xFFFFFFFFL
+
+        if ((cdSize == 0xFFFFFFFFL || cdOffset == 0xFFFFFFFFL) && eocdPos >= 20) {
+            val locPos = eocdPos - 20
+            if (buf.getInt(locPos) == 0x07064b50) {
+                val z64EocdOffset = buf.getLong(locPos + 8)
+                val z64Rel = (z64EocdOffset - tailFileOffset).toInt()
+                if (z64Rel >= 0 && z64Rel + 56 <= tailBytes.size && buf.getInt(z64Rel) == 0x06064b50) {
+                    cdSize = buf.getLong(z64Rel + 40)
+                    cdOffset = buf.getLong(z64Rel + 48)
+                }
+            }
+        }
+
+        if (cdOffset < 0L || cdSize < 0L) return null
+        return ZipCentralDirectoryRange(offset = cdOffset, size = cdSize)
+    }
+
+    /**
+     * Parses ZIP Central Directory (`0x02014b50`) headers directly from an exact slice
+     * of the Central Directory bytes without downloading the file payloads.
+     */
+    fun parseCentralDirectoryEntries(cdBytes: ByteArray): List<ZipEntryInfo> {
+        if (cdBytes.size < 46) return emptyList()
+        val buf = ByteBuffer.wrap(cdBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val result = mutableListOf<ZipEntryInfo>()
+        var pos = 0
+        while (pos + 46 <= cdBytes.size) {
+            if (buf.getInt(pos) != 0x02014b50) break
+            val gpFlag = buf.getShort(pos + 8).toInt() and 0xFFFF
+            var compSize = buf.getInt(pos + 20).toLong() and 0xFFFFFFFFL
+            var uncompSize = buf.getInt(pos + 24).toLong() and 0xFFFFFFFFL
+            val nameLen = buf.getShort(pos + 28).toInt() and 0xFFFF
+            val extraLen = buf.getShort(pos + 30).toInt() and 0xFFFF
+            val commentLen = buf.getShort(pos + 32).toInt() and 0xFFFF
+            val nextPos = pos + 46 + nameLen + extraLen + commentLen
+            if (nextPos > cdBytes.size) break
+
+            val name = String(cdBytes, pos + 46, nameLen, Charsets.UTF_8)
+            if ((compSize == 0xFFFFFFFFL || uncompSize == 0xFFFFFFFFL) && extraLen >= 4) {
+                var ePos = pos + 46 + nameLen
+                val eEnd = ePos + extraLen
+                while (ePos + 4 <= eEnd) {
+                    val headerId = buf.getShort(ePos).toInt() and 0xFFFF
+                    val dataSize = buf.getShort(ePos + 2).toInt() and 0xFFFF
+                    if (headerId == 0x0001 && ePos + 4 + dataSize <= eEnd) {
+                        var fieldOff = ePos + 4
+                        if (uncompSize == 0xFFFFFFFFL && fieldOff + 8 <= ePos + 4 + dataSize) {
+                            uncompSize = buf.getLong(fieldOff)
+                            fieldOff += 8
+                        }
+                        if (compSize == 0xFFFFFFFFL && fieldOff + 8 <= ePos + 4 + dataSize) {
+                            compSize = buf.getLong(fieldOff)
+                        }
+                        break
+                    }
+                    ePos += 4 + dataSize
+                }
+            }
+            result += ZipEntryInfo(
+                name = name,
+                isDirectory = name.endsWith("/"),
+                compressedSize = compSize,
+                uncompressedSize = uncompSize,
+                isEncrypted = (gpFlag and 0x0001) != 0,
+            )
+            pos = nextPos
+        }
+        return result
+    }
+
+    /**
+     * Convenience wrapper that parses all Central Directory entries directly from [tailBytes]
+     * when the Central Directory fits inside that tail slice; returns `null` if a larger
+     * fetch at the returned [findCentralDirectoryRange] is needed.
+     */
+    fun parseCentralDirectoryFromTail(
+        tailBytes: ByteArray,
+        tailFileOffset: Long,
+    ): List<ZipEntryInfo>? {
+        val range = findCentralDirectoryRange(tailBytes, tailFileOffset) ?: return null
+        val relStart = range.offset - tailFileOffset
+        if (relStart < 0L || relStart + range.size > tailBytes.size) return null
+        val slice = tailBytes.copyOfRange(relStart.toInt(), (relStart + range.size).toInt())
+        return parseCentralDirectoryEntries(slice)
+    }
 }
+
+data class ZipCentralDirectoryRange(
+    val offset: Long,
+    val size: Long,
+)
 
 data class ZipEntryInfo(
     val name: String,

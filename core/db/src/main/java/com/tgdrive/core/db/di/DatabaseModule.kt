@@ -9,6 +9,8 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.SyncLogDao
+import com.tgdrive.core.db.dao.TrashEntryDao
+import com.tgdrive.core.db.dao.ZipEntryDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -88,15 +90,59 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_4_5 = object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS zip_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    zip_message_id INTEGER NOT NULL,
+                    zip_file_name TEXT NOT NULL,
+                    entry_path TEXT NOT NULL,
+                    entry_name TEXT NOT NULL,
+                    entry_size INTEGER NOT NULL,
+                    is_encrypted INTEGER NOT NULL,
+                    indexed_at INTEGER NOT NULL
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_zip_entries_chat_id_zip_message_id ON zip_entries(chat_id, zip_message_id)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_zip_entries_entry_name ON zip_entries(entry_name)")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_zip_entries_chat_id_zip_message_id_entry_path ON zip_entries(chat_id, zip_message_id, entry_path)")
+
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS trash_entries (
+                    message_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    mime_type TEXT,
+                    thumbnail_path TEXT,
+                    remote_id TEXT NOT NULL,
+                    original_date INTEGER NOT NULL,
+                    is_starred INTEGER NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    PRIMARY KEY(message_id, chat_id)
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_trash_entries_deleted_at ON trash_entries(deleted_at)")
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()
     @Provides fun provideSyncedFileDao(db: TgDriveDatabase): SyncedFileDao = db.syncedFileDao()
     @Provides fun provideSyncLogDao(db: TgDriveDatabase): SyncLogDao = db.syncLogDao()
     @Provides fun provideFileCacheDao(db: TgDriveDatabase): FileCacheDao = db.fileCacheDao()
+    @Provides fun provideZipEntryDao(db: TgDriveDatabase): ZipEntryDao = db.zipEntryDao()
+    @Provides fun provideTrashEntryDao(db: TgDriveDatabase): TrashEntryDao = db.trashEntryDao()
 }

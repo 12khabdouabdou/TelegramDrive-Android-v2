@@ -21,7 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
@@ -57,16 +57,16 @@ import com.tgdrive.feature.browser.FolderScreen
 import com.tgdrive.feature.browser.FoldersManagementScreen
 import com.tgdrive.feature.browser.GlobalSearchScreen
 import com.tgdrive.feature.browser.HomeScreen
+import com.tgdrive.feature.browser.PhotosTimelineScreen
 import com.tgdrive.feature.browser.analytics.StorageAnalyticsScreen
 import com.tgdrive.feature.download.DownloadListScreen
-import com.tgdrive.feature.settings.SettingsScreen
 
 private enum class Tab(val route: String, val labelRes: Int) {
     HOME("tab/home", R.string.tab_home),
+    PHOTOS("tab/photos", R.string.tab_photos),
     FOLDERS("tab/folders", R.string.tab_folders),
     TRANSFERS("tab/transfers", R.string.tab_transfers),
     BACKUP("tab/backup", R.string.tab_backup),
-    SETTINGS("tab/settings", R.string.tab_settings),
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -78,11 +78,15 @@ fun MainBottomNav(
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
+    onOpenZipEntry: (Long, Long, String) -> Unit = { _, msgId, _ -> onOpenZip(msgId) },
     onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenHistory: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
     onOpenCacheSettings: () -> Unit = {},
     onOpenAbout: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
+    onOpenTrash: () -> Unit = {},
+    onOpenFreeUpSpace: () -> Unit = {},
 ) {
     val nav = mainNav
     val backStack by nav.currentBackStackEntryAsState()
@@ -145,10 +149,10 @@ fun MainBottomNav(
                                 Icon(
                                     imageVector = when (tab) {
                                         Tab.HOME -> Icons.Filled.Folder
+                                        Tab.PHOTOS -> Icons.Filled.PhotoLibrary
                                         Tab.FOLDERS -> Icons.Filled.CreateNewFolder
                                         Tab.TRANSFERS -> Icons.Filled.SwapVert
                                         Tab.BACKUP -> Icons.Filled.CloudUpload
-                                        Tab.SETTINGS -> Icons.Filled.Settings
                                     },
                                     contentDescription = null,
                                     tint = tint,
@@ -200,6 +204,17 @@ fun MainBottomNav(
                     onOpenCategoryFolder = { chatId, title, filter ->
                         nav.navigate("folder/$chatId/${Uri.encode(title)}?filter=${filter.name}")
                     },
+                    onOpenSettings = onOpenSettings,
+                    onOpenTrash = onOpenTrash,
+                    onOpenFreeUpSpace = onOpenFreeUpSpace,
+                )
+            }
+            composable(Tab.PHOTOS.route) {
+                PhotosTimelineScreen(
+                    onOpenImage = onOpenImage,
+                    onOpenVideo = onOpenVideo,
+                    onOpenSearch = { nav.navigate("search") },
+                    onOpenSettings = onOpenSettings,
                 )
             }
             composable(Tab.TRANSFERS.route) {
@@ -210,15 +225,13 @@ fun MainBottomNav(
                     onOpenFolder = { chatId, title ->
                         nav.navigate("folder/$chatId/${Uri.encode(title)}")
                     },
+                    onOpenTrash = onOpenTrash,
                 )
             }
             composable(Tab.BACKUP.route) {
-                AutoBackupScreen(onOpenHistory = onOpenHistory)
-            }
-            composable(Tab.SETTINGS.route) {
-                SettingsScreen(
-                    onOpenCache = onOpenCacheSettings,
-                    onOpenAbout = onOpenAbout,
+                AutoBackupScreen(
+                    onOpenHistory = onOpenHistory,
+                    onOpenFreeUpSpace = onOpenFreeUpSpace,
                 )
             }
 
@@ -237,6 +250,7 @@ fun MainBottomNav(
                     onOpenFile = { chatId, folderTitle, _ ->
                         nav.navigate("folder/$chatId/${Uri.encode(folderTitle)}")
                     },
+                    onOpenZipEntry = onOpenZipEntry,
                 )
             }
 

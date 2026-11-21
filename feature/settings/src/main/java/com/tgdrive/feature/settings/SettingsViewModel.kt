@@ -14,13 +14,17 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.SyncedFileDao
+import com.tgdrive.core.db.dao.TrashEntryDao
+import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -42,6 +46,8 @@ data class SettingsUiState(
     val apiHash: String = "",
     val clearingCache: Boolean = false,
     val isEncryptionAvailable: Boolean = true,
+    val cloudSyncing: Boolean = false,
+    val lastCloudSyncMs: Long = 0L,
 )
 
 @HiltViewModel
@@ -56,6 +62,9 @@ class SettingsViewModel @Inject constructor(
     private val fileCacheDao: FileCacheDao,
     private val syncedFileDao: SyncedFileDao,
     private val syncLogDao: SyncLogDao,
+    private val zipEntryDao: ZipEntryDao,
+    private val trashEntryDao: TrashEntryDao,
+    private val cloudSyncManager: CloudSyncManager,
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatchersProvider,
     private val offlinePinStore: OfflinePinStore,
@@ -68,7 +77,8 @@ class SettingsViewModel @Inject constructor(
         preferences.data,
         _credsVersion,
         _clearingCache,
-    ) { p, _, clearing ->
+        cloudSyncManager.syncing,
+    ) { p, _, clearing, syncing ->
         val creds = keystore.getApiCreds()
         SettingsUiState(
             themeMode = p.themeMode,
@@ -78,6 +88,8 @@ class SettingsViewModel @Inject constructor(
             apiHash = creds?.apiHash.orEmpty(),
             clearingCache = clearing,
             isEncryptionAvailable = keystore.isEncryptionAvailable,
+            cloudSyncing = syncing,
+            lastCloudSyncMs = p.lastCloudSyncMs,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -122,6 +134,18 @@ class SettingsViewModel @Inject constructor(
         _credsVersion.value += 1
     }
 
+    fun syncNow() {
+        viewModelScope.launch(dispatchers.io) {
+            try {
+                cloudSyncManager.syncNow()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.w("SettingsViewModel: syncNow failed", t)
+            }
+        }
+    }
+
     /**
      * Perform complete logout on a ViewModel-independent scope + [NonCancellable]
      * so navigation away from `"main"` never cancels mid-cleanup, and logs out
@@ -156,6 +180,8 @@ class SettingsViewModel @Inject constructor(
                 try { fileCacheDao.clear() } catch (t: Throwable) { Log.w("logout: fileCacheDao.clear failed", t) }
                 try { syncedFileDao.clear() } catch (t: Throwable) { Log.w("logout: syncedFileDao.clear failed", t) }
                 try { syncLogDao.clear() } catch (t: Throwable) { Log.w("logout: syncLogDao.clear failed", t) }
+                try { zipEntryDao.clear() } catch (t: Throwable) { Log.w("logout: zipEntryDao.clear failed", t) }
+                try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
                 try { offlinePinStore.clearAll() } catch (t: Throwable) { Log.w("logout: offlinePinStore.clearAll failed", t) }
 
                 // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
@@ -181,6 +207,8 @@ class SettingsViewModel @Inject constructor(
                             backupDeleteAfterUpload = false,
                             backupZipIncremental = false,
                             backupFolderTargetsJson = "{}",
+                            recentSearchQueries = "",
+                            lastCloudSyncMs = 0L,
                         )
                     }
                 } catch (t: Throwable) {
@@ -188,7 +216,7 @@ class SettingsViewModel @Inject constructor(
                 }
 
                 // 5. Purge all local cache / staging directories.
-                for (dirName in listOf("backup_staging", "upload_staging", "downloads", "image_cache", "zip_extracts", "share_staging")) {
+                for (dirName in listOf("backup_staging", "upload_staging", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync")) {
                     try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
                 }
 

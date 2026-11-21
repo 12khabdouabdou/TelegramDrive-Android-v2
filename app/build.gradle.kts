@@ -118,6 +118,7 @@ dependencies {
     implementation(project(":core:telegram"))
     implementation(project(":core:db"))
     implementation(project(":core:datastore"))
+    implementation(project(":core:download"))
     implementation(project(":core:security"))
 
     // Feature modules

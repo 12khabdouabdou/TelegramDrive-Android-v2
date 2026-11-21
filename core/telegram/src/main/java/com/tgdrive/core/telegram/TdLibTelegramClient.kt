@@ -53,6 +53,7 @@ class TdLibTelegramClient(
     @Volatile private var initializedApiHash: String? = null
     @Volatile private var myUserIdCache: Long? = null
     @Volatile private var myUserIsPremiumCache: Boolean? = null
+    @Volatile private var systemChannelIdCache: Long? = null
     @Volatile private var tdlibFilesDir: File? = null
 
     private val _authState = MutableStateFlow<AuthorizationState>(AuthorizationState.WaitInitialization)
@@ -385,6 +386,7 @@ class TdLibTelegramClient(
                 _authCodeInfo.value = null
                 myUserIdCache = null
                 myUserIsPremiumCache = null
+                systemChannelIdCache = null
                 initializedApiId = null
                 initializedApiHash = null
                 pendingSendConfirmations.values.forEach {
@@ -459,7 +461,12 @@ class TdLibTelegramClient(
                         if (type is TdApi.ChatTypeSupergroup && type.isChannel) {
                             val supergroup = send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId))
                             if (supergroup.status is TdApi.ChatMemberStatusCreator) {
-                                TelegramFolder(chat.id, chat.title, false, true, System.currentTimeMillis())
+                                if (chat.title == TelegramClient.SYSTEM_CHANNEL_TITLE) {
+                                    systemChannelIdCache = chat.id
+                                    null
+                                } else {
+                                    TelegramFolder(chat.id, chat.title, false, true, System.currentTimeMillis())
+                                }
                             } else {
                                 null
                             }
@@ -476,6 +483,39 @@ class TdLibTelegramClient(
         }
         folders.addAll(extraFolders)
         folders
+    }
+
+    override suspend fun getOrCreateSystemChannel(): Long? = withContext(dispatchers.io) {
+        systemChannelIdCache?.let { return@withContext it }
+        try {
+            try {
+                send<TdApi.Ok>(TdApi.LoadChats(TdApi.ChatListMain(), 200))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {}
+            val resp = send<TdApi.Chats>(TdApi.GetChats(TdApi.ChatListMain(), 200))
+            for (id in resp.chatIds) {
+                val chat = runCatching { send<TdApi.Chat>(TdApi.GetChat(id)) }.getOrNull() ?: continue
+                val type = chat.type
+                if (type is TdApi.ChatTypeSupergroup && type.isChannel && chat.title == TelegramClient.SYSTEM_CHANNEL_TITLE) {
+                    val supergroup = runCatching { send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId)) }.getOrNull()
+                    if (supergroup?.status is TdApi.ChatMemberStatusCreator) {
+                        systemChannelIdCache = chat.id
+                        return@withContext chat.id
+                    }
+                }
+            }
+            val created = send<TdApi.Chat>(
+                TdApi.CreateNewSupergroupChat(TelegramClient.SYSTEM_CHANNEL_TITLE, false, true, null, null, 0, false),
+            )
+            systemChannelIdCache = created.id
+            created.id
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("getOrCreateSystemChannel failed", t)
+            null
+        }
     }
 
     override suspend fun createFolder(title: String): TelegramFolder = withContext(dispatchers.io) {
@@ -878,6 +918,49 @@ class TdLibTelegramClient(
         } catch (_: Throwable) {}
     }
 
+    override suspend fun downloadFileRangeBytes(
+        remoteId: String,
+        offset: Long,
+        length: Long,
+    ): ByteArray? = withContext(dispatchers.io) {
+        if (remoteId.isBlank() || length <= 0L) return@withContext null
+        try {
+            val info = openStreamFile(remoteId) ?: return@withContext null
+            val safeOffset = offset.coerceAtLeast(0L)
+            val maxAvail = if (info.size > 0L) (info.size - safeOffset).coerceAtLeast(0L) else length
+            val safeLen = minOf(length, maxAvail)
+            if (safeLen <= 0L) return@withContext null
+
+            val state = ensureFileRangeDownloaded(info.fileId, safeOffset, safeLen)
+                ?: return@withContext null
+            if (state.localPath.isEmpty()) return@withContext null
+
+            val availPrefix = if (state.isCompleted) {
+                safeLen
+            } else {
+                (state.downloadOffset + state.downloadedPrefixSize - safeOffset).coerceIn(0L, safeLen)
+            }
+            if (availPrefix <= 0L) return@withContext null
+
+            val out = ByteArray(availPrefix.toInt())
+            java.io.RandomAccessFile(state.localPath, "r").use { raf ->
+                raf.seek(safeOffset)
+                var readTotal = 0
+                while (readTotal < out.size) {
+                    val n = raf.read(out, readTotal, out.size - readTotal)
+                    if (n <= 0) break
+                    readTotal += n
+                }
+                if (readTotal == out.size) out else out.copyOf(readTotal)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("downloadFileRangeBytes failed", t)
+            null
+        }
+    }
+
     override suspend fun clearDownloadCache(): Unit = withContext(dispatchers.io) {
         try {
             val optimize = TdApi.OptimizeStorage().apply {
@@ -967,6 +1050,7 @@ class TdLibTelegramClient(
             initializedApiHash = null
             myUserIdCache = null
             myUserIsPremiumCache = null
+            systemChannelIdCache = null
             _authCodeInfo.value = null
             _authState.value = AuthorizationState.Closed
             Log.i("TDLib client closed")

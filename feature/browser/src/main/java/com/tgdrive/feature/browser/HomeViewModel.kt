@@ -12,11 +12,13 @@ import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileViewMode
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.FolderEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
@@ -42,6 +44,9 @@ data class HomeUiState(
     val categoryTargets: Map<FileFilter, Pair<Long, String>> = emptyMap(),
     val recentFiles: List<FileCacheEntity> = emptyList(),
     val starredFiles: List<FileCacheEntity> = emptyList(),
+    val trashCount: Int = 0,
+    val cloudSyncing: Boolean = false,
+    val lastCloudSyncMs: Long = 0L,
 )
 
 private data class HomeDashboardStats(
@@ -52,6 +57,9 @@ private data class HomeDashboardStats(
     val categoryTargets: Map<FileFilter, Pair<Long, String>> = emptyMap(),
     val recentFiles: List<FileCacheEntity> = emptyList(),
     val starredFiles: List<FileCacheEntity> = emptyList(),
+    val trashCount: Int = 0,
+    val cloudSyncing: Boolean = false,
+    val lastCloudSyncMs: Long = 0L,
 )
 
 @HiltViewModel
@@ -61,6 +69,8 @@ class HomeViewModel
         private val telegramClient: TelegramClient,
         private val folderDao: FolderDao,
         private val fileCacheDao: FileCacheDao,
+        private val trashEntryDao: TrashEntryDao,
+        private val cloudSyncManager: CloudSyncManager,
         private val downloadManager: DownloadManager,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
@@ -76,7 +86,8 @@ class HomeViewModel
                 combine(_loading, _error, _savedChatId, _dashboard) { loading, error, savedId, dash ->
                     Triple(loading to error, savedId, dash)
                 },
-            ) { (folders, prefs), (loadErr, savedId, dash) ->
+                combine(trashEntryDao.observeCount(), cloudSyncManager.syncing) { trash, syncing -> trash to syncing },
+            ) { (folders, prefs), (loadErr, savedId, dash), (trashCount, syncing) ->
                 HomeUiState(
                     folders = folders,
                     savedMessagesChatId = savedId,
@@ -90,6 +101,9 @@ class HomeViewModel
                     categoryTargets = dash.categoryTargets,
                     recentFiles = dash.recentFiles,
                     starredFiles = dash.starredFiles,
+                    trashCount = trashCount,
+                    cloudSyncing = syncing,
+                    lastCloudSyncMs = prefs.lastCloudSyncMs,
                 )
             }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUiState())
 
@@ -330,6 +344,7 @@ class HomeViewModel
             viewModelScope.launch(dispatchers.io) {
                 try {
                     folderDao.updateColor(folder.id, color)
+                    cloudSyncManager.noteFolderColorChanged(folder.channelId, color)
                     Log.i("HomeViewModel: set folder color to $color")
                 } catch (e: CancellationException) {
                     throw e

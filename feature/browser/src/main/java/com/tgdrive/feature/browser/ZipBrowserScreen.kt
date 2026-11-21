@@ -32,10 +32,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -116,6 +118,8 @@ private sealed interface ZipBrowserItem {
 fun ZipBrowserScreen(
     messageId: Long,
     onBack: () -> Unit,
+    chatId: Long = 0L,
+    initialEntryPath: String = "",
     vm: ZipBrowserViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -125,28 +129,50 @@ fun ZipBrowserScreen(
     val scope = rememberCoroutineScope()
 
     val downloadItem =
-        remember(messageId, downloadState.items) {
-            downloadState.items.find { it.id == messageId }
+        remember(chatId, messageId, downloadState.items) {
+            downloadState.items.find {
+                it.id == messageId && (chatId == 0L || it.chatId == 0L || it.chatId == chatId)
+            }
         }
     val localPath =
         remember(downloadItem) {
             downloadItem?.takeIf { it.status == DownloadStatus.DONE }?.localPath
         }
 
-    var currentPath by remember(localPath) { mutableStateOf("") }
+    var currentPath by remember(localPath, initialEntryPath) {
+        mutableStateOf(
+            initialEntryPath.substringBeforeLast('/', "").let {
+                if (it.isNotEmpty()) "$it/" else ""
+            },
+        )
+    }
+    var searchQuery by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var showPasswordDialog by remember { mutableStateOf<String?>(null) }
     var imageViewerPath by remember { mutableStateOf<String?>(null) }
 
     val noViewerMsg = stringResource(R.string.zip_browser_no_viewer)
 
-    BackHandler(enabled = currentPath.isNotEmpty() && imageViewerPath == null) {
-        currentPath = parentZipPrefix(currentPath)
+    BackHandler(enabled = (searchQuery.isNotEmpty() || currentPath.isNotEmpty()) && imageViewerPath == null) {
+        if (searchQuery.isNotEmpty()) {
+            searchQuery = ""
+        } else {
+            currentPath = parentZipPrefix(currentPath)
+        }
+    }
+
+    LaunchedEffect(chatId, messageId) {
+        vm.ensureArchiveQueued(chatId, messageId)
     }
 
     LaunchedEffect(localPath) {
         if (localPath != null && !state.zipReady) {
-            vm.load(localPath)
+            vm.load(
+                zipPath = localPath,
+                chatId = chatId,
+                messageId = messageId,
+                zipFileName = downloadItem?.fileName.orEmpty(),
+            )
         }
     }
 
@@ -174,8 +200,27 @@ fun ZipBrowserScreen(
     }
 
     val visibleItems =
-        remember(state.entries, currentPath) {
-            buildDirectoryItems(state.entries, currentPath)
+        remember(state.entries, currentPath, searchQuery) {
+            val q = searchQuery.trim()
+            if (q.isBlank()) {
+                buildDirectoryItems(state.entries, currentPath)
+            } else {
+                val tokens = com.tgdrive.feature.browser.search.SmartSearchEngine.tokenize(q)
+                state.entries
+                    .filter { !it.isDirectory }
+                    .filter { entry ->
+                        val lower = entry.name.lowercase()
+                        lower.contains(q.lowercase()) ||
+                            (tokens.isNotEmpty() && tokens.all { lower.contains(it) })
+                    }
+                    .map { entry ->
+                        ZipBrowserItem.FileNode(
+                            displayName = entry.name,
+                            entry = entry,
+                        )
+                    }
+                    .sortedBy { it.sortKey }
+            }
         }
 
     Scaffold(
@@ -230,8 +275,30 @@ fun ZipBrowserScreen(
                     }
                 }
 
-                // Breadcrumbs when inside a subfolder (or archive is ready with nested folders)
-                if (state.zipReady && currentPath.isNotEmpty()) {
+                // In-ZIP live search bar
+                if (state.zipReady) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text(stringResource(R.string.zip_browser_search_hint)) },
+                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { searchQuery = "" }) {
+                                    Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.browser_clear))
+                                }
+                            }
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                }
+
+                // Breadcrumbs when inside a subfolder (and not searching)
+                if (state.zipReady && currentPath.isNotEmpty() && searchQuery.isBlank()) {
                     BreadcrumbBar(
                         currentPath = currentPath,
                         onSelectPrefix = { currentPath = it },

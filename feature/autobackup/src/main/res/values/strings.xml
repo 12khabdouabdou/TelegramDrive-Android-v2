@@ -92,4 +92,18 @@
     <string name="backup_files_failed">Failed</string>
     <string name="backup_error_label">Error</string>
     <string name="backup_log_not_found">Sync log entry not found</string>
+    <string name="free_up_space_title">Free up space</string>
+    <string name="free_up_space_subtitle">Remove local copies of files already backed up to Telegram</string>
+    <string name="free_up_space_scanning">Scanning backed-up files on device…</string>
+    <string name="free_up_space_none_title">Nothing to clean up</string>
+    <string name="free_up_space_none_desc">All your backed-up local files have already been removed, or no AutoBackup files exist on device yet.</string>
+    <string name="free_up_space_summary">%1$d file(s) safely backed up · %2$s reclaimable</string>
+    <string name="free_up_space_action">Free up %1$s</string>
+    <string name="free_up_space_done">Freed %1$s (%2$d file(s))</string>
+    <string name="free_up_space_select_all">Select all</string>
+    <string name="free_up_space_deselect_all">Deselect all</string>
+    <string name="free_up_space_confirm_title">Delete local copies?</string>
+    <string name="free_up_space_confirm_msg">%1$d file(s) (%2$s) will be removed from your device storage. Your cloud copies on Telegram remain safe.</string>
+    <string name="free_up_space_card_title">Free up device space</string>
+    <string name="free_up_space_card_desc">Review and delete local copies already verified on Telegram</string>
 </resources>

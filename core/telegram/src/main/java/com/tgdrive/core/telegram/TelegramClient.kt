@@ -21,6 +21,7 @@ interface TelegramClient : TelegramAuthObserver {
         const val MAX_FILE_SIZE_PREMIUM: Long = 4L * 1024 * 1024 * 1024
         const val SAFE_CHUNK_LIMIT_STANDARD: Long = 1_900L * 1024 * 1024
         const val SAFE_CHUNK_LIMIT_PREMIUM: Long = 3_800L * 1024 * 1024
+        const val SYSTEM_CHANNEL_TITLE: String = "TelegramDrive System"
     }
 
     val authCodeInfo: StateFlow<AuthCodeInfo?>
@@ -83,6 +84,8 @@ interface TelegramClient : TelegramAuthObserver {
     suspend fun openStreamFile(remoteId: String): StreamFileInfo? = null
     suspend fun ensureFileRangeDownloaded(fileId: Int, offset: Long, length: Long): StreamFileState? = null
     suspend fun cancelFileStream(fileId: Int) {}
+    suspend fun getOrCreateSystemChannel(): Long? = null
+    suspend fun downloadFileRangeBytes(remoteId: String, offset: Long, length: Long): ByteArray? = null
     suspend fun close()
 
     /**

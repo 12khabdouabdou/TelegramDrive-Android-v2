@@ -258,11 +258,44 @@ class TgDriveDatabaseTest {
         raw.close()
 
         val migrated = Room.databaseBuilder(ctx, TgDriveDatabase::class.java, dbFile.absolutePath)
-            .addMigrations(com.tgdrive.core.db.di.DatabaseModule.MIGRATION_3_4)
+            .addMigrations(
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_3_4,
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_4_5,
+            )
             .allowMainThreadQueries()
             .build()
         try {
             assertThat(migrated.fileCacheDao().getPinnedOffline()).isEmpty()
+            migrated.zipEntryDao().upsertAll(
+                listOf(
+                    com.tgdrive.core.db.entity.ZipEntryEntity(
+                        chatId = 10L,
+                        zipMessageId = 99L,
+                        zipFileName = "backup.zip",
+                        entryPath = "Docs/tax.pdf",
+                        entryName = "tax.pdf",
+                        entrySize = 4096L,
+                        isEncrypted = false,
+                        indexedAt = 123L,
+                    ),
+                ),
+            )
+            assertThat(migrated.zipEntryDao().forZip(10L, 99L)).hasSize(1)
+            migrated.trashEntryDao().upsert(
+                com.tgdrive.core.db.entity.TrashEntryEntity(
+                    messageId = 50L,
+                    chatId = 10L,
+                    fileName = "old.jpg",
+                    fileSize = 200L,
+                    mimeType = "image/jpeg",
+                    thumbnailPath = null,
+                    remoteId = "rem_50",
+                    originalDate = 100L,
+                    isStarred = true,
+                    deletedAt = 999L,
+                ),
+            )
+            assertThat(migrated.trashEntryDao().getAll()).hasSize(1)
         } finally {
             migrated.close()
             dbFile.delete()

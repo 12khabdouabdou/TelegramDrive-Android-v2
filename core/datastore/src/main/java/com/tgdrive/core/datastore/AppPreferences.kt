@@ -70,7 +70,20 @@ data class AppPreferencesData(
     val scheduledUploadTargetFolderId: Long = -1L,
     val scheduledUploadHour: Int = 3, // 3 AM by default
     val scheduledUploadMinute: Int = 0,
+    val recentSearchQueries: String = "",
+    val lastCloudSyncMs: Long = 0L,
 ) {
+    fun recentSearches(): List<String> =
+        recentSearchQueries.split('\n').map { it.trim() }.filter { it.isNotEmpty() }.take(10)
+
+    fun withRecentSearch(query: String): AppPreferencesData {
+        val cleaned = query.trim().replace('\n', ' ')
+        if (cleaned.isEmpty()) return this
+        val updated = listOf(cleaned) + recentSearches().filterNot { it.equals(cleaned, ignoreCase = true) }
+        return copy(recentSearchQueries = updated.take(10).joinToString("\n"))
+    }
+
+    fun clearRecentSearches(): AppPreferencesData = copy(recentSearchQueries = "")
     fun targetFolderFor(folderUri: String): Long =
         parseFolderTargets()[folderUri] ?: backupTargetFolderId
 
@@ -169,6 +182,8 @@ class AppPreferences @Inject constructor(
         val SCHEDULED_UPLOAD_TARGET = longPreferencesKey("scheduled_upload_target")
         val SCHEDULED_UPLOAD_HOUR = intPreferencesKey("scheduled_upload_hour")
         val SCHEDULED_UPLOAD_MINUTE = intPreferencesKey("scheduled_upload_minute")
+        val RECENT_SEARCH_QUERIES = stringPreferencesKey("recent_search_queries")
+        val LAST_CLOUD_SYNC_MS = longPreferencesKey("last_cloud_sync_ms")
     }
 
     /**
@@ -226,6 +241,8 @@ class AppPreferences @Inject constructor(
             scheduledUploadTargetFolderId = get(Keys.SCHEDULED_UPLOAD_TARGET) ?: -1L,
             scheduledUploadHour = get(Keys.SCHEDULED_UPLOAD_HOUR) ?: 3,
             scheduledUploadMinute = get(Keys.SCHEDULED_UPLOAD_MINUTE) ?: 0,
+            recentSearchQueries = get(Keys.RECENT_SEARCH_QUERIES) ?: "",
+            lastCloudSyncMs = get(Keys.LAST_CLOUD_SYNC_MS) ?: 0L,
         )
     }
 
@@ -258,5 +275,7 @@ class AppPreferences @Inject constructor(
         this[Keys.SCHEDULED_UPLOAD_TARGET] = d.scheduledUploadTargetFolderId
         this[Keys.SCHEDULED_UPLOAD_HOUR] = d.scheduledUploadHour
         this[Keys.SCHEDULED_UPLOAD_MINUTE] = d.scheduledUploadMinute
+        this[Keys.RECENT_SEARCH_QUERIES] = d.recentSearchQueries
+        this[Keys.LAST_CLOUD_SYNC_MS] = d.lastCloudSyncMs
     }
 }

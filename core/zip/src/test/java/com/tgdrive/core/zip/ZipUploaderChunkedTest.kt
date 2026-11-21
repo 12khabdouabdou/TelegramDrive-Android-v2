@@ -134,4 +134,38 @@ class ZipUploaderChunkedTest {
         assertThat(text).contains("\"Camera_part001.zip\"")
         assertThat(text).contains("\"Camera/b.jpg\"")
     }
+
+    @Test
+    fun `remote central directory tail parser reads plain and encrypted entries`(@TempDir tmp: File) = runTest {
+        val workDir = File(tmp, "work")
+        val files = listOf(
+            "Docs/Tax_2026.pdf" to randomBytes(12 * 1024, 11L),
+            "Photos/Paris_Trip.jpg" to randomBytes(18 * 1024, 22L),
+        )
+        val entries = files.map { (path, bytes) ->
+            ZipSourceEntry(path, bytes.size.toLong()) { ByteArrayInputStream(bytes) }
+        }
+        lateinit var builtZip: File
+        ZipUploader.zipSourcesInParts(
+            entries = entries,
+            workDir = workDir,
+            baseZipName = "TailTest",
+            maxPartBytes = 256 * 1024L,
+            password = "pass",
+            checkFreeSpace = false,
+        ) { part ->
+            builtZip = File(tmp, part.partFile.name)
+            part.partFile.copyTo(builtZip, overwrite = true)
+        }
+
+        val allBytes = builtZip.readBytes()
+        val tailLen = minOf(allBytes.size, 8192)
+        val tailOffset = (allBytes.size - tailLen).toLong()
+        val tail = allBytes.copyOfRange(tailOffset.toInt(), allBytes.size)
+
+        val parsed = ZipUploader.parseCentralDirectoryFromTail(tail, tailOffset)
+        assertThat(parsed).isNotNull()
+        assertThat(parsed!!.map { it.name }).containsExactly("Docs/Tax_2026.pdf", "Photos/Paris_Trip.jpg")
+        assertThat(parsed.all { it.isEncrypted }).isTrue()
+    }
 }

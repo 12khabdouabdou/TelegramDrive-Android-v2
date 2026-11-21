@@ -28,6 +28,7 @@ dependencies {
     implementation(project(":core:db"))
     implementation(project(":core:datastore"))
     implementation(project(":core:zip"))
+    implementation(project(":core:download"))
     implementation(project(":designsystem"))
 
     implementation(platform(libs.compose.bom))

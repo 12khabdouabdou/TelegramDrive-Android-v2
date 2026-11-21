@@ -79,6 +79,7 @@ private val FOLDER_COLOR_PALETTE = listOf(
 @Composable
 fun FoldersManagementScreen(
     onOpenFolder: (Long, String) -> Unit,
+    onOpenTrash: () -> Unit = {},
     vm: HomeViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -173,6 +174,21 @@ fun FoldersManagementScreen(
                         tint = MaterialTheme.colorScheme.tertiary,
                         enabled = ready,
                         onClick = { onOpenFolder(state.savedMessagesChatId, savedTitle) },
+                    )
+                }
+
+                // 30-day Trash bin shortcut
+                item {
+                    FolderManagementRow(
+                        title = stringResource(R.string.folders_trash_title),
+                        subtitle = if (state.trashCount > 0) {
+                            stringResource(R.string.folders_trash_count, state.trashCount)
+                        } else {
+                            stringResource(R.string.folders_trash_empty)
+                        },
+                        icon = Icons.Filled.Delete,
+                        tint = MaterialTheme.colorScheme.error,
+                        onClick = onOpenTrash,
                     )
                 }
 

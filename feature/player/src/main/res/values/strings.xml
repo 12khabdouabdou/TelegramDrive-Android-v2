@@ -29,4 +29,20 @@
     <string name="player_audio_pause">Pause</string>
     <string name="player_audio_stop">Close player</string>
     <string name="player_audio_seek">Seek audio position</string>
+    <string name="player_action_share">Share</string>
+    <string name="player_action_pin_offline">Offline</string>
+    <string name="player_action_pinned">Pinned</string>
+    <string name="player_action_star">Star</string>
+    <string name="player_action_starred">Starred</string>
+    <string name="player_action_info">Info</string>
+    <string name="player_action_trash">Trash</string>
+    <string name="player_exif_title">Details</string>
+    <string name="player_exif_resolution">Resolution</string>
+    <string name="player_exif_date">Taken</string>
+    <string name="player_exif_camera">Camera</string>
+    <string name="player_exif_details">Exposure</string>
+    <string name="player_exif_location">Location</string>
+    <string name="player_exif_size">File size</string>
+    <string name="player_trashed_toast">Moved to Trash</string>
+    <string name="player_share_chooser">Share image</string>
 </resources>

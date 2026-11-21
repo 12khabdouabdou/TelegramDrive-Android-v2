@@ -5,6 +5,7 @@ import com.google.common.truth.Truth.assertThat
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipEntryInfo
 import io.mockk.mockk
@@ -29,6 +30,7 @@ class ZipBrowserViewModelTest {
     private val fileCacheDao: FileCacheDao = mockk(relaxed = true)
     private val appContext: Context = mockk(relaxed = true)
     private val zipUploader: TestZipUploader = TestZipUploader()
+    private val zipIndexService: ZipIndexService = mockk(relaxed = true)
     private val cacheDir: File = createTempDir(prefix = "ziptest")
 
     private lateinit var dispatchers: DispatchersProvider
@@ -238,6 +240,7 @@ class ZipBrowserViewModelTest {
             telegramClient = telegramClient,
             downloadManager = downloadManager,
             fileCacheDao = fileCacheDao,
+            zipIndexService = zipIndexService,
             dispatchers = dispatchers,
             appContext = appContext,
             zipLister = zipUploader,
