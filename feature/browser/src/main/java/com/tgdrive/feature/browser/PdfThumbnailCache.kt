@@ -65,7 +65,7 @@ class PdfThumbnailCache @Inject constructor(
                             try {
                                 val canvas = Canvas(bmp)
                                 canvas.drawColor(Color.WHITE)
-                                page.render(bmp, null, null, PdfRenderer.PAGE_RENDER_MODE_FOR_DISPLAY)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                                 FileOutputStream(tmpFile).use { fos ->
                                     bmp.compress(Bitmap.CompressFormat.JPEG, 82, fos)
                                 }
