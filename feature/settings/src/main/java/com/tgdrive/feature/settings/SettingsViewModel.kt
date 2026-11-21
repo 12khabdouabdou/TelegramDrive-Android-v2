@@ -10,6 +10,7 @@ import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
+import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncLogDao
@@ -64,6 +65,7 @@ class SettingsViewModel @Inject constructor(
     private val syncLogDao: SyncLogDao,
     private val zipEntryDao: ZipEntryDao,
     private val trashEntryDao: TrashEntryDao,
+    private val albumDao: AlbumDao,
     private val cloudSyncManager: CloudSyncManager,
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatchersProvider,
@@ -182,6 +184,7 @@ class SettingsViewModel @Inject constructor(
                 try { syncLogDao.clear() } catch (t: Throwable) { Log.w("logout: syncLogDao.clear failed", t) }
                 try { zipEntryDao.clear() } catch (t: Throwable) { Log.w("logout: zipEntryDao.clear failed", t) }
                 try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
+                try { albumDao.clear() } catch (t: Throwable) { Log.w("logout: albumDao.clear failed", t) }
                 try { offlinePinStore.clearAll() } catch (t: Throwable) { Log.w("logout: offlinePinStore.clearAll failed", t) }
 
                 // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.

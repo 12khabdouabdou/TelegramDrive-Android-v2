@@ -64,6 +64,8 @@ class CloudSyncManager @Inject constructor(
     private val localRenameTimestamps = ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudRenameRecord>()
     private val localColorTimestamps = ConcurrentHashMap<Long, CloudSyncCodec.CloudFolderColorRecord>()
     private val localTrashTombstones = ConcurrentHashMap<Pair<Long, Long>, Long>()
+    private val localPlaybackTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudPlaybackPositionRecord>()
 
     private val syncDir: File
         get() = File(ctx.cacheDir, "cloud_sync").apply { mkdirs() }
@@ -91,6 +93,16 @@ class CloudSyncManager @Inject constructor(
 
     fun noteTrashRemoved(chatId: Long, messageId: Long) {
         localTrashTombstones[chatId to messageId] = System.currentTimeMillis()
+        schedulePushMetadata()
+    }
+
+    fun notePlaybackPositionChanged(chatId: Long, messageId: Long, positionMs: Long) {
+        localPlaybackTimestamps[chatId to messageId] = CloudSyncCodec.CloudPlaybackPositionRecord(
+            chatId = chatId,
+            messageId = messageId,
+            positionMs = positionMs.coerceAtLeast(0L),
+            updatedAtMs = System.currentTimeMillis(),
+        )
         schedulePushMetadata()
     }
 
@@ -334,6 +346,21 @@ class CloudSyncManager @Inject constructor(
             )
         }
 
+        val playbackPositions = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudPlaybackPositionRecord>()
+        files.filter { it.playbackPositionMs > 0L }.forEach { f ->
+            val key = f.chatId to f.messageId
+            playbackPositions[key] = localPlaybackTimestamps[key]
+                ?: CloudSyncCodec.CloudPlaybackPositionRecord(
+                    chatId = f.chatId,
+                    messageId = f.messageId,
+                    positionMs = f.playbackPositionMs,
+                    updatedAtMs = f.lastAccessed.takeIf { it > 0L } ?: 1L,
+                )
+        }
+        localPlaybackTimestamps.forEach { (key, rec) ->
+            playbackPositions[key] = rec
+        }
+
         return CloudSyncCodec.CloudMetaSnapshot(
             version = 1,
             updatedAtMs = now,
@@ -342,6 +369,7 @@ class CloudSyncManager @Inject constructor(
             folderColors = colors,
             trash = trash,
             syncedFiles = synced,
+            playbackPositions = playbackPositions.values.toList(),
         )
     }
 
@@ -432,6 +460,14 @@ class CloudSyncManager @Inject constructor(
                         ),
                     )
                 }
+            }
+        }
+
+        merged.playbackPositions.forEach { pos ->
+            localPlaybackTimestamps[pos.chatId to pos.messageId] = pos
+            val local = existingByKey[pos.chatId to pos.messageId]
+            if (local != null && local.playbackPositionMs != pos.positionMs) {
+                runCatching { fileCacheDao.updatePlaybackPosition(pos.chatId, pos.messageId, pos.positionMs) }
             }
         }
     }

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Image
@@ -47,11 +48,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -60,6 +63,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.toHumanSize
@@ -72,11 +76,17 @@ import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.browser.search.SearchScopeFilter
 import com.tgdrive.feature.browser.search.SmartSearchHit
+import java.io.File
 
 @Composable
 fun GlobalSearchScreen(
     onBack: () -> Unit,
-    onOpenFile: (chatId: Long, folderTitle: String, messageId: Long) -> Unit,
+    onOpenFolder: (chatId: Long, folderTitle: String) -> Unit,
+    onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
+    onOpenImage: (Long, Long) -> Unit = { _, _ -> },
+    onOpenPdf: (Long) -> Unit = {},
+    onOpenZip: (Long) -> Unit = {},
+    onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenZipEntry: (chatId: Long, zipMessageId: Long, entryPath: String) -> Unit = { _, _, _ -> },
     vm: GlobalSearchViewModel = hiltViewModel(),
 ) {
@@ -291,9 +301,23 @@ fun GlobalSearchScreen(
                                     val msg = hit.entity
                                     val folderTitle = folderNames[msg.chatId]
                                         ?: stringResource(R.string.browser_saved_messages)
-                                    CloudFileResultRow(msg, folderTitle) {
-                                        onOpenFile(msg.chatId, folderTitle, msg.messageId)
-                                    }
+                                    CloudFileResultRow(
+                                        msg = msg,
+                                        folderTitle = folderTitle,
+                                        onClick = {
+                                            vm.openCloudFile(
+                                                file = msg,
+                                                folderTitle = folderTitle,
+                                                onOpenVideo = onOpenVideo,
+                                                onOpenImage = onOpenImage,
+                                                onOpenPdf = onOpenPdf,
+                                                onOpenZip = onOpenZip,
+                                                onOpenText = onOpenText,
+                                                onOpenFolder = onOpenFolder,
+                                            )
+                                        },
+                                        onShowInFolder = { onOpenFolder(msg.chatId, folderTitle) },
+                                    )
                                 }
                                 is SmartSearchHit.ZipMemberHit -> {
                                     val entry = hit.entry
@@ -343,25 +367,38 @@ private fun CloudFileResultRow(
     msg: FileCacheEntity,
     folderTitle: String,
     onClick: () -> Unit,
+    onShowInFolder: () -> Unit,
 ) {
     val (icon, tint) = searchVisual(msg.mimeType, msg.fileName)
+    val thumbFile = remember(msg.thumbnailPath) {
+        msg.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(MaterialTheme.colorScheme.surfaceContainer)
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             modifier = Modifier
-                .size(40.dp)
+                .size(44.dp)
                 .clip(TgShapes.Large)
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+            if (thumbFile != null) {
+                AsyncImage(
+                    model = thumbFile,
+                    contentDescription = msg.fileName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+            }
         }
         Column(
             modifier = Modifier
@@ -382,6 +419,14 @@ private fun CloudFileResultRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onShowInFolder) {
+            Icon(
+                Icons.Filled.FolderOpen,
+                contentDescription = stringResource(R.string.search_show_in_folder),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
             )
         }
     }

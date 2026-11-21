@@ -40,6 +40,10 @@
     <string name="share_upload_title_many">Upload %1$d files?</string>
     <string name="share_upload_body_one">Upload 1 file to Saved Messages?</string>
     <string name="share_upload_body_many">Upload %1$d files to Saved Messages?</string>
+    <string name="share_pick_destination">Destination folder</string>
+    <string name="share_pack_zip">Pack files into a ZIP archive</string>
+    <string name="share_zip_name_label">ZIP archive name (optional)</string>
+    <string name="share_zip_password_label">ZIP password (optional)</string>
     <string name="share_upload_action">Upload</string>
 
     <!-- Onboarding -->

@@ -41,4 +41,13 @@ interface FolderDao {
 
     @Query("UPDATE folders SET color = :color WHERE id = :id")
     suspend fun updateColor(id: Long, color: Int)
+
+    @Query("UPDATE folders SET is_pinned_offline = :pinned WHERE channel_id = :channelId")
+    suspend fun setPinnedOffline(channelId: Long, pinned: Boolean)
+
+    @Query("UPDATE folders SET is_vault = :isVault WHERE channel_id = :channelId")
+    suspend fun setVault(channelId: Long, isVault: Boolean)
+
+    @Query("SELECT * FROM folders WHERE is_pinned_offline = 1")
+    suspend fun getPinnedOfflineFolders(): List<FolderEntity>
 }

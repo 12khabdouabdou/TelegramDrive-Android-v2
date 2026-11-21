@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -125,9 +126,11 @@ internal fun ZoomableImagePage(
     isActive: Boolean,
     onZoomChanged: (Boolean) -> Unit,
     onTap: () -> Unit,
+    rotationDegrees: Float = 0f,
 ) {
     var scale by remember(path) { mutableFloatStateOf(1f) }
     var offset by remember(path) { mutableStateOf(Offset.Zero) }
+    val animatedRotation by animateFloatAsState(targetValue = rotationDegrees, label = "photo_rotation")
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var bitmap by remember(path) { mutableStateOf<Bitmap?>(null) }
     var decodeFailed by remember(path) { mutableStateOf(false) }
@@ -212,6 +215,7 @@ internal fun ZoomableImagePage(
                             scaleY = scale,
                             translationX = offset.x,
                             translationY = offset.y,
+                            rotationZ = animatedRotation,
                         ),
                 )
             }

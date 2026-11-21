@@ -3,13 +3,20 @@ package com.tgdrive.feature.browser
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.DownloadItem
+import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.feature.browser.search.SearchScopeFilter
@@ -24,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import java.io.File
 import javax.inject.Inject
 
 sealed class GlobalSearchUiState {
@@ -50,6 +58,8 @@ class GlobalSearchViewModel
         private val zipEntryDao: ZipEntryDao,
         private val trashEntryDao: TrashEntryDao,
         private val zipIndexService: ZipIndexService,
+        private val downloadManager: DownloadManager,
+        private val mediaThumbnailCache: MediaThumbnailCache,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
     ) : ViewModel() {
@@ -73,6 +83,7 @@ class GlobalSearchViewModel
 
         @Volatile private var systemChannelId: Long? = null
         private var searchJob: Job? = null
+        private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
 
         init {
             viewModelScope.launch(dispatchers.io) {
@@ -179,6 +190,7 @@ class GlobalSearchViewModel
 
                 if (localHits.isNotEmpty() || trimmed.isBlank()) {
                     _state.value = GlobalSearchUiState.Results(localHits)
+                    warmSearchThumbnails(localHits)
                 } else {
                     _state.value = GlobalSearchUiState.Searching
                 }
@@ -215,6 +227,7 @@ class GlobalSearchViewModel
                                 excludedChatIds = excludedIds,
                             )
                             _state.value = GlobalSearchUiState.Results(mergedHits)
+                            warmSearchThumbnails(mergedHits)
                         } else if (_state.value is GlobalSearchUiState.Searching) {
                             _state.value = GlobalSearchUiState.Results(localHits)
                         }
@@ -227,6 +240,93 @@ class GlobalSearchViewModel
                         }
                     }
                 }
+            }
+        }
+
+        private fun warmSearchThumbnails(hits: List<SmartSearchHit>) {
+            val candidates = hits
+                .filterIsInstance<SmartSearchHit.CloudFileHit>()
+                .map { it.entity }
+                .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+                .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
+                .take(20)
+            for (entity in candidates) {
+                viewModelScope.launch(dispatchers.io) {
+                    try {
+                        val path = mediaThumbnailCache.ensureThumbnail(entity) ?: return@launch
+                        val cur = _state.value as? GlobalSearchUiState.Results ?: return@launch
+                        _state.value = GlobalSearchUiState.Results(
+                            cur.hits.map { hit ->
+                                if (hit is SmartSearchHit.CloudFileHit &&
+                                    hit.entity.chatId == entity.chatId &&
+                                    hit.entity.messageId == entity.messageId
+                                ) {
+                                    hit.copy(entity = hit.entity.copy(thumbnailPath = path))
+                                } else {
+                                    hit
+                                }
+                            },
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+
+        fun openCloudFile(
+            file: FileCacheEntity,
+            folderTitle: String,
+            onOpenVideo: (Long, Long) -> Unit,
+            onOpenImage: (Long, Long) -> Unit,
+            onOpenPdf: (Long) -> Unit,
+            onOpenZip: (Long) -> Unit,
+            onOpenText: (Long, Long) -> Unit,
+            onOpenFolder: (Long, String) -> Unit,
+        ) {
+            viewModelScope.launch(dispatchers.io) {
+                runCatching { fileCacheDao.updateLastAccessed(file.chatId, file.messageId, System.currentTimeMillis()) }
+            }
+            val bucket = classifyFile(file.mimeType, file.fileName)
+            val needsDownload = run {
+                val item = downloadManager.findItem(file.chatId, file.messageId)
+                    ?.takeIf { it.status == DownloadStatus.DONE }
+                val path = item?.localPath
+                path == null || !File(path).exists()
+            }
+            fun enqueueIfNeeded() {
+                if (needsDownload && file.remoteId.isNotEmpty()) {
+                    downloadManager.enqueue(
+                        DownloadItem(
+                            id = file.messageId,
+                            chatId = file.chatId,
+                            remoteId = file.remoteId,
+                            fileName = file.fileName,
+                            totalBytes = file.fileSize,
+                        ),
+                    )
+                }
+            }
+            when {
+                bucket == FileBucket.ARCHIVES && file.fileName.lowercase().endsWith(".zip") -> {
+                    enqueueIfNeeded()
+                    onOpenZip(file.messageId)
+                }
+                bucket == FileBucket.VIDEOS -> onOpenVideo(file.chatId, file.messageId)
+                bucket == FileBucket.IMAGES -> {
+                    enqueueIfNeeded()
+                    onOpenImage(file.chatId, file.messageId)
+                }
+                bucket == FileBucket.PDF -> {
+                    enqueueIfNeeded()
+                    onOpenPdf(file.messageId)
+                }
+                isTextPreviewable(file.mimeType, file.fileName) -> {
+                    enqueueIfNeeded()
+                    onOpenText(file.chatId, file.messageId)
+                }
+                else -> onOpenFolder(file.chatId, folderTitle)
             }
         }
 

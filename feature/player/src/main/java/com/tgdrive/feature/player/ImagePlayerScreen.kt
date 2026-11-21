@@ -31,6 +31,8 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.OfflinePin
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.OfflinePin
@@ -63,6 +65,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
@@ -73,6 +76,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
+import com.tgdrive.core.common.FileBucket
+import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadStatus
@@ -97,6 +103,7 @@ fun ImagePlayerScreen(
     messageId: Long,
     onBack: () -> Unit,
     chatId: Long = 0L,
+    onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
@@ -104,6 +111,7 @@ fun ImagePlayerScreen(
     val scope = rememberCoroutineScope()
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var siblings by remember(chatId, messageId) { mutableStateOf<List<GalleryItemRef>>(emptyList()) }
+    var rotations by remember(chatId, messageId) { mutableStateOf<Map<Long, Float>>(emptyMap()) }
     var showChrome by remember(chatId, messageId) { mutableStateOf(true) }
     var isCurrentZoomed by remember { mutableStateOf(false) }
     var showExifSheet by remember { mutableStateOf(false) }
@@ -111,12 +119,16 @@ fun ImagePlayerScreen(
     var dragOffsetY by remember { mutableFloatStateOf(0f) }
 
     LaunchedEffect(chatId, messageId) {
-        val loaded = if (chatId != 0L) vm.loadSiblingImages(chatId) else emptyList()
+        val target = vm.getCachedEntry(chatId, messageId)
+        val loaded = if (chatId != 0L) {
+            vm.loadSiblingMedia(chatId, includeLocked = target?.isLocked == true)
+        } else {
+            emptyList()
+        }
         siblings = if (loaded.any { it.messageId == messageId }) {
             loaded.map { GalleryItemRef(it.chatId, it.messageId, it) }
         } else {
-            val single = vm.getCachedEntry(chatId, messageId)
-            listOf(GalleryItemRef(chatId, messageId, single))
+            listOf(GalleryItemRef(chatId, messageId, target))
         }
     }
 
@@ -137,7 +149,9 @@ fun ImagePlayerScreen(
         dragOffsetY = 0f
         val cur = pages.getOrNull(pagerState.currentPage)
         cur?.entity?.let { entry ->
-            if (vm.getLocalPath(entry.messageId, entry.chatId) == null &&
+            val isVid = classifyFile(entry.mimeType, entry.fileName) == FileBucket.VIDEOS
+            if (!isVid &&
+                vm.getLocalPath(entry.messageId, entry.chatId) == null &&
                 vm.downloadManager.findItem(entry.chatId, entry.messageId) == null
             ) {
                 vm.ensureDownloaded(entry)
@@ -145,7 +159,9 @@ fun ImagePlayerScreen(
         }
         val next = pages.getOrNull(pagerState.currentPage + 1)
         next?.entity?.let { nextEntry ->
-            if (vm.getLocalPath(nextEntry.messageId, nextEntry.chatId) == null &&
+            val nextIsVid = classifyFile(nextEntry.mimeType, nextEntry.fileName) == FileBucket.VIDEOS
+            if (!nextIsVid &&
+                vm.getLocalPath(nextEntry.messageId, nextEntry.chatId) == null &&
                 vm.downloadManager.findItem(nextEntry.chatId, nextEntry.messageId) == null &&
                 nextEntry.fileSize <= 15L * 1024 * 1024
             ) {
@@ -200,6 +216,9 @@ fun ImagePlayerScreen(
                 },
         ) { page ->
             val ref = pages[page]
+            val isVideoPage = ref.entity?.let {
+                classifyFile(it.mimeType, it.fileName) == FileBucket.VIDEOS
+            } ?: false
             val pagePath = vm.getLocalPath(ref.messageId, ref.chatId)
             val downloadItem = downloadState.items.find {
                 it.id == ref.messageId && (ref.chatId == 0L || it.chatId == 0L || it.chatId == ref.chatId)
@@ -212,6 +231,40 @@ fun ImagePlayerScreen(
             val fileReady = pagePath != null && runCatching { File(pagePath).exists() }.getOrDefault(false)
 
             when {
+                isVideoPage -> {
+                    val thumbFile = remember(ref.entity?.thumbnailPath) {
+                        ref.entity?.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable { showChrome = !showChrome },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (thumbFile != null) {
+                            AsyncImage(
+                                model = thumbFile,
+                                contentDescription = ref.entity?.fileName,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                        IconButton(
+                            onClick = { onOpenVideo(ref.chatId, ref.messageId) },
+                            modifier = Modifier
+                                .size(72.dp)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.65f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.PlayArrow,
+                                contentDescription = stringResource(R.string.player_video_play),
+                                tint = Color.White,
+                                modifier = Modifier.size(40.dp),
+                            )
+                        }
+                    }
+                }
                 pagePath != null && fileReady -> {
                     ZoomableImagePage(
                         path = pagePath,
@@ -220,6 +273,7 @@ fun ImagePlayerScreen(
                             if (page == pagerState.currentPage) isCurrentZoomed = zoomed
                         },
                         onTap = { showChrome = !showChrome },
+                        rotationDegrees = rotations[ref.messageId] ?: 0f,
                     )
                 }
                 isFailed -> {
@@ -339,6 +393,27 @@ fun ImagePlayerScreen(
                     )
                 } else {
                     Spacer(Modifier.weight(1f))
+                }
+                val activeIsVideo = activeRef.entity?.let {
+                    classifyFile(it.mimeType, it.fileName) == FileBucket.VIDEOS
+                } ?: false
+                if (!activeIsVideo && activePath != null) {
+                    IconButton(
+                        onClick = {
+                            val next = (rotations[activeRef.messageId] ?: 0f) + 90f
+                            rotations = rotations + (activeRef.messageId to next)
+                        },
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.45f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.RotateRight,
+                            contentDescription = stringResource(R.string.player_image_rotate),
+                            tint = Color.White,
+                        )
+                    }
                 }
                 if (pages.size > 1) {
                     Text(

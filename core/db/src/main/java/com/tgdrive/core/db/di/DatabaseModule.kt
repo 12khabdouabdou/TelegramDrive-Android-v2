@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.tgdrive.core.db.TgDriveDatabase
+import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncedFileDao
@@ -132,11 +133,62 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_5_6 = object : Migration(5, 6) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN playback_position_ms INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN virtual_path TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN is_encrypted_vault INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN user_note TEXT")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN ocr_text TEXT")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN ai_tags TEXT")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN exif_lat REAL")
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN exif_lng REAL")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_is_locked ON file_cache(is_locked)")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_file_cache_chat_id_virtual_path ON file_cache(chat_id, virtual_path)",
+            )
+
+            db.execSQL("ALTER TABLE folders ADD COLUMN is_pinned_offline INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE folders ADD COLUMN is_vault INTEGER NOT NULL DEFAULT 0")
+
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS albums (
+                    id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    cover_chat_id INTEGER,
+                    cover_message_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(id)
+                )
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS album_items (
+                    album_id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    added_at INTEGER NOT NULL,
+                    PRIMARY KEY(album_id, chat_id, message_id),
+                    FOREIGN KEY(album_id) REFERENCES albums(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_album_items_album_id ON album_items(album_id)")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_album_items_chat_id_message_id ON album_items(chat_id, message_id)",
+            )
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()
@@ -145,4 +197,5 @@ object DatabaseModule {
     @Provides fun provideFileCacheDao(db: TgDriveDatabase): FileCacheDao = db.fileCacheDao()
     @Provides fun provideZipEntryDao(db: TgDriveDatabase): ZipEntryDao = db.zipEntryDao()
     @Provides fun provideTrashEntryDao(db: TgDriveDatabase): TrashEntryDao = db.trashEntryDao()
+    @Provides fun provideAlbumDao(db: TgDriveDatabase): AlbumDao = db.albumDao()
 }

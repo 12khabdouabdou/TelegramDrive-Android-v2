@@ -819,6 +819,97 @@ object ZipUploader {
         }
     }
 
+    /**
+     * Packs an arbitrary list of SAF [uris] into a single [outputFile] ZIP archive
+     * (optionally AES-256 encrypted when [password] is non-blank).
+     * Returns the list of entry names written into the archive.
+     */
+    fun zipUrisToFile(
+        context: Context,
+        uris: List<Uri>,
+        outputFile: File,
+        password: String? = null,
+    ): List<String> {
+        require(uris.isNotEmpty()) { "At least one URI is required" }
+        outputFile.parentFile?.mkdirs()
+        if (outputFile.exists()) outputFile.delete()
+        val encrypted = !password.isNullOrBlank()
+        val written = mutableListOf<String>()
+        val usedNames = HashSet<String>()
+        try {
+            val zos = if (encrypted) {
+                Zip4jOutputStream(BufferedOutputStream(FileOutputStream(outputFile)), password!!.toCharArray())
+            } else {
+                Zip4jOutputStream(BufferedOutputStream(FileOutputStream(outputFile)))
+            }
+            zos.use { stream ->
+                val buffer = ByteArray(COPY_BUFFER_SIZE)
+                uris.forEachIndexed { idx, uri ->
+                    val rawName = resolveUriDisplayName(context, uri) ?: "file_${idx + 1}"
+                    val entryName = deduplicateEntryName(sanitizeZipBaseName(rawName), usedNames)
+                    val params = ZipParameters().apply {
+                        fileNameInZip = entryName
+                        compressionMethod = CompressionMethod.DEFLATE
+                        if (encrypted) {
+                            isEncryptFiles = true
+                            encryptionMethod = EncryptionMethod.AES
+                            aesKeyStrength = AesKeyStrength.KEY_STRENGTH_256
+                        }
+                    }
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        stream.putNextEntry(params)
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n <= 0) break
+                            stream.write(buffer, 0, n)
+                        }
+                        stream.closeEntry()
+                        written += entryName
+                    } ?: throw IllegalStateException("Cannot open URI: $uri")
+                }
+            }
+            return written
+        } catch (t: Throwable) {
+            runCatching { outputFile.delete() }
+            throw t
+        }
+    }
+
+    private fun resolveUriDisplayName(context: Context, uri: Uri): String? {
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val name = c.getString(idx)
+                        if (!name.isNullOrBlank()) return name
+                    }
+                }
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+    }
+
+    private fun deduplicateEntryName(baseName: String, used: MutableSet<String>): String {
+        val clean = baseName.ifBlank { "file" }
+        if (used.add(clean)) return clean
+        val dot = clean.lastIndexOf('.')
+        val stem = if (dot > 0) clean.substring(0, dot) else clean
+        val ext = if (dot > 0) clean.substring(dot) else ""
+        var i = 2
+        while (true) {
+            val candidate = "${stem}_$i$ext"
+            if (used.add(candidate)) return candidate
+            i++
+        }
+    }
+
     private val IMAGE_COVER_EXTS = setOf("jpg", "jpeg", "png", "webp", "bmp", "heic", "heif", "gif")
 }
 

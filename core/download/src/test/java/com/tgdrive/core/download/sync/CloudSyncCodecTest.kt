@@ -37,6 +37,14 @@ class CloudSyncCodecTest {
                     channelId = null,
                 ),
             ),
+            playbackPositions = listOf(
+                CloudSyncCodec.CloudPlaybackPositionRecord(
+                    chatId = 10L,
+                    messageId = 88L,
+                    positionMs = 123_456L,
+                    updatedAtMs = 999L,
+                ),
+            ),
         )
         val encoded = CloudSyncCodec.encodeMetaGzip(snap)
         val decoded = CloudSyncCodec.decodeMetaGzip(encoded)
@@ -45,6 +53,20 @@ class CloudSyncCodecTest {
         assertThat(decoded.renames.single().fileName).isEqualTo("Tax \"2026\".pdf")
         assertThat(decoded.trash.single().fileName).isEqualTo("deleted.png")
         assertThat(decoded.syncedFiles.single().sha256).isEqualTo("abc123")
+        assertThat(decoded.playbackPositions.single().positionMs).isEqualTo(123_456L)
+
+        val newer = snap.copy(
+            playbackPositions = listOf(
+                CloudSyncCodec.CloudPlaybackPositionRecord(
+                    chatId = 10L,
+                    messageId = 88L,
+                    positionMs = 200_000L,
+                    updatedAtMs = 1500L,
+                ),
+            ),
+        )
+        val merged = CloudSyncCodec.mergeMeta(snap, newer)
+        assertThat(merged.playbackPositions.single().positionMs).isEqualTo(200_000L)
     }
 
     @Test

@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import com.tgdrive.core.db.entity.AlbumEntity
+import com.tgdrive.core.db.entity.AlbumItemEntity
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.FolderEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
@@ -263,6 +265,7 @@ class TgDriveDatabaseTest {
             .addMigrations(
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_3_4,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_4_5,
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_5_6,
             )
             .allowMainThreadQueries()
             .build()
@@ -298,6 +301,33 @@ class TgDriveDatabaseTest {
                 ),
             )
             assertThat(migrated.trashEntryDao().getAll()).hasSize(1)
+
+            // Verify v6 file_cache columns, playback position, and albums + cascade delete
+            migrated.fileCacheDao().upsertAll(
+                listOf(
+                    FileCacheEntity(
+                        messageId = 77L,
+                        chatId = 10L,
+                        fileName = "movie.mp4",
+                        fileSize = 4096L,
+                        mimeType = "video/mp4",
+                        thumbnailPath = null,
+                        date = 500L,
+                    ),
+                ),
+            )
+            migrated.fileCacheDao().updatePlaybackPosition(10L, 77L, 42_500L)
+            assertThat(migrated.fileCacheDao().getById(10L, 77L)?.playbackPositionMs).isEqualTo(42_500L)
+
+            migrated.albumDao().upsert(
+                AlbumEntity(id = "alb1", name = "Trips", createdAt = 1L, updatedAt = 1L),
+            )
+            migrated.albumDao().addItem(
+                AlbumItemEntity(albumId = "alb1", chatId = 10L, messageId = 77L, addedAt = 2L),
+            )
+            assertThat(migrated.albumDao().getAllItems()).hasSize(1)
+            migrated.albumDao().deleteById("alb1")
+            assertThat(migrated.albumDao().getAllItems()).isEmpty()
         } finally {
             migrated.close()
             dbFile.delete()

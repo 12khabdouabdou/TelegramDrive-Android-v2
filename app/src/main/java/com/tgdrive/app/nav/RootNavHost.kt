@@ -169,7 +169,12 @@ fun RootNavHost(
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
                 val chatId = entry.arguments?.getLong("chatId") ?: 0L
-                ImagePlayerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
+                ImagePlayerScreen(
+                    messageId = msgId,
+                    chatId = chatId,
+                    onOpenVideo = { vChatId, vMsgId -> nav.navigate("video/$vMsgId?chatId=$vChatId") },
+                    onBack = { nav.popBackStack() },
+                )
             }
 
             composable(

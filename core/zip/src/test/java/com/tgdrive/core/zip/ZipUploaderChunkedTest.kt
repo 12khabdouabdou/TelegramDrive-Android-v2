@@ -168,4 +168,23 @@ class ZipUploaderChunkedTest {
         assertThat(parsed!!.map { it.name }).containsExactly("Docs/Tax_2026.pdf", "Photos/Paris_Trip.jpg")
         assertThat(parsed.all { it.isEncrypted }).isTrue()
     }
+
+    @Test
+    fun `readFirstImageEntryBytes returns null cleanly when zip has no images`(@TempDir tmp: File) = runTest {
+        val workDir = File(tmp, "work")
+        val data = randomBytes(4096, 99L)
+        lateinit var builtZip: File
+        ZipUploader.zipSourcesInParts(
+            entries = listOf(ZipSourceEntry("notes/readme.txt", data.size.toLong()) { ByteArrayInputStream(data) }),
+            workDir = workDir,
+            baseZipName = "TextOnly",
+            maxPartBytes = 256 * 1024L,
+            password = null,
+            checkFreeSpace = false,
+        ) { part ->
+            builtZip = File(tmp, part.partFile.name)
+            part.partFile.copyTo(builtZip, overwrite = true)
+        }
+        assertThat(ZipUploader.readFirstImageEntryBytes(builtZip.absolutePath)).isNull()
+    }
 }

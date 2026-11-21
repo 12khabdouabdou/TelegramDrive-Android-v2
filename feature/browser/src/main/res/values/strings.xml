@@ -237,4 +237,19 @@
     <string name="home_free_up_space">Free up space</string>
     <string name="home_trash">Trash</string>
     <string name="home_sync_settings">Sync &amp; Settings</string>
+    <string name="home_quick_create_title">Add to Telegram Drive</string>
+    <string name="home_quick_target_label">Destination</string>
+    <string name="home_quick_upload_files">Upload files</string>
+    <string name="home_quick_upload_files_desc">Pick photos, videos, documents, or any file</string>
+    <string name="home_quick_upload_zip">Upload folder as ZIP</string>
+    <string name="home_quick_upload_zip_desc">Open folder to archive &amp; optionally encrypt</string>
+    <string name="home_quick_new_folder">New folder</string>
+    <string name="home_quick_new_folder_desc">Create a new private Telegram channel folder</string>
+    <string name="search_show_in_folder">Open containing folder</string>
+    <string name="category_title_videos">All Videos</string>
+    <string name="category_title_docs">All Documents</string>
+    <string name="category_title_audio">All Audio</string>
+    <string name="category_title_archives">All Archives</string>
+    <string name="category_empty_title">No files in this category</string>
+    <string name="category_empty_desc">Upload or sync files across your folders to see them gathered here.</string>
 </resources>

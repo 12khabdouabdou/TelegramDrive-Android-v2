@@ -57,6 +57,13 @@ object CloudSyncCodec {
         val channelId: Long?,
     )
 
+    data class CloudPlaybackPositionRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val positionMs: Long,
+        val updatedAtMs: Long,
+    )
+
     data class CloudMetaSnapshot(
         val version: Int = 1,
         val updatedAtMs: Long = 0L,
@@ -65,6 +72,7 @@ object CloudSyncCodec {
         val folderColors: List<CloudFolderColorRecord> = emptyList(),
         val trash: List<CloudTrashRecord> = emptyList(),
         val syncedFiles: List<CloudSyncedFileRecord> = emptyList(),
+        val playbackPositions: List<CloudPlaybackPositionRecord> = emptyList(),
     )
 
     data class CloudZipEntryRecord(
@@ -143,6 +151,15 @@ object CloudSyncCodec {
                 channelId = o.longVal("channelId"),
             )
         }
+        val playbackPositions = root.optArray("playbackPositions").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudPlaybackPositionRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                positionMs = o.longVal("positionMs") ?: 0L,
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
         CloudMetaSnapshot(
             version = root.longVal("version")?.toInt() ?: 1,
             updatedAtMs = root.longVal("updatedAtMs") ?: 0L,
@@ -151,6 +168,7 @@ object CloudSyncCodec {
             folderColors = colors,
             trash = trash,
             syncedFiles = synced,
+            playbackPositions = playbackPositions,
         )
     }.getOrNull()
 
@@ -217,6 +235,13 @@ object CloudSyncCodec {
             if (cur == null || r.syncedAt >= cur.syncedAt) syncedMap[key] = r
         }
 
+        val playbackMap = LinkedHashMap<Pair<Long, Long>, CloudPlaybackPositionRecord>()
+        (local.playbackPositions + remote.playbackPositions).forEach { r ->
+            val key = r.chatId to r.messageId
+            val cur = playbackMap[key]
+            if (cur == null || r.updatedAtMs >= cur.updatedAtMs) playbackMap[key] = r
+        }
+
         return CloudMetaSnapshot(
             version = 1,
             updatedAtMs = maxOf(local.updatedAtMs, remote.updatedAtMs, System.currentTimeMillis()),
@@ -225,6 +250,7 @@ object CloudSyncCodec {
             folderColors = colorsMap.values.toList(),
             trash = trashMap.values.toList(),
             syncedFiles = syncedMap.values.toList(),
+            playbackPositions = playbackMap.values.toList(),
         )
     }
 
@@ -300,6 +326,15 @@ object CloudSyncCodec {
                 .append(",\"size\":").append(r.size)
                 .append(",\"syncedAt\":").append(r.syncedAt)
                 .append(",\"channelId\":").append(r.channelId?.toString() ?: "null").append("}")
+        }
+        append("],\n")
+        append("  \"playbackPositions\": [")
+        s.playbackPositions.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"positionMs\":").append(r.positionMs)
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
         }
         append("]\n}\n")
     }

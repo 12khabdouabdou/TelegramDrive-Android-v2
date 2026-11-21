@@ -1,5 +1,8 @@
 package com.tgdrive.feature.browser
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
@@ -18,17 +21,22 @@ import com.tgdrive.core.db.entity.FolderEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.MediaThumbnailCache
+import com.tgdrive.core.download.UploadTracker
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.UUID
 import javax.inject.Inject
 
 data class HomeUiState(
@@ -72,13 +80,19 @@ class HomeViewModel
         private val trashEntryDao: TrashEntryDao,
         private val cloudSyncManager: CloudSyncManager,
         private val downloadManager: DownloadManager,
+        private val uploadTracker: UploadTracker,
+        private val mediaThumbnailCache: MediaThumbnailCache,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
+        @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
         private val _loading = MutableStateFlow(false)
         private val _error = MutableStateFlow<String?>(null)
+        private val _snackbar = MutableStateFlow<String?>(null)
+        val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
         private val _savedChatId = MutableStateFlow(0L)
         private val _dashboard = MutableStateFlow(HomeDashboardStats())
+        private val warmedThumbKeys = HashSet<Pair<Long, Long>>()
 
         val state: StateFlow<HomeUiState> =
             combine(
@@ -162,6 +176,40 @@ class HomeViewModel
                         recentFiles = recent,
                         starredFiles = starred,
                     )
+
+                    val toWarm = (starred + recent)
+                        .distinctBy { it.chatId to it.messageId }
+                        .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+                        .filter { warmedThumbKeys.add(it.chatId to it.messageId) }
+                        .take(20)
+                    for (item in toWarm) {
+                        launch {
+                            try {
+                                val resolved = mediaThumbnailCache.ensureThumbnail(item)
+                                if (resolved != null) {
+                                    _dashboard.value = _dashboard.value.copy(
+                                        recentFiles = _dashboard.value.recentFiles.map {
+                                            if (it.chatId == item.chatId && it.messageId == item.messageId) {
+                                                it.copy(thumbnailPath = resolved)
+                                            } else {
+                                                it
+                                            }
+                                        },
+                                        starredFiles = _dashboard.value.starredFiles.map {
+                                            if (it.chatId == item.chatId && it.messageId == item.messageId) {
+                                                it.copy(thumbnailPath = resolved)
+                                            } else {
+                                                it
+                                            }
+                                        },
+                                    )
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
@@ -366,5 +414,137 @@ class HomeViewModel
                 fileCacheDao.getRecent()
             } catch (_: Throwable) {
                 emptyList()
+            }
+
+        fun clearSnackbar() {
+            _snackbar.value = null
+        }
+
+        fun uploadFilesToChat(
+            targetChatId: Long,
+            uris: List<Uri>,
+        ) {
+            if (uris.isEmpty()) return
+            viewModelScope.launch(dispatchers.io) {
+                val chatId = if (targetChatId == 0L) {
+                    runCatching { telegramClient.myUserId() }.getOrDefault(0L)
+                } else {
+                    targetChatId
+                }
+                if (chatId == 0L) {
+                    _error.value = "Telegram session not ready"
+                    return@launch
+                }
+                var uploaded = 0
+                var failed = 0
+                val stagingDir = File(appContext.cacheDir, "upload_staging").apply { mkdirs() }
+                for (uri in uris) {
+                    val (displayName, resolvedSize) = resolveUriInfo(uri)
+                    val safeName = displayName.replace('/', '_').replace('\\', '_').ifBlank {
+                        "upload_${System.currentTimeMillis()}"
+                    }
+                    val trackerKey = "home_${UUID.randomUUID()}"
+                    val mime = appContext.contentResolver.getType(uri) ?: guessMimeFromName(safeName)
+                    val staging = File.createTempFile("home_up_", "_$safeName", stagingDir)
+                    try {
+                        appContext.contentResolver.openInputStream(uri)?.use { input ->
+                            staging.outputStream().use { out -> input.copyTo(out) }
+                        } ?: throw IllegalStateException("Cannot open URI")
+                        val realSize = if (resolvedSize > 0L) resolvedSize else staging.length()
+                        uploadTracker.beginUpload(trackerKey, chatId, safeName, realSize)
+                        val result = telegramClient.uploadFile(
+                            chatId = chatId,
+                            localPath = staging.absolutePath,
+                            fileName = safeName,
+                            mimeType = mime,
+                        ) { sent, total ->
+                            uploadTracker.updateProgress(trackerKey, sent, total)
+                        }
+                        val localThumb = mediaThumbnailCache.generateFromLocalFile(
+                            chatId = chatId,
+                            messageId = result.messageId,
+                            localPath = staging.absolutePath,
+                            mimeType = mime,
+                            fileName = safeName,
+                        )
+                        fileCacheDao.upsertAll(
+                            listOf(
+                                FileCacheEntity(
+                                    messageId = result.messageId,
+                                    chatId = chatId,
+                                    fileName = safeName,
+                                    fileSize = realSize,
+                                    mimeType = mime,
+                                    thumbnailPath = localThumb,
+                                    remoteId = result.remoteId,
+                                    date = System.currentTimeMillis(),
+                                    lastAccessed = System.currentTimeMillis(),
+                                ),
+                            ),
+                        )
+                        uploadTracker.completeUpload(trackerKey)
+                        uploaded++
+                    } catch (e: CancellationException) {
+                        uploadTracker.failUpload(trackerKey, "Cancelled")
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w("HomeViewModel: quick upload failed for $safeName", t)
+                        uploadTracker.failUpload(trackerKey, t.message ?: "Upload failed")
+                        failed++
+                    } finally {
+                        staging.delete()
+                    }
+                }
+                refreshDashboard()
+                _snackbar.value = when {
+                    failed == 0 -> "Uploaded $uploaded file(s)"
+                    uploaded == 0 -> "Upload failed ($failed)"
+                    else -> "Uploaded $uploaded, failed $failed"
+                }
+            }
+        }
+
+        private fun resolveUriInfo(uri: Uri): Pair<String, Long> {
+            var name: String? = null
+            var size = 0L
+            runCatching {
+                appContext.contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null,
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (nameIdx >= 0) name = c.getString(nameIdx)
+                        if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                    }
+                }
+            }
+            val fallback = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                ?: "file_${System.currentTimeMillis()}"
+            return (name?.takeIf { it.isNotBlank() } ?: fallback) to size
+        }
+
+        private fun guessMimeFromName(name: String): String =
+            when (name.substringAfterLast('.', "").lowercase()) {
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                "gif" -> "image/gif"
+                "heic" -> "image/heic"
+                "mp4" -> "video/mp4"
+                "mkv" -> "video/x-matroska"
+                "mov" -> "video/quicktime"
+                "mp3" -> "audio/mpeg"
+                "wav" -> "audio/wav"
+                "flac" -> "audio/flac"
+                "pdf" -> "application/pdf"
+                "zip" -> "application/zip"
+                "txt" -> "text/plain"
+                "json" -> "application/json"
+                else -> "application/octet-stream"
             }
     }

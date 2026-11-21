@@ -15,4 +15,6 @@ data class FolderEntity(
     @ColumnInfo(name = "title") val title: String,
     @ColumnInfo(name = "created_at") val createdAt: Long,
     @ColumnInfo(name = "color") val color: Int = 0xFF2D8CF0.toInt(), // default accent blue
+    @ColumnInfo(name = "is_pinned_offline") val isPinnedOffline: Boolean = false,
+    @ColumnInfo(name = "is_vault") val isVault: Boolean = false,
 )

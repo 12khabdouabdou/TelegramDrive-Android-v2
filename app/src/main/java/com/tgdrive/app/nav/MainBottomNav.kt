@@ -3,20 +3,27 @@ package com.tgdrive.app.nav
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
@@ -24,21 +31,29 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -51,8 +66,10 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.navArgument
 import com.tgdrive.app.R
 import com.tgdrive.app.RootViewModel
+import com.tgdrive.app.ShareTargetFolder
 import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.feature.autobackup.AutoBackupScreen
+import com.tgdrive.feature.browser.CategoryFilesScreen
 import com.tgdrive.feature.browser.FolderScreen
 import com.tgdrive.feature.browser.FoldersManagementScreen
 import com.tgdrive.feature.browser.GlobalSearchScreen
@@ -201,6 +218,17 @@ fun MainBottomNav(
                     onOpenText = onOpenText,
                     onOpenAnalytics = { nav.navigate("analytics") },
                     onOpenSearch = { nav.navigate("search") },
+                    onOpenCategory = { filter ->
+                        if (filter == FileFilter.IMAGES) {
+                            nav.navigate(Tab.PHOTOS.route) {
+                                popUpTo(nav.graph.startDestinationId) { saveState = true }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        } else {
+                            nav.navigate("category/${filter.name}")
+                        }
+                    },
                     onOpenCategoryFolder = { chatId, title, filter ->
                         nav.navigate("folder/$chatId/${Uri.encode(title)}?filter=${filter.name}")
                     },
@@ -247,10 +275,35 @@ fun MainBottomNav(
             composable("search") {
                 GlobalSearchScreen(
                     onBack = { nav.popBackStack() },
-                    onOpenFile = { chatId, folderTitle, _ ->
+                    onOpenFolder = { chatId, folderTitle ->
                         nav.navigate("folder/$chatId/${Uri.encode(folderTitle)}")
                     },
+                    onOpenVideo = onOpenVideo,
+                    onOpenImage = onOpenImage,
+                    onOpenPdf = onOpenPdf,
+                    onOpenZip = onOpenZip,
+                    onOpenText = onOpenText,
                     onOpenZipEntry = onOpenZipEntry,
+                )
+            }
+
+            composable(
+                "category/{filter}",
+                arguments = listOf(navArgument("filter") { type = NavType.StringType }),
+            ) { entry ->
+                val raw = entry.arguments?.getString("filter").orEmpty()
+                val filter = runCatching { FileFilter.valueOf(raw) }.getOrNull() ?: FileFilter.VIDEOS
+                CategoryFilesScreen(
+                    filter = filter,
+                    onBack = { nav.popBackStack() },
+                    onOpenVideo = onOpenVideo,
+                    onOpenImage = onOpenImage,
+                    onOpenPdf = onOpenPdf,
+                    onOpenZip = onOpenZip,
+                    onOpenText = onOpenText,
+                    onOpenFolder = { chatId, folderTitle ->
+                        nav.navigate("folder/$chatId/${Uri.encode(folderTitle)}")
+                    },
                 )
             }
 
@@ -287,6 +340,7 @@ fun MainBottomNav(
         if (rootState.pendingShareUris.isNotEmpty()) {
             ShareUploadDialog(
                 count = rootState.pendingShareUris.size,
+                folders = rootState.shareFolders,
                 inProgress = rootState.shareUploadInProgress,
                 message = rootState.shareUploadMessage,
                 onConfirm = rootVm::confirmShareUpload,
@@ -299,11 +353,19 @@ fun MainBottomNav(
 @Composable
 private fun ShareUploadDialog(
     count: Int,
+    folders: List<ShareTargetFolder>,
     inProgress: Boolean,
     message: String?,
-    onConfirm: () -> Unit,
+    onConfirm: (targetChatId: Long?, packAsZip: Boolean, zipName: String?, zipPassword: String?) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var selectedChatId by remember(folders) {
+        mutableLongStateOf(folders.firstOrNull()?.chatId ?: 0L)
+    }
+    var packAsZip by remember { mutableStateOf(false) }
+    var zipName by remember { mutableStateOf("") }
+    var zipPassword by remember { mutableStateOf("") }
+
     AlertDialog(
         onDismissRequest = { if (!inProgress) onDismiss() },
         containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -318,16 +380,99 @@ private fun ShareUploadDialog(
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Text(
-                    if (count == 1) {
-                        stringResource(R.string.share_upload_body_one)
-                    } else {
-                        stringResource(R.string.share_upload_body_many, count)
-                    },
+                    stringResource(R.string.share_pick_destination),
+                    style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (folders.isEmpty()) {
+                    Text(
+                        if (count == 1) {
+                            stringResource(R.string.share_upload_body_one)
+                        } else {
+                            stringResource(R.string.share_upload_body_many, count)
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Column(modifier = Modifier.selectableGroup()) {
+                        folders.forEach { folder ->
+                            val selected = selectedChatId == folder.chatId
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .selectable(
+                                        selected = selected,
+                                        enabled = !inProgress,
+                                        role = Role.RadioButton,
+                                        onClick = { selectedChatId = folder.chatId },
+                                    )
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(
+                                    selected = selected,
+                                    enabled = !inProgress,
+                                    onClick = null,
+                                )
+                                Text(
+                                    text = folder.title,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(start = 8.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = !inProgress) { packAsZip = !packAsZip }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = packAsZip,
+                        enabled = !inProgress,
+                        onCheckedChange = null,
+                    )
+                    Text(
+                        text = stringResource(R.string.share_pack_zip),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+                if (packAsZip) {
+                    OutlinedTextField(
+                        value = zipName,
+                        onValueChange = { zipName = it },
+                        label = { Text(stringResource(R.string.share_zip_name_label)) },
+                        singleLine = true,
+                        enabled = !inProgress,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = zipPassword,
+                        onValueChange = { zipPassword = it },
+                        label = { Text(stringResource(R.string.share_zip_password_label)) },
+                        singleLine = true,
+                        enabled = !inProgress,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 if (inProgress) {
+                    Spacer(Modifier.height(4.dp))
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
                 if (message != null) {
@@ -340,7 +485,14 @@ private fun ShareUploadDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = onConfirm,
+                onClick = {
+                    onConfirm(
+                        selectedChatId.takeIf { it != 0L },
+                        packAsZip,
+                        zipName.takeIf { it.isNotBlank() },
+                        zipPassword.takeIf { it.isNotBlank() },
+                    )
+                },
                 enabled = !inProgress,
             ) {
                 Text(stringResource(R.string.share_upload_action))

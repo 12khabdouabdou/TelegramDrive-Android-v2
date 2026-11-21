@@ -4,10 +4,17 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.BitmapFactory
+import android.media.AudioManager
 import android.media.ExifInterface
 import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +23,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -23,26 +31,35 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,10 +67,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -63,13 +83,20 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.FileDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.source.SingleSampleMediaSource
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
@@ -87,6 +114,10 @@ import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.designsystem.theme.TgTypography
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -115,6 +146,8 @@ class VideoPlayerViewModel @Inject constructor(
     private val cloudSyncManager: CloudSyncManager,
     private val dispatchers: DispatchersProvider,
 ) : ViewModel() {
+
+    private val persistScope = CoroutineScope(SupervisorJob() + dispatchers.io)
 
     fun getLocalPath(messageId: Long, chatId: Long = 0L): String? {
         if (chatId != 0L) {
@@ -152,6 +185,39 @@ class VideoPlayerViewModel @Inject constructor(
                 mime.startsWith("image/") || ext in IMAGE_EXTS
             }
         }.getOrDefault(emptyList())
+    }
+
+    suspend fun loadSiblingMedia(chatId: Long, includeLocked: Boolean = false): List<FileCacheEntity> {
+        if (chatId == 0L) return emptyList()
+        return runCatching {
+            fileCacheDao.forChat(chatId).filter { entity ->
+                if (!includeLocked && entity.isLocked) return@filter false
+                val mime = entity.mimeType.orEmpty().lowercase()
+                val ext = entity.fileName.substringAfterLast('.', "").lowercase()
+                mime.startsWith("image/") ||
+                    mime.startsWith("video/") ||
+                    ext in IMAGE_EXTS ||
+                    ext in VIDEO_EXTS
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun savePlaybackPosition(
+        chatId: Long,
+        messageId: Long,
+        positionMs: Long,
+        durationMs: Long,
+    ) {
+        if (chatId == 0L) return
+        val effective = when {
+            durationMs > 0L && positionMs >= durationMs - 3_000L -> 0L
+            positionMs >= 3_000L -> positionMs
+            else -> 0L
+        }
+        persistScope.launch {
+            runCatching { fileCacheDao.updatePlaybackPosition(chatId, messageId, effective) }
+            cloudSyncManager.notePlaybackPositionChanged(chatId, messageId, effective)
+        }
     }
 
     fun ensureDownloaded(entry: FileCacheEntity) {
@@ -316,6 +382,7 @@ class VideoPlayerViewModel @Inject constructor(
 
     companion object {
         private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif")
+        private val VIDEO_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
     }
 }
 
@@ -328,9 +395,10 @@ private tailrec fun Context.findActivity(): Activity? =
 
 /**
  * Video player screen supporting local cached playback and progressive TDLib range
- * streaming with automatic download fallback, PiP button + chrome hiding, and retry.
+ * streaming with speed control, aspect-ratio cycling, embedded & external subtitles,
+ * tap/swipe seek/brightness/volume gestures, cloud-synced resume position, and PiP.
  */
-@OptIn(UnstableApi::class)
+@OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun VideoPlayerScreen(
     messageId: Long,
@@ -339,7 +407,11 @@ fun VideoPlayerScreen(
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val activity = remember(ctx) { ctx.findActivity() }
+    val audioManager = remember(ctx) {
+        ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
     val config = LocalConfiguration.current
     val inPip = remember(config, activity) {
         activity != null && vm.pipController.isInPip(activity)
@@ -355,6 +427,7 @@ fun VideoPlayerScreen(
     var isStreamingBuffering by remember(chatId, messageId) { mutableStateOf(false) }
     var streamFileId by remember(chatId, messageId) { mutableIntStateOf(0) }
     var fellBackToDownload by remember(chatId, messageId) { mutableStateOf(false) }
+    var initialCloudSeekApplied by remember(chatId, messageId) { mutableStateOf(false) }
 
     val downloadItem = downloadState.items.find {
         it.id == messageId && (chatId == 0L || it.chatId == 0L || it.chatId == chatId)
@@ -365,8 +438,81 @@ fun VideoPlayerScreen(
     val isFailed = downloadItem?.status == DownloadStatus.FAILED
     val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
 
+    val exo = remember(chatId, messageId) {
+        try {
+            ExoPlayer.Builder(ctx.applicationContext).build()
+        } catch (t: Throwable) {
+            Log.w("VideoPlayer: failed to create ExoPlayer", t)
+            playerInitError = t.localizedMessage ?: "Video player initialization failed"
+            null
+        }
+    }
+    var savedPositionMs by rememberSaveable(chatId, messageId) { mutableLongStateOf(0L) }
+    var playbackSpeed by rememberSaveable(chatId, messageId) { mutableFloatStateOf(1f) }
+    var resizeMode by rememberSaveable(chatId, messageId) {
+        mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT)
+    }
+    var externalSubtitle by remember(chatId, messageId) {
+        mutableStateOf<MediaItem.SubtitleConfiguration?>(null)
+    }
+    var showSubtitleSheet by remember { mutableStateOf(false) }
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    var gestureHudText by remember { mutableStateOf<String?>(null) }
+    var gestureHudStamp by remember { mutableIntStateOf(0) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val subPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { pickedUri: Uri? ->
+        if (pickedUri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                copyExternalSubtitle(ctx, pickedUri, chatId, messageId)
+            }
+            if (loaded != null) {
+                val (subFile, subMime, subLabel) = loaded
+                exo?.currentPosition?.coerceAtLeast(0L)?.let { pos ->
+                    if (pos > 0L) savedPositionMs = pos
+                }
+                externalSubtitle = MediaItem.SubtitleConfiguration.Builder(Uri.fromFile(subFile))
+                    .setMimeType(subMime)
+                    .setLanguage("en")
+                    .setLabel(subLabel)
+                    .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                    .build()
+                exo?.trackSelectionParameters = exo?.trackSelectionParameters
+                    ?.buildUpon()
+                    ?.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                    ?.build() ?: return@launch
+            }
+        }
+    }
+
+    LaunchedEffect(gestureHudStamp) {
+        if (gestureHudStamp > 0) {
+            delay(900L)
+            gestureHudText = null
+        }
+    }
+
     LaunchedEffect(chatId, messageId) {
         cachedEntry = vm.getCachedEntry(chatId, messageId)
+    }
+
+    LaunchedEffect(cachedEntry?.playbackPositionMs, exo) {
+        val resumeMs = cachedEntry?.playbackPositionMs ?: 0L
+        if (!initialCloudSeekApplied && resumeMs > 0L) {
+            initialCloudSeekApplied = true
+            if (savedPositionMs == 0L) {
+                savedPositionMs = resumeMs
+                exo?.let { p ->
+                    if (p.currentPosition < 2_000L) {
+                        runCatching { p.seekTo(resumeMs) }
+                    }
+                }
+            }
+        }
     }
 
     LaunchedEffect(chatId, messageId, downloadState.items, cachedEntry) {
@@ -387,28 +533,22 @@ fun VideoPlayerScreen(
         }
     }
 
-    val exo = remember(chatId, messageId) {
-        try {
-            ExoPlayer.Builder(ctx.applicationContext).build()
-        } catch (t: Throwable) {
-            Log.w("VideoPlayer: failed to create ExoPlayer", t)
-            playerInitError = t.localizedMessage ?: "Video player initialization failed"
-            null
-        }
-    }
-    var savedPositionMs by rememberSaveable(chatId, messageId) { mutableLongStateOf(0L) }
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    LaunchedEffect(localPath, useProgressiveStream, cachedEntry, exo) {
+    LaunchedEffect(localPath, useProgressiveStream, cachedEntry, exo, externalSubtitle) {
         val player = exo ?: return@LaunchedEffect
         val path = localPath
+        val subConfig = externalSubtitle
         if (path != null) {
             try {
                 val file = File(path)
                 if (!file.exists()) return@LaunchedEffect
                 playbackError = null
-                player.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                val itemBuilder = MediaItem.Builder().setUri(Uri.fromFile(file))
+                if (subConfig != null) {
+                    itemBuilder.setSubtitleConfigurations(listOf(subConfig))
+                }
+                player.setMediaItem(itemBuilder.build())
                 if (savedPositionMs > 0L) player.seekTo(savedPositionMs)
+                player.setPlaybackSpeed(playbackSpeed)
                 player.prepare()
                 player.playWhenReady = true
             } catch (t: Throwable) {
@@ -430,10 +570,18 @@ fun VideoPlayerScreen(
                         onOpenedFileId = { fid -> streamFileId = fid },
                     )
                 }
-                val mediaSource = ProgressiveMediaSource.Factory(factory)
+                val videoSource = ProgressiveMediaSource.Factory(factory)
                     .createMediaSource(MediaItem.fromUri("tgstream://video/$chatId/$messageId"))
-                player.setMediaSource(mediaSource)
+                val finalSource = if (subConfig != null) {
+                    val subSource = SingleSampleMediaSource.Factory(FileDataSource.Factory())
+                        .createMediaSource(subConfig, C.TIME_UNSET)
+                    MergingMediaSource(videoSource, subSource)
+                } else {
+                    videoSource
+                }
+                player.setMediaSource(finalSource)
                 if (savedPositionMs > 0L) player.seekTo(savedPositionMs)
+                player.setPlaybackSpeed(playbackSpeed)
                 player.prepare()
                 player.playWhenReady = true
             } catch (t: Throwable) {
@@ -448,6 +596,20 @@ fun VideoPlayerScreen(
 
     val hasActiveVideo = localPath != null || useProgressiveStream
 
+    LaunchedEffect(exo, hasActiveVideo, chatId, messageId) {
+        val player = exo ?: return@LaunchedEffect
+        if (!hasActiveVideo || chatId == 0L) return@LaunchedEffect
+        while (true) {
+            delay(15_000L)
+            if (player.isPlaying) {
+                val pos = player.currentPosition.coerceAtLeast(0L)
+                val dur = player.duration.coerceAtLeast(0L)
+                savedPositionMs = pos
+                vm.savePlaybackPosition(chatId, messageId, pos, dur)
+            }
+        }
+    }
+
     LaunchedEffect(hasActiveVideo, playbackError, playerInitError) {
         vm.pipController.setActive(
             hasActiveVideo && playbackError == null && playerInitError == null,
@@ -458,7 +620,10 @@ fun VideoPlayerScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP && exo != null) {
                 runCatching {
-                    savedPositionMs = exo.currentPosition.coerceAtLeast(0L)
+                    val pos = exo.currentPosition.coerceAtLeast(0L)
+                    val dur = exo.duration.coerceAtLeast(0L)
+                    savedPositionMs = pos
+                    vm.savePlaybackPosition(chatId, messageId, pos, dur)
                     val inPipNow = activity != null && vm.pipController.isInPip(activity)
                     if (!inPipNow) exo.pause()
                 }
@@ -494,7 +659,10 @@ fun VideoPlayerScreen(
         onDispose {
             runCatching {
                 exo?.let {
-                    savedPositionMs = it.currentPosition.coerceAtLeast(0L)
+                    val pos = it.currentPosition.coerceAtLeast(0L)
+                    val dur = it.duration.coerceAtLeast(0L)
+                    savedPositionMs = pos
+                    vm.savePlaybackPosition(chatId, messageId, pos, dur)
                     it.removeListener(listener)
                     it.release()
                 }
@@ -507,10 +675,16 @@ fun VideoPlayerScreen(
     }
 
     val activeError = playerInitError ?: playbackError
+    val seekBackText = stringResource(R.string.player_video_seek_back)
+    val seekForwardText = stringResource(R.string.player_video_seek_forward)
+    val fitText = stringResource(R.string.player_video_resize_fit)
+    val zoomText = stringResource(R.string.player_video_resize_zoom)
+    val fillText = stringResource(R.string.player_video_resize_fill)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .onSizeChanged { containerSize = it }
             .background(Color.Black),
     ) {
         when {
@@ -553,15 +727,106 @@ fun VideoPlayerScreen(
                         PlayerView(viewCtx).apply {
                             player = exo
                             useController = !inPip
+                            this.resizeMode = resizeMode
+                            playerViewRef = this
                         }
                     },
                     update = { view ->
                         if (view.player !== exo) view.player = exo
                         view.useController = !inPip
+                        view.resizeMode = resizeMode
+                        playerViewRef = view
                     },
-                    onRelease = { view -> view.player = null },
+                    onRelease = { view ->
+                        view.player = null
+                        if (playerViewRef === view) playerViewRef = null
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
+                if (!inPip) {
+                    var dragIsLeft by remember { mutableStateOf(true) }
+                    var brightnessAccum by remember { mutableFloatStateOf(-1f) }
+                    var volumeAccum by remember { mutableFloatStateOf(0f) }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(top = 68.dp, bottom = 108.dp)
+                            .pointerInput(exo, containerSize) {
+                                detectTapGestures(
+                                    onTap = {
+                                        playerViewRef?.let { pv ->
+                                            if (pv.isControllerFullyVisible) {
+                                                pv.hideController()
+                                            } else {
+                                                pv.showController()
+                                            }
+                                        }
+                                    },
+                                    onDoubleTap = { tapOffset ->
+                                        val w = containerSize.width.coerceAtLeast(1)
+                                        val dur = exo.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+                                        if (tapOffset.x < w * 0.42f) {
+                                            exo.seekTo((exo.currentPosition - 10_000L).coerceAtLeast(0L))
+                                            gestureHudText = seekBackText
+                                            gestureHudStamp++
+                                        } else if (tapOffset.x > w * 0.58f) {
+                                            exo.seekTo((exo.currentPosition + 10_000L).coerceAtMost(dur))
+                                            gestureHudText = seekForwardText
+                                            gestureHudStamp++
+                                        } else {
+                                            if (exo.isPlaying) exo.pause() else exo.play()
+                                        }
+                                    },
+                                )
+                            }
+                            .pointerInput(activity, audioManager, containerSize) {
+                                detectVerticalDragGestures(
+                                    onDragStart = { start ->
+                                        val w = containerSize.width.coerceAtLeast(1)
+                                        dragIsLeft = start.x < w * 0.5f
+                                        if (dragIsLeft && activity != null) {
+                                            val cur = activity.window.attributes.screenBrightness
+                                            brightnessAccum = if (cur in 0f..1f) cur else 0.5f
+                                        } else if (!dragIsLeft && audioManager != null) {
+                                            val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                                .coerceAtLeast(1)
+                                            volumeAccum = cur.toFloat() / max.toFloat()
+                                        }
+                                    },
+                                    onVerticalDrag = { _, dragAmount ->
+                                        val h = containerSize.height.coerceAtLeast(200)
+                                        val delta = -dragAmount / h.toFloat()
+                                        if (dragIsLeft && activity != null) {
+                                            val next = (brightnessAccum + delta).coerceIn(0.05f, 1f)
+                                            brightnessAccum = next
+                                            val lp = activity.window.attributes
+                                            lp.screenBrightness = next
+                                            activity.window.attributes = lp
+                                            gestureHudText = ctx.getString(
+                                                R.string.player_video_brightness,
+                                                (next * 100).toInt(),
+                                            )
+                                            gestureHudStamp++
+                                        } else if (!dragIsLeft && audioManager != null) {
+                                            val next = (volumeAccum + delta).coerceIn(0f, 1f)
+                                            volumeAccum = next
+                                            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                                .coerceAtLeast(1)
+                                            val targetIdx = Math.round(next * max).coerceIn(0, max)
+                                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetIdx, 0)
+                                            gestureHudText = ctx.getString(
+                                                R.string.player_video_volume,
+                                                (next * 100).toInt(),
+                                            )
+                                            gestureHudStamp++
+                                        }
+                                    },
+                                )
+                            },
+                    )
+                }
                 if (isStreamingBuffering && !inPip) {
                     Surface(
                         color = Color.Black.copy(alpha = 0.65f),
@@ -569,13 +834,28 @@ fun VideoPlayerScreen(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .statusBarsPadding()
-                            .padding(top = 16.dp),
+                            .padding(top = 64.dp),
                     ) {
                         Text(
                             text = stringResource(R.string.player_video_streaming),
                             color = Color.White,
                             style = TgTypography.Caption,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+                if (gestureHudText != null && !inPip) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.72f),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.align(Alignment.Center),
+                    ) {
+                        Text(
+                            text = gestureHudText.orEmpty(),
+                            color = Color.White,
+                            style = TgTypography.Display.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
                         )
                     }
                 }
@@ -665,7 +945,75 @@ fun VideoPlayerScreen(
                     )
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (hasActiveVideo && exo != null) {
+                        val speedLabel = if (playbackSpeed == playbackSpeed.toInt().toFloat()) {
+                            "${playbackSpeed.toInt()}×"
+                        } else {
+                            "${playbackSpeed}×"
+                        }
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(16.dp))
+                                .clickable {
+                                    val speeds = floatArrayOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+                                    val idx = speeds.indexOfFirst { kotlin.math.abs(it - playbackSpeed) < 0.05f }
+                                    val next = speeds[(idx + 1) % speeds.size]
+                                    playbackSpeed = next
+                                    exo.setPlaybackSpeed(next)
+                                },
+                        ) {
+                            Text(
+                                text = speedLabel,
+                                color = Color.White,
+                                style = TgTypography.Mono,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            )
+                        }
+                        IconButton(
+                            onClick = {
+                                val nextMode = when (resizeMode) {
+                                    AspectRatioFrameLayout.RESIZE_MODE_FIT -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                                    AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                                    else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                }
+                                resizeMode = nextMode
+                                gestureHudText = when (nextMode) {
+                                    AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> zoomText
+                                    AspectRatioFrameLayout.RESIZE_MODE_FILL -> fillText
+                                    else -> fitText
+                                }
+                                gestureHudStamp++
+                            },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.AspectRatio,
+                                contentDescription = stringResource(R.string.player_video_resize),
+                                tint = Color.White,
+                            )
+                        }
+                        IconButton(
+                            onClick = { showSubtitleSheet = true },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.ClosedCaption,
+                                contentDescription = stringResource(R.string.player_video_subtitles),
+                                tint = if (externalSubtitle != null) MaterialTheme.colorScheme.primary else Color.White,
+                            )
+                        }
+                    }
                     if (localPath == null && cachedEntry != null && !isDownloading) {
                         IconButton(
                             onClick = { cachedEntry?.let { vm.ensureDownloaded(it) } },
@@ -697,5 +1045,146 @@ fun VideoPlayerScreen(
                 }
             }
         }
+    }
+
+    if (showSubtitleSheet && exo != null) {
+        val textGroups = exo.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
+        val textDisabled = exo.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
+        ModalBottomSheet(
+            onDismissRequest = { showSubtitleSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = stringResource(R.string.player_video_subtitles),
+                    style = TgTypography.Display.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            exo.trackSelectionParameters = exo.trackSelectionParameters
+                                .buildUpon()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                .build()
+                            showSubtitleSheet = false
+                        }
+                        .padding(horizontal = 12.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(R.string.player_video_subtitles_off),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (textDisabled) {
+                        Icon(
+                            Icons.Filled.Check,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+                textGroups.forEachIndexed { gIdx, group ->
+                    for (tIdx in 0 until group.length) {
+                        val fmt = group.getTrackFormat(tIdx)
+                        val trackName = listOfNotNull(
+                            fmt.label?.takeIf { it.isNotBlank() },
+                            fmt.language?.takeIf { it.isNotBlank() },
+                        ).joinToString(" · ").ifBlank { "Track ${gIdx + 1}.${tIdx + 1}" }
+                        val selected = !textDisabled && group.isTrackSelected(tIdx)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    exo.trackSelectionParameters = exo.trackSelectionParameters
+                                        .buildUpon()
+                                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, tIdx))
+                                        .build()
+                                    showSubtitleSheet = false
+                                }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(trackName, color = MaterialTheme.colorScheme.onSurface)
+                            if (selected) {
+                                Icon(
+                                    Icons.Filled.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Button(
+                    onClick = {
+                        showSubtitleSheet = false
+                        subPicker.launch(arrayOf("*/*"))
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.player_video_subtitles_load))
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+}
+
+private fun copyExternalSubtitle(
+    context: Context,
+    uri: Uri,
+    chatId: Long,
+    messageId: Long,
+): Triple<File, String, String>? {
+    return try {
+        var displayName: String? = null
+        context.contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null,
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) displayName = c.getString(idx)
+            }
+        }
+        val cleanName = (displayName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "subtitle.srt")
+            .replace('/', '_')
+            .replace('\\', '_')
+        val ext = cleanName.substringAfterLast('.', "srt").lowercase()
+        val mime = when (ext) {
+            "vtt" -> MimeTypes.TEXT_VTT
+            "ass", "ssa" -> MimeTypes.TEXT_SSA
+            "ttml", "dfxp" -> MimeTypes.APPLICATION_TTML
+            else -> MimeTypes.APPLICATION_SUBRIP
+        }
+        val subsDir = File(context.cacheDir, "subs").apply { mkdirs() }
+        val outFile = File(subsDir, "sub_${chatId}_${messageId}_$cleanName")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            outFile.outputStream().use { out -> input.copyTo(out) }
+        } ?: return null
+        Triple(outFile, mime, cleanName)
+    } catch (t: Throwable) {
+        Log.w("VideoPlayer: failed loading subtitle URI", t)
+        null
     }
 }

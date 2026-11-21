@@ -229,4 +229,34 @@ interface FileCacheDao {
         deleteByMessageId(chatId, newId)
         updateMessageId(chatId, oldId, newId)
     }
+
+    @Query("UPDATE file_cache SET playback_position_ms = :positionMs WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun updatePlaybackPosition(chatId: Long, messageId: Long, positionMs: Long)
+
+    @Query("UPDATE file_cache SET virtual_path = :virtualPath WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun updateVirtualPath(chatId: Long, messageId: Long, virtualPath: String)
+
+    @Query("UPDATE file_cache SET is_locked = :locked WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun setLocked(chatId: Long, messageId: Long, locked: Boolean)
+
+    @Query("UPDATE file_cache SET is_encrypted_vault = :encrypted WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun setEncryptedVault(chatId: Long, messageId: Long, encrypted: Boolean)
+
+    @Query("UPDATE file_cache SET user_note = :note WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun updateUserNote(chatId: Long, messageId: Long, note: String?)
+
+    @Query("UPDATE file_cache SET ocr_text = :ocrText, ai_tags = :aiTags WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun updateAiIndex(chatId: Long, messageId: Long, ocrText: String?, aiTags: String?)
+
+    @Query("UPDATE file_cache SET exif_lat = :lat, exif_lng = :lng WHERE chat_id = :chatId AND message_id = :messageId")
+    suspend fun updateExifLocation(chatId: Long, messageId: Long, lat: Double?, lng: Double?)
+
+    @Query("SELECT * FROM file_cache WHERE is_locked = 0 ORDER BY date DESC")
+    fun observeAllUnlocked(): Flow<List<FileCacheEntity>>
+
+    @Query("SELECT * FROM file_cache WHERE is_locked = 1 ORDER BY date DESC")
+    fun observeLockedFiles(): Flow<List<FileCacheEntity>>
+
+    @Query("SELECT * FROM file_cache WHERE is_locked = 0 ORDER BY date DESC")
+    suspend fun getAllUnlocked(): List<FileCacheEntity>
 }

@@ -15,6 +15,8 @@ import androidx.room.Index
         Index(value = ["file_name", "file_size"]),
         Index("last_accessed"),
         Index("is_pinned_offline"),
+        Index("is_locked"),
+        Index(value = ["chat_id", "virtual_path"]),
     ],
 )
 data class FileCacheEntity(
@@ -29,4 +31,13 @@ data class FileCacheEntity(
     @ColumnInfo(name = "is_starred") val isStarred: Boolean = false,
     @ColumnInfo(name = "last_accessed") val lastAccessed: Long = 0L,
     @ColumnInfo(name = "is_pinned_offline") val isPinnedOffline: Boolean = false,
+    @ColumnInfo(name = "playback_position_ms") val playbackPositionMs: Long = 0L,
+    @ColumnInfo(name = "virtual_path") val virtualPath: String = "",
+    @ColumnInfo(name = "is_locked") val isLocked: Boolean = false,
+    @ColumnInfo(name = "is_encrypted_vault") val isEncryptedVault: Boolean = false,
+    @ColumnInfo(name = "user_note") val userNote: String? = null,
+    @ColumnInfo(name = "ocr_text") val ocrText: String? = null,
+    @ColumnInfo(name = "ai_tags") val aiTags: String? = null,
+    @ColumnInfo(name = "exif_lat") val exifLat: Double? = null,
+    @ColumnInfo(name = "exif_lng") val exifLng: Double? = null,
 )
