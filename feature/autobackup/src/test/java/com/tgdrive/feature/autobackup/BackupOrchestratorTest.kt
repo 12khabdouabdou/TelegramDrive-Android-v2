@@ -26,7 +26,6 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
-import io.mockk.slot
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -96,6 +95,7 @@ class BackupOrchestratorTest {
         every { preferences.data } returns prefsFlow
         coEvery { telegramClient.myUserId() } returns 999L
         coEvery { telegramClient.maxUploadSizeBytes() } returns 2_000_000_000L
+        coEvery { syncLogDao.get(any()) } returns null
         every { stagingManager.extractCaptureTimestampMs(any(), any(), any()) } answers { thirdArg() }
 
         orchestrator = BackupOrchestrator(
@@ -267,9 +267,9 @@ class BackupOrchestratorTest {
             telegramClient.uploadFile(any(), any(), "clip.mp4", any(), any())
         }
 
-        val logSlot = slot<SyncLogEntity>()
-        coVerify { syncLogDao.upsert(capture(logSlot)) }
-        val captured = logSlot.captured
+        val logs = mutableListOf<SyncLogEntity>()
+        coVerify { syncLogDao.upsert(capture(logs)) }
+        val captured = logs.last()
         assertThat(captured.failedCount).isEqualTo(1)
         assertThat(BackupFailureRecord.decode(captured.failedDetailsJson).single().fileName).isEqualTo("huge.mkv")
     }

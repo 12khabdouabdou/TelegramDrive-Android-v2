@@ -98,15 +98,17 @@ object ExcludePatternMatcher {
         return matches(fileName, patterns)
     }
 
-    private fun matchesGlob(candidateLower: String, patternLower: String): Boolean = when {
-        patternLower.startsWith("*") && patternLower.endsWith("*") && patternLower.length >= 2 ->
-            candidateLower.contains(patternLower.drop(1).dropLast(1))
-        patternLower.startsWith("*.") ->
-            candidateLower.endsWith(patternLower.drop(1))
-        patternLower.startsWith("*") ->
-            candidateLower.endsWith(patternLower.drop(1))
-        patternLower.endsWith("*") ->
-            candidateLower.startsWith(patternLower.dropLast(1))
-        else -> candidateLower == patternLower
+    private fun matchesGlob(candidateLower: String, patternLower: String): Boolean {
+        if ('*' !in patternLower) return candidateLower == patternLower
+        val regexPattern = buildString {
+            append('^')
+            val parts = patternLower.split('*')
+            parts.forEachIndexed { idx, part ->
+                if (part.isNotEmpty()) append(Regex.escape(part))
+                if (idx < parts.lastIndex) append(".*")
+            }
+            append('$')
+        }
+        return Regex(regexPattern).matches(candidateLower)
     }
 }
