@@ -8,6 +8,7 @@ import android.os.HandlerThread
 import android.provider.MediaStore
 import com.tgdrive.core.common.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,12 +20,16 @@ class FolderWatcher @Inject constructor(
     private var thread: HandlerThread? = null
     private var observer: ContentObserver? = null
     private var lastTriggerMs: Long = 0
-    private val debounceMs: Long = 15L * 60 * 1000  // 15 minutes
+    private val debounceMs: Long = 2L * 60 * 1000  // 2 minutes
 
-    private val triggers = mutableListOf<() -> Unit>()
+    private val triggers = CopyOnWriteArrayList<() -> Unit>()
 
     /** Add a callback to invoke when a relevant change is observed. */
-    fun onChange(block: () -> Unit) { triggers += block }
+    fun onChange(block: () -> Unit) {
+        if (block !in triggers) {
+            triggers += block
+        }
+    }
 
     fun start() {
         if (thread != null) return

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import com.tgdrive.core.common.Log
 import com.tgdrive.feature.autobackup.BackupScheduler
+import com.tgdrive.feature.autobackup.ScheduledUploadScheduler
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +31,7 @@ import javax.inject.Inject
 class BootCompletedReceiver : BroadcastReceiver() {
 
     @Inject lateinit var backupScheduler: BackupScheduler
+    @Inject lateinit var scheduledUploadScheduler: ScheduledUploadScheduler
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
@@ -45,6 +47,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
         scope.launch {
             try {
                 backupScheduler.rescheduleIfEnabled()
+                scheduledUploadScheduler.rescheduleIfEnabled()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {

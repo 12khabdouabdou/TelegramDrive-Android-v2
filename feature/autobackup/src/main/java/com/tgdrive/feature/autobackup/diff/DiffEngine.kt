@@ -23,6 +23,7 @@ data class LocalFile(
     val lastModified: Long,
     val mimeType: String,
     val sha256: String? = null,  // populated lazily by DiffEngine when strict mode is on
+    val relativePath: String = "",
 )
 
 /**
@@ -177,7 +178,16 @@ class DiffEngine(
             val matched = byPathAndSize[f.absolutePath to f.size]
             if (matched != null) {
                 if (!strict) {
-                    toSkip.add(f); continue
+                    val mtimeChanged =
+                        matched.lastModified > 0L &&
+                            f.lastModified > 0L &&
+                            kotlin.math.abs(f.lastModified - matched.lastModified) > MTIME_TOLERANCE_MS
+                    if (mtimeChanged) {
+                        toUpload.add(f)
+                    } else {
+                        toSkip.add(f)
+                    }
+                    continue
                 }
                 // Strict + path+size match → verify via SHA.
                 // This is the slow path: SHA-256 computation does blocking I/O.
@@ -218,5 +228,6 @@ class DiffEngine(
     private companion object {
         /** Yield to the coroutine dispatcher every N files to allow cancellation. */
         const val YIELD_INTERVAL = 100
+        const val MTIME_TOLERANCE_MS = 2_000L
     }
 }

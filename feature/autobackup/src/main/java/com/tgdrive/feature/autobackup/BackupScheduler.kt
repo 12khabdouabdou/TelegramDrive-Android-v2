@@ -16,31 +16,21 @@ import androidx.work.WorkManager
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.BackupSchedule
+import com.tgdrive.feature.autobackup.watcher.FolderWatcher
 import com.tgdrive.feature.autobackup.worker.BackupWorker
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.first
+import java.util.Calendar
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * Schedules / unschedules the periodic BackupWorker based on user prefs.
- *
- * Both manual "Run now" taps and the periodic schedule enqueue a
- * [BackupWorker] — they go through the same code path
- * ([BackupOrchestrator.runBackup]). This guarantees:
- *
- *   - Constraints (WiFi-only, charging-only) are respected for periodic runs.
- *   - Manual runs bypass constraints (the user explicitly asked for it).
- *   - Mutual exclusion is enforced by [ActiveBackupRegistry].
- *
- * Per spec §8 + §F-05.
- */
 @Singleton
 class BackupScheduler @Inject constructor(
     @ApplicationContext private val ctx: Context,
     private val preferences: AppPreferences,
     private val registry: ActiveBackupRegistry,
+    private val folderWatcher: FolderWatcher,
 ) {
 
     companion object {
@@ -56,6 +46,7 @@ class BackupScheduler @Inject constructor(
         if (!prefs.backupEnabled || prefs.backupPaused) {
             cancelPeriodic()
             cancelContentTrigger()
+            folderWatcher.stop()
             return
         }
         val constraints = Constraints.Builder()
@@ -72,22 +63,27 @@ class BackupScheduler @Inject constructor(
             BackupSchedule.ON_CHANGE -> {
                 cancelPeriodic()
                 armContentUriTriggerIfEnabled()
+                folderWatcher.start()
                 return
             }
             BackupSchedule.MANUAL -> {
                 cancelPeriodic()
                 cancelContentTrigger()
+                folderWatcher.stop()
                 return
             }
         }
         cancelContentTrigger()
+        folderWatcher.stop()
 
         // Minimum WorkManager interval is 15 minutes.
         val interval = intervalMin.coerceAtLeast(15)
+        val initialDelayMin = computeInitialDelayMinutes(prefs.backupScheduleHour, prefs.backupScheduleMinute)
 
         val req = PeriodicWorkRequestBuilder<BackupWorker>(interval, TimeUnit.MINUTES)
             .addTag(TAG)
             .setConstraints(constraints)
+            .setInitialDelay(initialDelayMin, TimeUnit.MINUTES)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .setInputData(Data.Builder()
                 .putString(BackupWorker.KEY_JOB_ID, "periodic")
@@ -261,9 +257,48 @@ class BackupScheduler @Inject constructor(
         Log.i("BackupScheduler: cancelled periodic")
     }
 
+    fun retryFailed(failedPaths: List<String>): String? {
+        if (registry.isAnyActive() || failedPaths.isEmpty()) return null
+        val jobId = "retry_${System.currentTimeMillis()}"
+        val req = OneTimeWorkRequestBuilder<BackupWorker>()
+            .addTag(TAG)
+            .addTag("manual")
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setInputData(
+                Data.Builder()
+                    .putString(BackupWorker.KEY_JOB_ID, jobId)
+                    .putBoolean(BackupWorker.KEY_IS_MANUAL, true)
+                    .putStringArray(BackupWorker.KEY_RETRY_PATHS, failedPaths.toTypedArray())
+                    .build(),
+            )
+            .build()
+        WorkManager.getInstance(ctx).enqueueUniqueWork(
+            ONE_TIME_WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            req,
+        )
+        Log.i("BackupScheduler: enqueued retry-failed $jobId (${failedPaths.size} paths)")
+        return jobId
+    }
+
+    private fun computeInitialDelayMinutes(targetHour: Int, targetMinute: Int): Long {
+        val now = Calendar.getInstance()
+        val next = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, targetHour.coerceIn(0, 23))
+            set(Calendar.MINUTE, targetMinute.coerceIn(0, 59))
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis <= now.timeInMillis) {
+                add(Calendar.DAY_OF_YEAR, 1)
+            }
+        }
+        return ((next.timeInMillis - now.timeInMillis) / (60L * 1000L)).coerceAtLeast(1L)
+    }
+
     fun cancelAll() {
         WorkManager.getInstance(ctx).cancelAllWorkByTag(TAG)
         cancelPeriodic()
         cancelContentTrigger()
+        folderWatcher.stop()
     }
 }

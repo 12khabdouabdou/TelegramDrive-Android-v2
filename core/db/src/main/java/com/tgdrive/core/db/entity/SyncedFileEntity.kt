@@ -39,4 +39,5 @@ data class SyncedFileEntity(
     @ColumnInfo(name = "size") val size: Long,
     @ColumnInfo(name = "synced_at") val syncedAt: Long,
     @ColumnInfo(name = "folder_id") val folderId: Long?,
+    @ColumnInfo(name = "last_modified") val lastModified: Long = 0L,
 )

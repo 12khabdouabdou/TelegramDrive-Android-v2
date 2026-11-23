@@ -29,7 +29,11 @@ dependencies {
     implementation(project(":core:datastore"))
     implementation(project(":core:zip"))
     implementation(project(":core:download"))
+    implementation(project(":core:security"))
     implementation(project(":designsystem"))
+
+    implementation(libs.coil.compose)
+    implementation(libs.coil.video)
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

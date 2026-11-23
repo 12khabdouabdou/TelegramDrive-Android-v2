@@ -266,6 +266,7 @@ class TgDriveDatabaseTest {
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_3_4,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_4_5,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_5_6,
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_6_7,
             )
             .allowMainThreadQueries()
             .build()
@@ -328,6 +329,55 @@ class TgDriveDatabaseTest {
             assertThat(migrated.albumDao().getAllItems()).hasSize(1)
             migrated.albumDao().deleteById("alb1")
             assertThat(migrated.albumDao().getAllItems()).isEmpty()
+
+            // Verify v7 columns and folder-scoped stale delete
+            val f1 = migrated.folderDao().insert(FolderEntity(channelId = 101L, title = "F1", createdAt = 1L))
+            val f2 = migrated.folderDao().insert(FolderEntity(channelId = 102L, title = "F2", createdAt = 1L))
+            migrated.syncedFileDao().upsert(
+                SyncedFileEntity(
+                    localPath = "content://doc/shared.jpg",
+                    telegramMessageId = 11L,
+                    sha256 = "s1",
+                    size = 1024L,
+                    syncedAt = 100L,
+                    folderId = f1,
+                    lastModified = 99_000L,
+                ),
+            )
+            migrated.syncedFileDao().upsert(
+                SyncedFileEntity(
+                    localPath = "content://doc/shared.jpg",
+                    telegramMessageId = 12L,
+                    sha256 = "s1",
+                    size = 1024L,
+                    syncedAt = 100L,
+                    folderId = f2,
+                    lastModified = 99_000L,
+                ),
+            )
+            migrated.syncedFileDao().deleteByPathAndFolder("content://doc/shared.jpg", f1)
+            assertThat(migrated.syncedFileDao().forFolder(f1)).isEmpty()
+            assertThat(migrated.syncedFileDao().forFolder(f2).single().lastModified).isEqualTo(99_000L)
+
+            migrated.syncLogDao().upsert(
+                SyncLogEntity(
+                    jobId = "v7_job",
+                    startedAt = 10L,
+                    completedAt = 20L,
+                    filesScanned = 5,
+                    filesUploaded = 3,
+                    filesSkipped = 1,
+                    status = "PARTIAL",
+                    errorMessage = "1 failed",
+                    failedCount = 1,
+                    failedDetailsJson = """[{"fileName":"big.mov","localPath":"p","reason":"Too large","folderUri":"u"}]""",
+                    bytesUploaded = 12_345L,
+                ),
+            )
+            val logRow = migrated.syncLogDao().get("v7_job")
+            assertThat(logRow?.failedCount).isEqualTo(1)
+            assertThat(logRow?.bytesUploaded).isEqualTo(12_345L)
+            assertThat(logRow?.failedDetailsJson).contains("big.mov")
         } finally {
             migrated.close()
             dbFile.delete()

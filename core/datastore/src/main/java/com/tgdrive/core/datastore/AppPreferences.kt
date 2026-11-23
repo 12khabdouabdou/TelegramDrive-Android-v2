@@ -33,6 +33,9 @@ private val Context.appStore by preferencesDataStore("tgdrive_prefs")
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 enum class BackupSchedule { ON_CHANGE, DAILY, WEEKLY, MANUAL }
+enum class BackupUploadOrder { NEWEST_FIRST, OLDEST_FIRST, SMALLEST_FIRST }
+enum class BackupMediaFilter { ALL_FILES, PHOTOS_AND_VIDEOS, PHOTOS_ONLY }
+enum class BackupQuality { ORIGINAL, STORAGE_SAVER }
 enum class ConflictStrategy { SKIP, OVERWRITE_RENAME }
 enum class FileViewMode { GRID, LIST }
 enum class FileFilter { ALL, IMAGES, VIDEOS, AUDIO, DOCUMENTS, ARCHIVES }
@@ -72,7 +75,26 @@ data class AppPreferencesData(
     val scheduledUploadMinute: Int = 0,
     val recentSearchQueries: String = "",
     val lastCloudSyncMs: Long = 0L,
+
+    // AutoBackup v2 enhancements
+    val backupUploadOrder: BackupUploadOrder = BackupUploadOrder.NEWEST_FIRST,
+    val backupMediaFilter: BackupMediaFilter = BackupMediaFilter.ALL_FILES,
+    val backupQuality: BackupQuality = BackupQuality.ORIGINAL,
+    val backupOnlyNewAfterMs: Long = 0L,
+    val backupCellularDailyLimitMb: Int = 0,
+    val backupCellularUsedBytes: Long = 0L,
+    val backupCellularUsageDay: String = "",
+    val backupSkipVideosOnCellular: Boolean = true,
+    val backupMaxFileSizeMb: Int = 0,
+    val backupMinBatteryPercent: Int = 15,
+    val backupAutoOrganizeByDate: Boolean = false,
+    val backupEncryptedFolderUris: Set<String> = emptySet(),
+    val backupScheduleHour: Int = 2,
+    val backupScheduleMinute: Int = 0,
+    val backupSyncIndexRestored: Boolean = false,
 ) {
+    fun isFolderEncrypted(folderUri: String): Boolean = folderUri in backupEncryptedFolderUris
+
     fun recentSearches(): List<String> =
         recentSearchQueries.split('\n').map { it.trim() }.filter { it.isNotEmpty() }.take(10)
 
@@ -184,6 +206,22 @@ class AppPreferences @Inject constructor(
         val SCHEDULED_UPLOAD_MINUTE = intPreferencesKey("scheduled_upload_minute")
         val RECENT_SEARCH_QUERIES = stringPreferencesKey("recent_search_queries")
         val LAST_CLOUD_SYNC_MS = longPreferencesKey("last_cloud_sync_ms")
+
+        val BACKUP_UPLOAD_ORDER = intPreferencesKey("backup_upload_order")
+        val BACKUP_MEDIA_FILTER = intPreferencesKey("backup_media_filter")
+        val BACKUP_QUALITY = intPreferencesKey("backup_quality")
+        val BACKUP_ONLY_NEW_AFTER_MS = longPreferencesKey("backup_only_new_after_ms")
+        val BACKUP_CELLULAR_DAILY_LIMIT_MB = intPreferencesKey("backup_cellular_daily_limit_mb")
+        val BACKUP_CELLULAR_USED_BYTES = longPreferencesKey("backup_cellular_used_bytes")
+        val BACKUP_CELLULAR_USAGE_DAY = stringPreferencesKey("backup_cellular_usage_day")
+        val BACKUP_SKIP_VIDEOS_ON_CELLULAR = booleanPreferencesKey("backup_skip_videos_on_cellular")
+        val BACKUP_MAX_FILE_SIZE_MB = intPreferencesKey("backup_max_file_size_mb")
+        val BACKUP_MIN_BATTERY_PERCENT = intPreferencesKey("backup_min_battery_percent")
+        val BACKUP_AUTO_ORGANIZE_BY_DATE = booleanPreferencesKey("backup_auto_organize_by_date")
+        val BACKUP_ENCRYPTED_FOLDER_URIS = stringSetPreferencesKey("backup_encrypted_folder_uris")
+        val BACKUP_SCHEDULE_HOUR = intPreferencesKey("backup_schedule_hour")
+        val BACKUP_SCHEDULE_MINUTE = intPreferencesKey("backup_schedule_minute")
+        val BACKUP_SYNC_INDEX_RESTORED = booleanPreferencesKey("backup_sync_index_restored")
     }
 
     /**
@@ -243,6 +281,27 @@ class AppPreferences @Inject constructor(
             scheduledUploadMinute = get(Keys.SCHEDULED_UPLOAD_MINUTE) ?: 0,
             recentSearchQueries = get(Keys.RECENT_SEARCH_QUERIES) ?: "",
             lastCloudSyncMs = get(Keys.LAST_CLOUD_SYNC_MS) ?: 0L,
+            backupUploadOrder = BackupUploadOrder.entries.getOrElse(get(Keys.BACKUP_UPLOAD_ORDER) ?: 0) {
+                BackupUploadOrder.NEWEST_FIRST
+            },
+            backupMediaFilter = BackupMediaFilter.entries.getOrElse(get(Keys.BACKUP_MEDIA_FILTER) ?: 0) {
+                BackupMediaFilter.ALL_FILES
+            },
+            backupQuality = BackupQuality.entries.getOrElse(get(Keys.BACKUP_QUALITY) ?: 0) {
+                BackupQuality.ORIGINAL
+            },
+            backupOnlyNewAfterMs = get(Keys.BACKUP_ONLY_NEW_AFTER_MS) ?: 0L,
+            backupCellularDailyLimitMb = get(Keys.BACKUP_CELLULAR_DAILY_LIMIT_MB) ?: 0,
+            backupCellularUsedBytes = get(Keys.BACKUP_CELLULAR_USED_BYTES) ?: 0L,
+            backupCellularUsageDay = get(Keys.BACKUP_CELLULAR_USAGE_DAY) ?: "",
+            backupSkipVideosOnCellular = get(Keys.BACKUP_SKIP_VIDEOS_ON_CELLULAR) ?: true,
+            backupMaxFileSizeMb = get(Keys.BACKUP_MAX_FILE_SIZE_MB) ?: 0,
+            backupMinBatteryPercent = (get(Keys.BACKUP_MIN_BATTERY_PERCENT) ?: 15).coerceIn(5, 80),
+            backupAutoOrganizeByDate = get(Keys.BACKUP_AUTO_ORGANIZE_BY_DATE) ?: false,
+            backupEncryptedFolderUris = get(Keys.BACKUP_ENCRYPTED_FOLDER_URIS) ?: emptySet(),
+            backupScheduleHour = (get(Keys.BACKUP_SCHEDULE_HOUR) ?: 2).coerceIn(0, 23),
+            backupScheduleMinute = (get(Keys.BACKUP_SCHEDULE_MINUTE) ?: 0).coerceIn(0, 59),
+            backupSyncIndexRestored = get(Keys.BACKUP_SYNC_INDEX_RESTORED) ?: false,
         )
     }
 
@@ -277,5 +336,20 @@ class AppPreferences @Inject constructor(
         this[Keys.SCHEDULED_UPLOAD_MINUTE] = d.scheduledUploadMinute
         this[Keys.RECENT_SEARCH_QUERIES] = d.recentSearchQueries
         this[Keys.LAST_CLOUD_SYNC_MS] = d.lastCloudSyncMs
+        this[Keys.BACKUP_UPLOAD_ORDER] = d.backupUploadOrder.ordinal
+        this[Keys.BACKUP_MEDIA_FILTER] = d.backupMediaFilter.ordinal
+        this[Keys.BACKUP_QUALITY] = d.backupQuality.ordinal
+        this[Keys.BACKUP_ONLY_NEW_AFTER_MS] = d.backupOnlyNewAfterMs
+        this[Keys.BACKUP_CELLULAR_DAILY_LIMIT_MB] = d.backupCellularDailyLimitMb
+        this[Keys.BACKUP_CELLULAR_USED_BYTES] = d.backupCellularUsedBytes
+        this[Keys.BACKUP_CELLULAR_USAGE_DAY] = d.backupCellularUsageDay
+        this[Keys.BACKUP_SKIP_VIDEOS_ON_CELLULAR] = d.backupSkipVideosOnCellular
+        this[Keys.BACKUP_MAX_FILE_SIZE_MB] = d.backupMaxFileSizeMb
+        this[Keys.BACKUP_MIN_BATTERY_PERCENT] = d.backupMinBatteryPercent
+        this[Keys.BACKUP_AUTO_ORGANIZE_BY_DATE] = d.backupAutoOrganizeByDate
+        this[Keys.BACKUP_ENCRYPTED_FOLDER_URIS] = d.backupEncryptedFolderUris
+        this[Keys.BACKUP_SCHEDULE_HOUR] = d.backupScheduleHour
+        this[Keys.BACKUP_SCHEDULE_MINUTE] = d.backupScheduleMinute
+        this[Keys.BACKUP_SYNC_INDEX_RESTORED] = d.backupSyncIndexRestored
     }
 }

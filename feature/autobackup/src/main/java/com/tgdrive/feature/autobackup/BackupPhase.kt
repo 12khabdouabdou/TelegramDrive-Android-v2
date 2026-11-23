@@ -39,6 +39,11 @@ sealed class BackupPhase {
         val fileName: String?,
         val bytesSent: Long,
         val bytesTotal: Long,
+        val totalBytesUploaded: Long = 0L,
+        val totalBytesAll: Long = 0L,
+        val speedBytesPerSec: Long = 0L,
+        val etaSeconds: Long = -1L,
+        val currentLocalUri: String? = null,
     ) : BackupPhase()
 
     /** Writing the final sync_log row and cleaning up staging. */

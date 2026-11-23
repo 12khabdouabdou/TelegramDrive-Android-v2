@@ -2,6 +2,7 @@ package com.tgdrive.feature.autobackup
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,15 +18,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -43,15 +49,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
+import com.tgdrive.designsystem.editorial.EditorialSwitchRow
 import com.tgdrive.designsystem.editorial.SuccessCallout
 import com.tgdrive.designsystem.theme.TgTypography
 
@@ -157,7 +166,16 @@ fun FreeUpSpaceScreen(
                         state.freedBytes.toHumanSize(),
                         state.freedCount,
                     ),
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            }
+
+            if (state.skippedModifiedCount > 0) {
+                Text(
+                    text = stringResource(R.string.free_up_space_skipped_modified, state.skippedModifiedCount),
+                    style = TgTypography.Caption,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             }
 
@@ -168,6 +186,68 @@ fun FreeUpSpaceScreen(
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 )
+            }
+
+            // Age & media filters (always shown once scanned if any local backed-up files exist)
+            if (!state.scanning && state.allItems.isNotEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = state.ageFilter == FreeUpAgeFilter.ALL,
+                            onClick = { vm.setAgeFilter(FreeUpAgeFilter.ALL) },
+                            label = { Text(stringResource(R.string.free_up_filter_all_ages)) },
+                        )
+                        FilterChip(
+                            selected = state.ageFilter == FreeUpAgeFilter.OLDER_7_DAYS,
+                            onClick = { vm.setAgeFilter(FreeUpAgeFilter.OLDER_7_DAYS) },
+                            label = { Text(stringResource(R.string.free_up_filter_7d)) },
+                        )
+                        FilterChip(
+                            selected = state.ageFilter == FreeUpAgeFilter.OLDER_30_DAYS,
+                            onClick = { vm.setAgeFilter(FreeUpAgeFilter.OLDER_30_DAYS) },
+                            label = { Text(stringResource(R.string.free_up_filter_30d)) },
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = state.mediaFilter == FreeUpMediaFilter.ALL,
+                            onClick = { vm.setMediaFilter(FreeUpMediaFilter.ALL) },
+                            label = { Text(stringResource(R.string.free_up_media_all)) },
+                        )
+                        FilterChip(
+                            selected = state.mediaFilter == FreeUpMediaFilter.PHOTOS,
+                            onClick = { vm.setMediaFilter(FreeUpMediaFilter.PHOTOS) },
+                            label = { Text(stringResource(R.string.free_up_media_photos)) },
+                        )
+                        FilterChip(
+                            selected = state.mediaFilter == FreeUpMediaFilter.VIDEOS,
+                            onClick = { vm.setMediaFilter(FreeUpMediaFilter.VIDEOS) },
+                            label = { Text(stringResource(R.string.free_up_media_videos)) },
+                        )
+                        FilterChip(
+                            selected = state.mediaFilter == FreeUpMediaFilter.OTHER,
+                            onClick = { vm.setMediaFilter(FreeUpMediaFilter.OTHER) },
+                            label = { Text(stringResource(R.string.free_up_media_other)) },
+                        )
+                    }
+                    EditorialSwitchRow(
+                        icon = Icons.Filled.Fingerprint,
+                        iconTint = MaterialTheme.colorScheme.tertiary,
+                        title = stringResource(R.string.free_up_verify_sha_title),
+                        description = stringResource(R.string.free_up_verify_sha_desc),
+                        checked = state.verifyShaBeforeDelete,
+                        onChange = vm::setVerifyShaBeforeDelete,
+                    )
+                }
             }
 
             when {
@@ -206,10 +286,10 @@ fun FreeUpSpaceScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 10.dp)
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
                             .clip(RoundedCornerShape(16.dp))
                             .background(MaterialTheme.colorScheme.surfaceContainer)
-                            .padding(16.dp),
+                            .padding(14.dp),
                     ) {
                         Text(
                             text = stringResource(R.string.free_up_space_subtitle),
@@ -249,6 +329,29 @@ fun FreeUpSpaceScreen(
                                     checked = checked,
                                     onCheckedChange = { vm.toggleSelect(item.id) },
                                 )
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (!item.thumbnailUri.isNullOrBlank()) {
+                                        AsyncImage(
+                                            model = item.thumbnailUri,
+                                            contentDescription = item.displayName,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+                                    } else {
+                                        Icon(
+                                            Icons.Filled.InsertDriveFile,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                    }
+                                }
                                 Column(
                                     modifier = Modifier
                                         .weight(1f)
@@ -269,6 +372,24 @@ fun FreeUpSpaceScreen(
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
                                     )
+                                    if (item.verifiedInCloud) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.Verified,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.tertiary,
+                                                modifier = Modifier.size(12.dp),
+                                            )
+                                            Text(
+                                                text = stringResource(R.string.free_up_verified_cloud),
+                                                style = TgTypography.Caption,
+                                                color = MaterialTheme.colorScheme.tertiary,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }

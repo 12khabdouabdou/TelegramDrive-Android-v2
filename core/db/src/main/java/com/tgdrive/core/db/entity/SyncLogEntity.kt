@@ -26,4 +26,7 @@ data class SyncLogEntity(
     @ColumnInfo(name = "files_skipped") val filesSkipped: Int = 0,
     @ColumnInfo(name = "status") val status: String, // SUCCESS | FAILURE | PARTIAL | RUNNING
     @ColumnInfo(name = "error_message") val errorMessage: String? = null,
+    @ColumnInfo(name = "failed_count") val failedCount: Int = 0,
+    @ColumnInfo(name = "failed_details_json") val failedDetailsJson: String? = null,
+    @ColumnInfo(name = "bytes_uploaded") val bytesUploaded: Long = 0L,
 )

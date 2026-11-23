@@ -44,6 +44,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
@@ -216,16 +217,29 @@ private fun SyncLogRow(
                     )
                 }
             }
+            val baseSummary = stringResource(
+                R.string.backup_status_count,
+                entry.filesUploaded,
+                entry.filesSkipped,
+                entry.filesScanned,
+            )
+            val fullSummary = buildString {
+                append(baseSummary)
+                if (entry.failedCount > 0) {
+                    append(" · ")
+                    append(entry.failedCount)
+                    append(" failed")
+                }
+                if (entry.bytesUploaded > 0L) {
+                    append(" · ")
+                    append(entry.bytesUploaded.toHumanSize())
+                }
+            }
             Text(
-                text = stringResource(
-                    R.string.backup_status_count,
-                    entry.filesUploaded,
-                    entry.filesSkipped,
-                    entry.filesScanned,
-                ),
+                text = fullSummary,
                 style = TgTypography.Mono,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 2.dp),
             )

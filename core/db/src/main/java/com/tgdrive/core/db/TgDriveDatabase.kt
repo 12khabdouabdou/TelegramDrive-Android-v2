@@ -29,7 +29,7 @@ import com.tgdrive.core.db.entity.ZipEntryEntity
         AlbumEntity::class,
         AlbumItemEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 abstract class TgDriveDatabase : RoomDatabase() {

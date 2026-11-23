@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.tgdrive.core.db.entity.SyncedFileEntity
+import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface SyncedFileDao {
@@ -46,6 +47,16 @@ interface SyncedFileDao {
      *  to clean up synced records whose local file has been deleted. */
     @Query("DELETE FROM synced_files WHERE local_path = :path")
     suspend fun deleteByPath(path: String): Int
+
+    @Query("""
+        DELETE FROM synced_files
+        WHERE local_path = :path
+          AND CASE WHEN :folderId = -1 THEN folder_id IS NULL ELSE folder_id = :folderId END
+    """)
+    suspend fun deleteByPathAndFolder(path: String, folderId: Long): Int
+
+    @Query("SELECT * FROM synced_files ORDER BY synced_at DESC")
+    fun observeAll(): Flow<List<SyncedFileEntity>>
 
     @Query("DELETE FROM synced_files")
     suspend fun clear()

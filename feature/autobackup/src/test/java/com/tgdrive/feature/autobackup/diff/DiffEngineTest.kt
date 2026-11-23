@@ -136,4 +136,48 @@ class DiffEngineTest {
         val r = DiffEngine().compute(local, emptyList())
         assertThat(r.toUpload).hasSize(10_000)
     }
+
+    @Test
+    fun `non-strict mode detects same-size file modification via lastModified`() = runTest {
+        val local = listOf(
+            LocalFile("/a/edited.txt", "edited.txt", 500, lastModified = 20_000L, "text/plain"),
+            LocalFile("/a/legacy.txt", "legacy.txt", 500, lastModified = 20_000L, "text/plain"),
+            LocalFile("/a/unchanged.txt", "unchanged.txt", 500, lastModified = 10_500L, "text/plain"),
+        )
+        val already = listOf(
+            SyncedFileEntity(
+                localPath = "/a/edited.txt",
+                telegramMessageId = 1,
+                sha256 = null,
+                size = 500,
+                syncedAt = 0,
+                folderId = 1,
+                lastModified = 10_000L,
+            ),
+            // Legacy v6 row has lastModified=0 -> must skip cleanly without re-upload storm
+            SyncedFileEntity(
+                localPath = "/a/legacy.txt",
+                telegramMessageId = 2,
+                sha256 = null,
+                size = 500,
+                syncedAt = 0,
+                folderId = 1,
+                lastModified = 0L,
+            ),
+            // Within 2s FAT/SAF rounding tolerance -> skip
+            SyncedFileEntity(
+                localPath = "/a/unchanged.txt",
+                telegramMessageId = 3,
+                sha256 = null,
+                size = 500,
+                syncedAt = 0,
+                folderId = 1,
+                lastModified = 10_000L,
+            ),
+        )
+
+        val r = DiffEngine().compute(local, already, strict = false)
+        assertThat(r.toUpload.map { it.name }).containsExactly("edited.txt")
+        assertThat(r.toSkip.map { it.name }).containsExactly("legacy.txt", "unchanged.txt")
+    }
 }

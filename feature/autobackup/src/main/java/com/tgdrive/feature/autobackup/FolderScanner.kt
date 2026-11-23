@@ -2,43 +2,35 @@ package com.tgdrive.feature.autobackup
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import com.tgdrive.core.common.Log
 import com.tgdrive.feature.autobackup.diff.LocalFile
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/** Detailed result of scanning one SAF folder tree. */
+data class FolderScanResult(
+    val files: List<LocalFile>,
+    val folderName: String = "",
+    val permissionLost: Boolean = false,
+    val scanError: String? = null,
+    val hitLimit: Boolean = false,
+)
+
 /**
- * Walks SAF (Storage Access Framework) document trees to enumerate files
- * that need to be backed up.
+ * Walks SAF (Storage Access Framework) document trees using a batched
+ * `DocumentsContract` child cursor projection (one query per directory) so
+ * large folders scan dramatically faster than per-file `DocumentFile` wrappers.
  *
- * ## Critical performance notes
- *
- * SAF operations (`listFiles()`, `isDirectory`, `isFile`, `name`, `length()`,
- * `lastModified()`, `type`) are ALL blocking IPC calls to the SAF provider
- * (usually a separate process). For a folder with 5,000 files, that's
- * 25,000+ cross-process round-trips. On a slow device, this can take
- * 5–10 minutes.
- *
- * To prevent the UI from freezing:
- *
- * 1. The entire scan runs on [Dispatchers.IO] via [withContext], so the
- *    blocking IPC calls don't starve the Default dispatcher.
- * 2. We call [yield] every [YIELD_INTERVAL] files. Unlike `ensureActive()`,
- *    `yield` actually SUSPENDS — letting the UI thread collect StateFlow
- *    updates and show progress.
- * 3. A [onProgress] callback fires every [YIELD_INTERVAL] files so the
- *    orchestrator can update the [BackupPhase.Scanning] phase with the
- *    current file count.
- *
- * ## Cancellation
- *
- * `yield` also checks for cancellation, so the scan exits within ~50ms of
- * the user tapping Cancel.
+ * Also checks persisted URI read permissions up front so permission revocation
+ * reports [FolderScanResult.permissionLost] = true instead of silently returning
+ * an empty file list and triggering stale-row deletion.
  */
 @Singleton
 class FolderScanner @Inject constructor(
@@ -48,41 +40,72 @@ class FolderScanner @Inject constructor(
         const val MAX_DEPTH = 15
         const val MAX_FILES = 50_000
         const val YIELD_INTERVAL = 50
+
+        private val CHILD_PROJECTION = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
     }
 
-    /**
-     * Walk [folderUri] recursively and return all readable files.
-     *
-     * @param onProgress Called every [YIELD_INTERVAL] files with the current
-     *   file count and folder index. The caller can use this to update the
-     *   UI phase so the user sees activity during a long scan.
-     */
     suspend fun scan(
         folderUri: String,
         onProgress: (filesFound: Int) -> Unit = {},
-    ): List<LocalFile> = withContext(Dispatchers.IO) {
+    ): List<LocalFile> = scanDetailed(folderUri, emptyList(), onProgress).files
+
+    suspend fun scanDetailed(
+        folderUri: String,
+        excludePatterns: List<String> = emptyList(),
+        onProgress: (filesFound: Int) -> Unit = {},
+    ): FolderScanResult = withContext(Dispatchers.IO) {
         Log.i("FolderScanner: scanning '$folderUri'")
-        val uri = try { Uri.parse(folderUri) } catch (t: Throwable) {
-            Log.w("FolderScanner: failed to parse URI", t)
-            return@withContext emptyList()
+        val uri = runCatching { Uri.parse(folderUri) }.getOrNull() ?: return@withContext FolderScanResult(
+            files = emptyList(),
+            scanError = "Invalid folder URI",
+        )
+
+        val persisted = runCatching {
+            ctx.contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+        }.getOrDefault(true)
+        if (!persisted) {
+            Log.w("FolderScanner: persisted read permission missing for $folderUri")
+            return@withContext FolderScanResult(
+                files = emptyList(),
+                permissionLost = true,
+                scanError = "Folder permission lost",
+            )
         }
 
-        val root = try {
+        val rootDoc = try {
             DocumentFile.fromTreeUri(ctx, uri)
+        } catch (se: SecurityException) {
+            Log.w("FolderScanner: security exception opening $folderUri", se)
+            return@withContext FolderScanResult(
+                files = emptyList(),
+                permissionLost = true,
+                scanError = "Folder permission lost",
+            )
         } catch (t: Throwable) {
-            Log.w("FolderScanner: fromTreeUri threw", t)
-            return@withContext emptyList()
-        } ?: run {
-            Log.w("FolderScanner: fromTreeUri returned null")
-            return@withContext emptyList()
+            Log.w("FolderScanner: fromTreeUri threw for $folderUri", t)
+            return@withContext FolderScanResult(
+                files = emptyList(),
+                scanError = t.message ?: "Failed to open folder",
+            )
         }
-        if (!root.isDirectory) {
-            Log.w("FolderScanner: root is not a directory")
-            return@withContext emptyList()
-        }
-        if (!root.canRead()) {
-            Log.w("FolderScanner: root is not readable (permission revoked?)")
-            return@withContext emptyList()
+
+        val folderName = rootDoc?.name
+            ?: Uri.decode(folderUri).substringAfterLast(':').substringAfterLast('/').ifBlank { "Backup" }
+
+        if (rootDoc == null || !rootDoc.exists() || !rootDoc.isDirectory || !rootDoc.canRead()) {
+            Log.w("FolderScanner: root unreadable for $folderUri (permission revoked?)")
+            return@withContext FolderScanResult(
+                files = emptyList(),
+                folderName = folderName,
+                permissionLost = true,
+                scanError = "Folder unreadable or permission lost",
+            )
         }
 
         val results = ArrayList<LocalFile>(256)
@@ -91,40 +114,149 @@ class FolderScanner @Inject constructor(
         var skippedCount = 0
         var errorCount = 0
         var hitLimit = false
+        var scanError: String? = null
+        var permissionLost = false
 
-        suspend fun walk(dir: DocumentFile, depth: Int) {
+        suspend fun walkWithCursor(treeUri: Uri, docId: String, relPath: String, depth: Int): Boolean {
+            if (depth > MAX_DEPTH) return true
+            if (results.size >= MAX_FILES) {
+                hitLimit = true
+                return true
+            }
+
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            val subDirs = ArrayList<Pair<String, String>>()
+            val cursor = try {
+                ctx.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
+            } catch (se: SecurityException) {
+                if (depth == 0) {
+                    permissionLost = true
+                    scanError = "Folder permission lost"
+                } else {
+                    errorCount++
+                }
+                return true
+            } catch (t: Throwable) {
+                Log.w("FolderScanner: cursor query failed at depth $depth", t)
+                if (depth == 0) scanError = t.message ?: "Cursor query failed"
+                return false
+            } ?: return false
+
+            cursor.use { c ->
+                val idxId = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val idxName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val idxMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val idxSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val idxMtime = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+
+                while (c.moveToNext()) {
+                    if (fileCount % YIELD_INTERVAL == 0) {
+                        yield()
+                        onProgress(results.size)
+                    }
+                    if (results.size >= MAX_FILES) {
+                        hitLimit = true
+                        return true
+                    }
+
+                    val childId = if (idxId >= 0) c.getString(idxId) else null
+                    val name = if (idxName >= 0) c.getString(idxName) else null
+                    val mime = (if (idxMime >= 0) c.getString(idxMime) else null) ?: "application/octet-stream"
+                    if (childId.isNullOrBlank() || name.isNullOrBlank()) continue
+
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        if (ExcludePatternMatcher.matchesDirectory(name, excludePatterns)) {
+                            continue
+                        }
+                        dirCount++
+                        val childRel = if (relPath.isEmpty()) name else "$relPath/$name"
+                        subDirs.add(childId to childRel)
+                    } else {
+                        fileCount++
+                        val size = if (idxSize >= 0 && !c.isNull(idxSize)) c.getLong(idxSize) else -1L
+                        if (size <= 0L) {
+                            skippedCount++
+                            continue
+                        }
+                        if (ExcludePatternMatcher.matchesPath(relPath, name, excludePatterns)) {
+                            skippedCount++
+                            continue
+                        }
+                        val lastModified = if (idxMtime >= 0 && !c.isNull(idxMtime)) c.getLong(idxMtime) else 0L
+                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        results.add(
+                            LocalFile(
+                                absolutePath = docUri.toString(),
+                                name = name,
+                                size = size,
+                                lastModified = lastModified,
+                                mimeType = mime,
+                                sha256 = null,
+                                relativePath = relPath,
+                            ),
+                        )
+                    }
+                }
+            }
+
+            for ((subId, subRel) in subDirs) {
+                if (results.size >= MAX_FILES) {
+                    hitLimit = true
+                    break
+                }
+                walkWithCursor(treeUri, subId, subRel, depth + 1)
+            }
+            return true
+        }
+
+        suspend fun walkFallbackDocumentFile(dir: DocumentFile, relPath: String, depth: Int) {
             if (depth > MAX_DEPTH) return
-            if (results.size >= MAX_FILES) { hitLimit = true; return }
-
+            if (results.size >= MAX_FILES) {
+                hitLimit = true
+                return
+            }
             val children = try {
                 dir.listFiles()
+            } catch (se: SecurityException) {
+                if (depth == 0) {
+                    permissionLost = true
+                    scanError = "Folder permission lost"
+                }
+                return
             } catch (t: Throwable) {
                 Log.w("FolderScanner: listFiles failed at depth $depth", t)
+                if (depth == 0) scanError = t.message ?: "Scan failed"
                 return
             }
 
             for (child in children) {
-                // Cooperative cancellation + yield: `yield()` both checks
-                // for cancellation AND suspends, letting the UI thread
-                // collect StateFlow updates. `ensureActive()` does NOT
-                // suspend — it only checks cancellation — which is why
-                // the old code froze the UI.
                 if (fileCount % YIELD_INTERVAL == 0) {
                     yield()
                     onProgress(results.size)
                 }
-
-                if (results.size >= MAX_FILES) { hitLimit = true; return }
-
+                if (results.size >= MAX_FILES) {
+                    hitLimit = true
+                    return
+                }
                 try {
                     if (child.isDirectory) {
+                        val subName = child.name ?: continue
+                        if (ExcludePatternMatcher.matchesDirectory(subName, excludePatterns)) continue
                         dirCount++
-                        walk(child, depth + 1)
+                        val childRel = if (relPath.isEmpty()) subName else "$relPath/$subName"
+                        walkFallbackDocumentFile(child, childRel, depth + 1)
                     } else if (child.isFile) {
                         fileCount++
                         val name = child.name ?: continue
                         val size = child.length()
-                        if (size <= 0) { skippedCount++; continue }
+                        if (size <= 0L) {
+                            skippedCount++
+                            continue
+                        }
+                        if (ExcludePatternMatcher.matchesPath(relPath, name, excludePatterns)) {
+                            skippedCount++
+                            continue
+                        }
                         results.add(
                             LocalFile(
                                 absolutePath = child.uri.toString(),
@@ -133,31 +265,50 @@ class FolderScanner @Inject constructor(
                                 lastModified = child.lastModified(),
                                 mimeType = child.type ?: "application/octet-stream",
                                 sha256 = null,
-                            )
+                                relativePath = relPath,
+                            ),
                         )
                     }
-                } catch (t: Throwable) {
+                } catch (_: Throwable) {
                     errorCount++
                 }
             }
         }
 
         try {
-            walk(root, 0)
-        } catch (t: kotlinx.coroutines.CancellationException) {
+            val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
+            val cursorWorked = rootDocId != null && walkWithCursor(uri, rootDocId, "", 0)
+            if (!cursorWorked && !permissionLost) {
+                results.clear()
+                dirCount = 0
+                fileCount = 0
+                skippedCount = 0
+                walkFallbackDocumentFile(rootDoc, "", 0)
+            }
+        } catch (t: CancellationException) {
             Log.i("FolderScanner: scan cancelled after ${results.size} files")
             throw t
         } catch (t: OutOfMemoryError) {
             Log.w("FolderScanner: OOM during walk — returning ${results.size} files scanned so far", t)
         } catch (t: Throwable) {
             Log.w("FolderScanner: walk failed", t)
+            if (scanError == null) scanError = t.message ?: "Walk failed"
         }
 
         if (hitLimit) {
             Log.w("FolderScanner: hit MAX_FILES limit ($MAX_FILES) — further files ignored.")
         }
 
-        Log.i("FolderScanner: scan complete — $fileCount files, $dirCount dirs, ${results.size} recorded, $skippedCount skipped, $errorCount errors")
-        results
+        Log.i(
+            "FolderScanner: scan complete — $fileCount files, $dirCount dirs, " +
+                "${results.size} recorded, $skippedCount skipped, $errorCount errors",
+        )
+        FolderScanResult(
+            files = results,
+            folderName = folderName,
+            permissionLost = permissionLost,
+            scanError = scanError,
+            hitLimit = hitLimit,
+        )
     }
 }

@@ -17,6 +17,7 @@ import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.feature.autobackup.BackupScheduler
+import com.tgdrive.feature.autobackup.ScheduledUploadScheduler
 import com.tgdrive.feature.autobackup.watcher.FolderWatcher
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
@@ -40,6 +41,7 @@ class TelegramDriveApp :
     @Inject lateinit var preferences: AppPreferences
     @Inject lateinit var folderWatcher: FolderWatcher
     @Inject lateinit var backupScheduler: BackupScheduler
+    @Inject lateinit var scheduledUploadScheduler: ScheduledUploadScheduler
     @Inject lateinit var syncLogDao: SyncLogDao
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -128,35 +130,32 @@ class TelegramDriveApp :
             }
         }
 
-        // Task 3: Start FolderWatcher for ON_CHANGE backup mode + reschedule
-        // periodic work. Independent of TDLib.
+        // Task 3: Register FolderWatcher callback unconditionally + reschedule
+        // periodic & on-change work so UI toggles take effect immediately.
+        registerFolderWatcherCallback()
         appScope.launch {
-            try {
-                val prefs = preferences.data.first()
-                if (prefs.backupEnabled && !prefs.backupPaused &&
-                    prefs.backupSchedule == BackupSchedule.ON_CHANGE) {
-                    startFolderWatcher()
-                }
-            } catch (t: Throwable) {
-                Log.w("TelegramDriveApp: FolderWatcher start failed", t)
-            }
-
             try {
                 backupScheduler.rescheduleIfEnabled()
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: rescheduleIfEnabled failed", t)
             }
+            try {
+                scheduledUploadScheduler.rescheduleIfEnabled()
+            } catch (t: Throwable) {
+                Log.w("TelegramDriveApp: scheduledUploadScheduler failed", t)
+            }
         }
     }
 
     /** Wire up FolderWatcher's onChange callback to enqueue an on-change backup. */
-    private fun startFolderWatcher() {
+    private fun registerFolderWatcherCallback() {
         folderWatcher.onChange {
             appScope.launch {
                 try {
                     val prefs = preferences.data.first()
                     if (prefs.backupEnabled && !prefs.backupPaused &&
-                        prefs.backupSchedule == BackupSchedule.ON_CHANGE) {
+                        prefs.backupSchedule == BackupSchedule.ON_CHANGE
+                    ) {
                         Log.i("TelegramDriveApp: ON_CHANGE trigger → enqueuing backup")
                         backupScheduler.enqueueOnChange()
                     }
@@ -165,8 +164,6 @@ class TelegramDriveApp :
                 }
             }
         }
-        folderWatcher.start()
-        Log.i("TelegramDriveApp: FolderWatcher started (ON_CHANGE mode)")
     }
 
     override fun newImageLoader(): ImageLoader =

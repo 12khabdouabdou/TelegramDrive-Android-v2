@@ -57,12 +57,25 @@ class BackupWorker @AssistedInject constructor(
         const val KEY_PROGRESS_TOTAL = "total"
         const val KEY_JOB_ID = "job_id"
         const val KEY_IS_MANUAL = "is_manual"
+        const val KEY_RETRY_PATHS = "retry_paths"
+        const val KEY_OVERRIDE_FOLDER_URI = "override_folder_uri"
+        const val KEY_OVERRIDE_TARGET_ID = "override_target_id"
     }
 
     override suspend fun doWork(): Result {
         val jobId = inputData.getString(KEY_JOB_ID) ?: java.util.UUID.randomUUID().toString()
-        val effectiveJobId = if (jobId == "periodic") "periodic_${System.currentTimeMillis()}" else jobId
+        val effectiveJobId = when (jobId) {
+            "periodic" -> "periodic_${System.currentTimeMillis()}"
+            "scheduled" -> "scheduled_${System.currentTimeMillis()}"
+            else -> jobId
+        }
         val isManual = inputData.getBoolean(KEY_IS_MANUAL, false)
+        val retryPaths = inputData.getStringArray(KEY_RETRY_PATHS)?.toSet()?.takeIf { it.isNotEmpty() }
+        val overrideFolderUris = inputData.getString(KEY_OVERRIDE_FOLDER_URI)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { listOf(it) }
+        val rawTarget = inputData.getLong(KEY_OVERRIDE_TARGET_ID, Long.MIN_VALUE)
+        val overrideTargetId = rawTarget.takeIf { it != Long.MIN_VALUE }
 
         Log.i("BackupWorker: starting $effectiveJobId (manual=$isManual, runAttemptCount=$runAttemptCount)")
 
@@ -84,15 +97,18 @@ class BackupWorker @AssistedInject constructor(
             val outcome = orchestrator.runBackup(
                 jobId = effectiveJobId,
                 isManual = isManual,
-                setForeground = { jId, count, total ->
+                onlyLocalPaths = retryPaths,
+                overrideFolderUris = overrideFolderUris,
+                overrideTargetFolderId = overrideTargetId,
+                setForeground = { jId, count, total, subText ->
                     // CRITICAL: Re-throw CancellationException — never swallow.
                     try {
-                        setForeground(notifier.buildForegroundInfo(jId, count, total))
+                        setForeground(notifier.buildForegroundInfo(jId, count, total, subText))
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (t: Throwable) {
                         Log.w("BackupWorker: setForeground failed", t)
-                        throw t  // Re-throw so the orchestrator can abort with a clear error.
+                        throw t // Re-throw so the orchestrator can degrade gracefully.
                     }
                 },
             )
@@ -114,8 +130,8 @@ class BackupWorker @AssistedInject constructor(
                     Result.success(workDataOf(KEY_JOB_ID to effectiveJobId))
                 }
                 is BackupOrchestrator.RunOutcome.Failed -> {
-                    Log.w("BackupWorker: $effectiveJobId FAILED — ${outcome.message}")
-                    if (runAttemptCount < 3) {
+                    Log.w("BackupWorker: $effectiveJobId FAILED — ${outcome.message} (retryable=${outcome.retryable})")
+                    if (outcome.retryable && runAttemptCount < 3) {
                         Result.retry()
                     } else {
                         try {

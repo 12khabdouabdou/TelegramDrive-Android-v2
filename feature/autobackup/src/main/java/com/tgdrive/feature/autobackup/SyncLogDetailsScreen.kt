@@ -20,12 +20,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -33,6 +36,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -44,15 +48,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.designsystem.editorial.EditorialCard
+import com.tgdrive.designsystem.editorial.SectionLabel
 import com.tgdrive.designsystem.theme.TgTypography
 
 private val DetailsAmber = Color(0xFFF5A623)
 
 /**
- * Detailed view of a single [SyncLogEntity] run pushed over [RootNavHost].
+ * Detailed view of a single [SyncLogEntity] run pushed over [RootNavHost],
+ * including exact uploaded byte totals, per-file failures, and one-tap retry.
  */
 @Composable
 fun SyncLogDetailsScreen(
@@ -114,14 +121,23 @@ fun SyncLogDetailsScreen(
                 }
             }
             else -> {
-                SyncLogDetails(entry = entry)
+                SyncLogDetails(
+                    entry = entry,
+                    onRetryPaths = { paths ->
+                        vm.retryFailed(paths)
+                        onBack()
+                    },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun SyncLogDetails(entry: SyncLogEntity) {
+private fun SyncLogDetails(
+    entry: SyncLogEntity,
+    onRetryPaths: (List<String>) -> Unit,
+) {
     val (statusTint, statusIcon, statusLabel) = when (entry.status) {
         "SUCCESS" -> Triple(
             MaterialTheme.colorScheme.secondary,
@@ -159,7 +175,18 @@ private fun SyncLogDetails(entry: SyncLogEntity) {
         }
     }
 
-    val failed = (entry.filesScanned - entry.filesUploaded - entry.filesSkipped).coerceAtLeast(0)
+    val failedDetails = remember(entry.failedDetailsJson) {
+        BackupFailureRecord.decode(entry.failedDetailsJson)
+    }
+    val failedCount = when {
+        entry.failedCount > 0 -> entry.failedCount
+        failedDetails.isNotEmpty() -> failedDetails.size
+        entry.status == "PARTIAL" -> (entry.filesScanned - entry.filesUploaded - entry.filesSkipped).coerceAtLeast(0)
+        else -> 0
+    }
+    val retryablePaths = remember(failedDetails) {
+        failedDetails.map { it.localPath }.filter { it.startsWith("content://") }
+    }
 
     Column(
         modifier = Modifier
@@ -232,13 +259,20 @@ private fun SyncLogDetails(entry: SyncLogEntity) {
                     label = stringResource(R.string.backup_files_uploaded),
                     value = "${entry.filesUploaded}",
                 )
+                if (entry.bytesUploaded > 0L) {
+                    DetailRow(
+                        icon = Icons.Filled.CloudDone,
+                        label = stringResource(R.string.backup_bytes_uploaded_label),
+                        value = entry.bytesUploaded.toHumanSize(),
+                    )
+                }
                 DetailRow(
                     icon = Icons.Filled.SkipNext,
                     label = stringResource(R.string.backup_files_skipped),
                     value = "${entry.filesSkipped}",
                 )
-                if (failed > 0 || entry.status == "FAILURE") {
-                    val failedDisplay = if (failed > 0) "$failed" else "1+"
+                if (failedCount > 0 || entry.status == "FAILURE") {
+                    val failedDisplay = if (failedCount > 0) "$failedCount" else "1+"
                     DetailRow(
                         icon = Icons.Filled.Error,
                         label = stringResource(R.string.backup_files_failed),
@@ -269,6 +303,45 @@ private fun SyncLogDetails(entry: SyncLogEntity) {
                         style = TgTypography.Mono,
                         color = MaterialTheme.colorScheme.onErrorContainer,
                     )
+                }
+            }
+        }
+
+        if (failedDetails.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                SectionLabel(text = stringResource(R.string.backup_failed_files_title))
+                EditorialCard {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        failedDetails.forEach { rec ->
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = rec.fileName,
+                                    style = TgTypography.Display.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = rec.reason,
+                                    style = TgTypography.Caption,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                        if (retryablePaths.isNotEmpty()) {
+                            Button(
+                                onClick = { onRetryPaths(retryablePaths) },
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            ) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null)
+                                Text(" " + stringResource(R.string.backup_retry_failed_action, retryablePaths.size))
+                            }
+                        }
+                    }
                 }
             }
         }

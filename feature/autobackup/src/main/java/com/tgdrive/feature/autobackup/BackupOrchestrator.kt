@@ -1,8 +1,20 @@
 package com.tgdrive.feature.autobackup
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
+import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.datastore.AppPreferences
+import com.tgdrive.core.datastore.AppPreferencesData
+import com.tgdrive.core.datastore.BackupMediaFilter
+import com.tgdrive.core.datastore.BackupUploadOrder
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncLogDao
@@ -13,6 +25,7 @@ import com.tgdrive.core.db.entity.SyncedFileEntity
 import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.index.ZipIndexService
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.UploadedZipPartRecord
 import com.tgdrive.core.zip.ZipUploader
@@ -21,37 +34,33 @@ import com.tgdrive.feature.autobackup.diff.LocalFile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DisposableHandle
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.coroutineContext
 
 /**
- * Single source of truth for the AutoBackup pipeline.
- *
- * Both [BackupWorker.doWork] and (indirectly via the scheduler) the manual
- * "Run now" button end up here. The orchestrator owns:
- *
- *   1. Acquiring the [ActiveBackupRegistry] slot (mutual exclusion).
- *   2. The full pipeline: scan → diff → resolve target → upload → finalize.
- *   3. Publishing [BackupPhase] updates to the registry (so the UI sees
- *      live progress, even across ViewModel recreation).
- *   4. Honoring cancellation at every suspend point.
- *   5. Cleaning up staging files in a `finally` block — even on cancel/fail.
- *
- * The orchestrator is a Singleton so it survives across ViewModel
- * recreations. It does NOT hold any per-job state in fields — everything
- * is local to [runBackup], so concurrent invocations are safe (and the
- * registry will reject the second one anyway).
+ * Single source of truth for the AutoBackup pipeline:
+ * scan (fast DocumentsContract cursor + permission guard) -> smart filters ->
+ * diff (mtime + SHA-256 strict + reinstall cloud restore) -> resolve target ->
+ * ordered & pipelined staging/compression/encryption -> adaptive rate-limited upload ->
+ * finalize with per-file failure records & byte totals.
  */
 @Singleton
 class BackupOrchestrator @Inject constructor(
@@ -70,72 +79,49 @@ class BackupOrchestrator @Inject constructor(
     private val zipIndexService: ZipIndexService,
     private val cloudSyncManager: CloudSyncManager,
     private val mediaThumbnailCache: MediaThumbnailCache,
+    private val backupCrypto: BackupCrypto,
+    private val dispatchers: DispatchersProvider,
 ) {
 
-    /**
-     * Run one backup job.
-     *
-     * @param jobId Unique identifier (e.g. "manual_<timestamp>" or "periodic_<timestamp>").
-     * @param isManual true if triggered by the user (controls foreground-notif text).
-     * @param setForeground Callback the orchestrator invokes to promote the worker
-     *        to a foreground service. Required on Android 12+ for long-running
-     *        workers. The lambda receives (jobId, count, total) and the worker
-     *        calls `setForeground(notifier.buildForegroundInfo(...))`. If the
-     *        callback throws (e.g. notification permission denied), the
-     *        orchestrator logs and continues — the run still works, it's just
-     *        more likely to be killed by the OS.
-     * @return A [RunOutcome] describing the final state. The caller (Worker)
-     *         uses this to decide Result.success / Result.failure.
-     */
     suspend fun runBackup(
         jobId: String,
         isManual: Boolean,
-        setForeground: suspend (jobId: String, count: Int, total: Int) -> Unit = { _, _, _ -> },
+        onlyLocalPaths: Set<String>? = null,
+        overrideFolderUris: List<String>? = null,
+        overrideTargetFolderId: Long? = null,
+        setForeground: suspend (jobId: String, count: Int, total: Int, subText: String?) -> Unit = { _, _, _, _ -> },
     ): RunOutcome {
         val startedAt = System.currentTimeMillis()
 
-        // --- 1. Mutual exclusion: refuse if another run is active.
+        // --- 1. Mutual exclusion
         if (!registry.tryBegin(jobId, startedAt)) {
             Log.i("BackupOrchestrator: refusing to start $jobId — another run is active")
             return RunOutcome.Skipped("Another backup is already running")
         }
 
-        // --- 2. Persist sync_log row in RUNNING state up-front.
+        // --- 2. Persist sync_log row in RUNNING state
         try {
-            syncLogDao.upsert(SyncLogEntity(
-                jobId = jobId, startedAt = startedAt,
-                completedAt = null, status = "RUNNING",
-            ))
+            syncLogDao.upsert(
+                SyncLogEntity(
+                    jobId = jobId,
+                    startedAt = startedAt,
+                    completedAt = null,
+                    status = "RUNNING",
+                ),
+            )
         } catch (t: Throwable) {
             Log.w("BackupOrchestrator: failed to create sync log", t)
         }
 
-        // --- 2.5. CANCELLATION WATCHER: launch a background job that polls
-        // the registry for cancellation requests AND observes preferences
-        // for pause/disable. When either is detected, it cancels the parent
-        // coroutine's Job — which interrupts ANY suspend point, including
-        // the `sendConfirmation.await()` inside uploadFile.
-        //
-        // C5 FIX: Previously used GlobalScope.launch (process-scoped, leaks
-        // if finally is skipped). Now uses a CHILD scope of the current
-        // coroutine via coroutineScope, so it's automatically cancelled when
-        // runBackup returns. Also uses cancelAndJoin() in finally to ensure
-        // the watcher has fully stopped before runBackup returns.
-        //
-        // C6 FIX: Previously called preferences.data.first() every 500ms,
-        // creating ~7200 flow collections per hour. Now collects the flow
-        // ONCE and reacts to emissions — zero polling overhead.
+        // --- 2.5. Cancellation & Pause watcher on injected IO dispatcher
         val parentJob = coroutineContext[Job]
-        val watcherJob = kotlinx.coroutines.CoroutineScope(coroutineContext[Job]!! + kotlinx.coroutines.Dispatchers.IO).launch {
+        val watcherJob = CoroutineScope(parentJob!! + dispatchers.io).launch {
             try {
-                // Launch two watchers in parallel: one for the registry's
-                // cancelRequested StateFlow, one for the preferences Flow.
-                // Use launch + selectFirst-style joinAll to wait for either.
                 val cancelWatcher = launch {
                     registry.cancelRequested.collect { requestedId ->
                         if (requestedId == jobId) {
                             Log.i("BackupOrchestrator: watcher detected cancellation — cancelling parent job")
-                            parentJob?.cancel()
+                            parentJob.cancel()
                         }
                     }
                 }
@@ -144,162 +130,247 @@ class BackupOrchestrator @Inject constructor(
                         val shouldCancel = if (isManual) p.backupPaused else (!p.backupEnabled || p.backupPaused)
                         if (shouldCancel) {
                             Log.i("BackupOrchestrator: watcher detected pause/disable — cancelling parent job")
-                            parentJob?.cancel()
+                            parentJob.cancel()
                         }
                     }
                 }
                 cancelWatcher.join()
                 pauseWatcher.cancel()
-            } catch (e: CancellationException) {
-                // Watcher was cancelled (runBackup finished) — just exit.
+            } catch (_: CancellationException) {
             }
         }
 
-        // --- 3. Pre-run cleanup: purge staging files older than 1 hour.
+        // --- 3. Purge stale staging files older than 1 hour
         stagingManager.purgeStale()
 
-        // --- Per-run mutable state. We track these explicitly so we can
-        // --- finalize correctly even on cancellation/failure.
         var filesScanned = 0
         var filesToUpload = 0
         var filesUploaded = 0
         var filesSkipped = 0
-        var lastStagingPath: String? = null
+        var bytesUploadedTotal = 0L
+        val failures = ArrayList<BackupFailureRecord>()
 
         try {
-            val prefs = preferences.data.first()
-            if (!prefs.backupEnabled && !isManual) {
+            var prefs = preferences.data.first()
+            if (!prefs.backupEnabled && !isManual && overrideFolderUris == null) {
                 Log.i("BackupOrchestrator: disabled; skipping")
-                finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, "SUCCESS", null)
+                finalize(jobId, startedAt, 0, 0, 0, "SUCCESS", null)
                 registry.updatePhase(BackupPhase.Done(0, 0, 0, 0))
                 return RunOutcome.Success(uploaded = 0, skipped = 0, total = 0)
             }
             if (prefs.backupPaused && !isManual) {
                 Log.i("BackupOrchestrator: paused; skipping")
-                finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, "SUCCESS", null)
+                finalize(jobId, startedAt, 0, 0, 0, "SUCCESS", null)
                 registry.updatePhase(BackupPhase.Done(0, 0, 0, 0))
                 return RunOutcome.Skipped("Paused")
             }
-            if (prefs.backupFolderUris.isEmpty()) {
+
+            val folderUris = overrideFolderUris?.takeIf { it.isNotEmpty() } ?: prefs.backupFolderUris.toList()
+            if (folderUris.isEmpty()) {
                 val msg = "No folders selected"
                 finalize(jobId, startedAt, 0, 0, 0, "FAILURE", msg)
                 registry.updatePhase(BackupPhase.Failed(msg, 0, 0))
-                return RunOutcome.Failed(msg, 0, 0)
+                return RunOutcome.Failed(msg, 0, 0, retryable = false)
             }
 
-            // --- 3.5. Promote to foreground service IMMEDIATELY — before
-            // --- scanning. On Android 12+, background workers are killed
-            // --- after ~3 minutes without foreground priority.
-            // ---
-            // --- CRITICAL: If setForeground fails (e.g., POST_NOTIFICATIONS
-            // --- permission not granted on Android 13+), we ABORT with a
-            // --- clear error instead of continuing without foreground
-            // --- priority. Previously we continued, which led to the OS
-            // --- killing the worker mid-scan → hard crash.
+            // Battery & power-saver guard for automatic background runs
+            if (!isManual) {
+                val skipReason = checkBatterySkipReason(prefs.backupMinBatteryPercent)
+                if (skipReason != null) {
+                    Log.i("BackupOrchestrator: $skipReason")
+                    finalize(jobId, startedAt, 0, 0, 0, "SUCCESS", skipReason)
+                    registry.updatePhase(BackupPhase.Done(0, 0, 0, 0))
+                    return RunOutcome.Skipped(skipReason)
+                }
+            }
+
+            // Network & daily cellular quota guard
+            val isMetered = isNetworkMetered()
+            if (!isManual && isMetered && prefs.backupWifiOnly) {
+                val msg = "Waiting for Wi-Fi"
+                finalize(jobId, startedAt, 0, 0, 0, "SUCCESS", msg)
+                registry.updatePhase(BackupPhase.Done(0, 0, 0, 0))
+                return RunOutcome.Skipped(msg)
+            }
+
+            val todayKey = runCatching { LocalDate.now().toString() }.getOrDefault("")
+            var usedCellularToday = if (prefs.backupCellularUsageDay == todayKey) {
+                prefs.backupCellularUsedBytes
+            } else {
+                0L
+            }
+            val cellularLimitBytes = if (isMetered && prefs.backupCellularDailyLimitMb > 0) {
+                prefs.backupCellularDailyLimitMb.toLong() * 1024L * 1024L
+            } else {
+                Long.MAX_VALUE
+            }
+            if (isMetered && prefs.backupCellularDailyLimitMb > 0 && usedCellularToday >= cellularLimitBytes) {
+                val msg = "Daily mobile data limit reached (${prefs.backupCellularDailyLimitMb} MB)"
+                finalize(jobId, startedAt, 0, 0, 0, "SUCCESS", msg)
+                registry.updatePhase(BackupPhase.Done(0, 0, 0, 0))
+                return RunOutcome.Skipped(msg)
+            }
+
+            // First-run / reinstall cloud metadata restore before diffing
+            if (!prefs.backupSyncIndexRestored) {
+                val existingCount = runCatching { syncedFileDao.grandTotal().fileCount }.getOrDefault(0)
+                if (existingCount == 0) {
+                    runCatching { cloudSyncManager.syncFromCloud() }
+                }
+                runCatching { preferences.update { it.copy(backupSyncIndexRestored = true) } }
+                prefs = preferences.data.first()
+            }
+
+            // Promote to foreground service immediately
             try {
-                setForeground(jobId, 0, 0)
-            } catch (e: kotlinx.coroutines.CancellationException) {
+                setForeground(jobId, 0, 0, null)
+            } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
-                // Background WorkManager runs on Android 12+ may hit
-                // ForegroundServiceStartNotAllowedException; degrade gracefully
-                // and let WorkManager run with standard background execution.
-                Log.w("BackupOrchestrator: setForeground unavailable (${t.javaClass.simpleName}) — continuing without foreground service", t)
+                Log.w("BackupOrchestrator: setForeground unavailable (${t.javaClass.simpleName}) — continuing", t)
             }
 
-            // --- 4. Scan
-            // CRITICAL: Pass a progress callback so the phase updates DURING
-            // the scan, not just between folders. Without this, a single
-            // large folder shows "Scanning folders 0/1" for minutes with
-            // no file count update — the user thinks the app is frozen.
-            //
-            // THROTTLING: The callback fires every 50 files from FolderScanner.
-            // If the scan finds files very fast (e.g., thousands of small
-            // files), this could mean dozens of StateFlow updates per second
-            // → dozens of Compose recompositions per second → main thread
-            // overloaded → app freeze. We throttle to at most one update per
-            // 200ms by tracking the last update timestamp.
-            registry.updatePhase(BackupPhase.Scanning(foldersDone = 0, foldersTotal = prefs.backupFolderUris.size, filesFound = 0))
+            // --- 4. Fast scan + permission guard
+            registry.updatePhase(BackupPhase.Scanning(0, folderUris.size, 0))
             val allLocal = mutableListOf<LocalFile>()
             val scannedByUri = LinkedHashMap<String, List<LocalFile>>()
-            val folderUris = prefs.backupFolderUris.toList()
+            val sourceUriByPath = HashMap<String, String>()
+            val folderNameByUri = HashMap<String, String>()
+            val scanProblemUris = HashSet<String>()
+            var permissionLostCount = 0
             val excludePatterns = ExcludePatternMatcher.parse(prefs.backupExcludePatterns)
             var lastProgressUpdateMs = 0L
-            var anyScanFailed = false
+
             for ((i, uri) in folderUris.withIndex()) {
                 ensureNotCancelled(jobId)
                 val folderIndex = i
                 try {
-                    val scanned = folderScanner.scan(uri) { filesFound ->
+                    val scanResult = folderScanner.scanDetailed(uri, excludePatterns) { filesFound ->
                         val now = System.currentTimeMillis()
-                        if (now - lastProgressUpdateMs >= 200) {
+                        if (now - lastProgressUpdateMs >= 200L) {
                             lastProgressUpdateMs = now
-                            registry.updatePhase(BackupPhase.Scanning(
-                                foldersDone = folderIndex,
-                                foldersTotal = folderUris.size,
-                                filesFound = filesFound,
-                            ))
+                            registry.updatePhase(
+                                BackupPhase.Scanning(
+                                    foldersDone = folderIndex,
+                                    foldersTotal = folderUris.size,
+                                    filesFound = filesFound,
+                                ),
+                            )
                         }
                     }
-                    val filteredScanned = if (excludePatterns.isEmpty()) {
-                        scanned
-                    } else {
-                        scanned.filterNot { file ->
-                            ExcludePatternMatcher.matches(file.name, excludePatterns)
-                        }
+                    folderNameByUri[uri] = scanResult.folderName.ifBlank { fallbackFolderName(uri) }
+                    if (scanResult.permissionLost) {
+                        permissionLostCount++
+                        scanProblemUris += uri
+                        failures += BackupFailureRecord(
+                            fileName = folderNameByUri[uri] ?: uri,
+                            localPath = uri,
+                            reason = "Folder permission lost — re-grant access",
+                            folderUri = uri,
+                        )
+                    } else if (scanResult.scanError != null) {
+                        scanProblemUris += uri
+                        failures += BackupFailureRecord(
+                            fileName = folderNameByUri[uri] ?: uri,
+                            localPath = uri,
+                            reason = scanResult.scanError,
+                            folderUri = uri,
+                        )
                     }
-                    scannedByUri[uri] = filteredScanned
-                    allLocal += filteredScanned
-                } catch (t: kotlinx.coroutines.CancellationException) {
-                    throw t
+
+                    val filtered = ArrayList<LocalFile>(scanResult.files.size)
+                    for (file in scanResult.files) {
+                        if (excludePatterns.isNotEmpty() &&
+                            ExcludePatternMatcher.matchesPath(file.relativePath, file.name, excludePatterns)
+                        ) {
+                            filesSkipped++
+                            continue
+                        }
+                        if (onlyLocalPaths != null && file.absolutePath !in onlyLocalPaths) {
+                            continue
+                        }
+                        if (!matchesBackupFilters(file, prefs, isMetered, isManual)) {
+                            filesSkipped++
+                            continue
+                        }
+                        filtered += file
+                        sourceUriByPath[file.absolutePath] = uri
+                    }
+                    scannedByUri[uri] = filtered
+                    allLocal += filtered
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (t: Throwable) {
-                    anyScanFailed = true
+                    scanProblemUris += uri
                     Log.w("BackupOrchestrator: scan failed for $uri", t)
                 }
-                registry.updatePhase(BackupPhase.Scanning(
-                    foldersDone = i + 1,
-                    foldersTotal = folderUris.size,
-                    filesFound = allLocal.size,
-                ))
+                registry.updatePhase(
+                    BackupPhase.Scanning(
+                        foldersDone = i + 1,
+                        foldersTotal = folderUris.size,
+                        filesFound = allLocal.size,
+                    ),
+                )
             }
             filesScanned = allLocal.size
-            Log.i("BackupOrchestrator: scanned $filesScanned files from ${folderUris.size} folder(s)")
+            Log.i("BackupOrchestrator: scanned $filesScanned files across ${folderUris.size} folder(s)")
+
+            if (permissionLostCount == folderUris.size && allLocal.isEmpty()) {
+                val msg = "Folder permission lost for all watched folders"
+                finalize(
+                    jobId, startedAt, 0, 0, filesSkipped, "FAILURE", msg,
+                    failedCount = failures.size,
+                    failedDetailsJson = BackupFailureRecord.encode(failures),
+                )
+                registry.updatePhase(BackupPhase.Failed(msg, 0, 0))
+                notifier.showResult(jobId, 0, filesSkipped, partial = false, failed = true, failedCount = failures.size)
+                return RunOutcome.Failed(msg, 0, 0, retryable = false)
+            }
 
             ensureNotCancelled(jobId)
 
-            // --- 5. Resolve per-folder target chat IDs BEFORE diffing.
+            // --- 5. Resolve per-folder Telegram targets BEFORE diffing
             val resolvedChatCache = mutableMapOf<Long, Long>()
             suspend fun resolveTargetCached(folderPrefId: Long): Long =
                 resolvedChatCache.getOrPut(folderPrefId) { resolveTargetChatId(folderPrefId) }
 
+            val defaultTargetPrefId = overrideTargetFolderId ?: prefs.backupTargetFolderId
             val defaultTargetChatId = try {
-                resolveTargetCached(prefs.backupTargetFolderId)
+                resolveTargetCached(defaultTargetPrefId)
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 val msg = "Cannot connect to Telegram: ${t.message}"
                 Log.w("BackupOrchestrator: resolveTargetChatId failed", t)
-                finalize(jobId, startedAt, filesScanned, 0, 0, "FAILURE", msg)
+                finalize(
+                    jobId, startedAt, filesScanned, 0, filesSkipped, "FAILURE", msg,
+                    failedCount = failures.size,
+                    failedDetailsJson = BackupFailureRecord.encode(failures),
+                )
                 registry.updatePhase(BackupPhase.Failed(msg, 0, 0))
-                return RunOutcome.Failed(msg, 0, 0)
+                return RunOutcome.Failed(msg, 0, 0, retryable = true)
             }
-            Log.i("BackupOrchestrator: default target chatId = $defaultTargetChatId")
 
             // --- 6. Diff (per target folder destination)
-            Log.i("BackupOrchestrator: starting diff — ${allLocal.size} local files, strict=${prefs.backupStrictMode}")
             registry.updatePhase(BackupPhase.Diffing(filesFound = filesScanned))
 
             val targetByPath = mutableMapOf<String, Pair<Long, Long?>>()
             val toUploadByUri = LinkedHashMap<String, List<LocalFile>>()
             val toUpload = mutableListOf<LocalFile>()
-            var totalSkippedCount = 0
+            var totalSkippedCount = filesSkipped
 
-            val urisByTargetPref = folderUris.groupBy { prefs.targetFolderFor(it) }
+            val urisByTargetPref = folderUris.groupBy { uri ->
+                overrideTargetFolderId ?: prefs.targetFolderFor(uri)
+            }
             try {
                 for ((targetPrefId, urisForTarget) in urisByTargetPref) {
                     val destChatId = resolveTargetCached(targetPrefId)
                     val queryFolderId = targetPrefId.takeIf { it > 0 } ?: -1L
-                    val already = syncedFileDao.forFolder(queryFolderId)
+                    val already = if (onlyLocalPaths != null) {
+                        emptyList()
+                    } else {
+                        syncedFileDao.forFolder(queryFolderId)
+                    }
                     val localForGroup = urisForTarget.flatMap { scannedByUri[it].orEmpty() }
                     val groupDiff = diffEngine.compute(
                         local = localForGroup,
@@ -309,235 +380,420 @@ class BackupOrchestrator @Inject constructor(
                     totalSkippedCount += groupDiff.toSkip.size
                     val uploadSet = groupDiff.toUpload.mapTo(HashSet()) { it.absolutePath }
                     for (uri in urisForTarget) {
-                        val uriUploads = scannedByUri[uri].orEmpty().filter { it.absolutePath in uploadSet }
-                        toUploadByUri[uri] = uriUploads
+                        toUploadByUri[uri] = scannedByUri[uri].orEmpty().filter { it.absolutePath in uploadSet }
                     }
                     val folderDbId = targetPrefId.takeIf { it > 0 }
                     for (item in groupDiff.toUpload) {
                         targetByPath[item.absolutePath] = destChatId to folderDbId
                         toUpload += item
                     }
-                    if (!anyScanFailed) {
+                    val canPruneStale = onlyLocalPaths == null && urisForTarget.none { it in scanProblemUris }
+                    if (canPruneStale) {
                         for (stalePath in groupDiff.staleRemotePaths) {
-                            runCatching { syncedFileDao.deleteByPath(stalePath) }
+                            runCatching { syncedFileDao.deleteByPathAndFolder(stalePath, queryFolderId) }
                         }
                     }
                 }
             } catch (t: CancellationException) {
-                Log.i("BackupOrchestrator: diff cancelled")
                 throw t
             } catch (t: Throwable) {
                 Log.e("BackupOrchestrator: diff failed", t)
                 val msg = "Diff failed: ${t.message ?: t.javaClass.simpleName}"
-                finalize(jobId, startedAt, filesScanned, 0, 0, "FAILURE", msg)
+                finalize(
+                    jobId, startedAt, filesScanned, 0, totalSkippedCount, "FAILURE", msg,
+                    failedCount = failures.size,
+                    failedDetailsJson = BackupFailureRecord.encode(failures),
+                )
                 registry.updatePhase(BackupPhase.Failed(msg, 0, 0))
-                return RunOutcome.Failed(msg, 0, 0)
+                return RunOutcome.Failed(msg, 0, 0, retryable = true)
             }
+
             filesSkipped = totalSkippedCount
-            filesToUpload = toUpload.size
-            Log.i("BackupOrchestrator: diff complete — ${toUpload.size} to upload, $filesSkipped to skip")
+
+            // Filter by upload order + check Telegram max upload size before staging
+            val maxTelegramBytes = runCatching { telegramClient.maxUploadSizeBytes() }
+                .getOrDefault(TelegramClient.MAX_FILE_SIZE_STANDARD)
+            val orderedToUpload = when (prefs.backupUploadOrder) {
+                BackupUploadOrder.NEWEST_FIRST -> toUpload.sortedByDescending { it.lastModified }
+                BackupUploadOrder.OLDEST_FIRST -> toUpload.sortedBy { it.lastModified }
+                BackupUploadOrder.SMALLEST_FIRST -> toUpload.sortedBy { it.size }
+            }
+            val eligibleToUpload = ArrayList<LocalFile>(orderedToUpload.size)
+            for (item in orderedToUpload) {
+                if (maxTelegramBytes > 0L && item.size > maxTelegramBytes) {
+                    failures += BackupFailureRecord(
+                        fileName = item.name,
+                        localPath = item.absolutePath,
+                        reason = "Exceeds Telegram limit (${maxTelegramBytes.toHumanSize()})",
+                        folderUri = sourceUriByPath[item.absolutePath].orEmpty(),
+                    )
+                } else {
+                    eligibleToUpload += item
+                }
+            }
+            filesToUpload = eligibleToUpload.size
 
             ensureNotCancelled(jobId)
 
-            if (toUpload.isEmpty()) {
+            if (eligibleToUpload.isEmpty() && failures.isEmpty()) {
                 Log.i("BackupOrchestrator: nothing to upload")
                 finalize(jobId, startedAt, filesScanned, 0, filesSkipped, "SUCCESS", null)
                 registry.updatePhase(BackupPhase.Done(0, 0, filesSkipped, 0))
                 return RunOutcome.Success(uploaded = 0, skipped = filesSkipped, total = 0)
             }
+            if (eligibleToUpload.isEmpty() && failures.isNotEmpty() && !prefs.backupZipFolders) {
+                val msg = failures.first().reason
+                finalize(
+                    jobId, startedAt, filesScanned, 0, filesSkipped, "FAILURE", msg,
+                    failedCount = failures.size,
+                    failedDetailsJson = BackupFailureRecord.encode(failures),
+                )
+                notifier.showResult(jobId, 0, filesSkipped, partial = false, failed = true, failedCount = failures.size)
+                registry.updatePhase(BackupPhase.Failed(msg, 0, failures.size))
+                return RunOutcome.Failed(msg, 0, failures.size, retryable = false)
+            }
 
-            // --- 6.5. ZIP mode: Option A standalone chunked ZIPs per folder
-            if (prefs.backupZipFolders) {
-                Log.i("BackupOrchestrator: zip mode enabled — uploading as Option A chunked ZIP archives")
+            // --- 6.5. ZIP mode
+            if (prefs.backupZipFolders && onlyLocalPaths == null) {
+                Log.i("BackupOrchestrator: zip mode enabled")
                 return runZipMode(
                     jobId = jobId,
                     startedAt = startedAt,
                     isManual = isManual,
                     prefs = prefs,
                     folderUris = folderUris,
+                    folderNameByUri = folderNameByUri,
                     scannedByUri = scannedByUri,
                     toUploadByUri = toUploadByUri,
                     resolveTargetCached = ::resolveTargetCached,
                     filesScanned = filesScanned,
                     filesSkipped = filesSkipped,
+                    initialFailures = failures,
                     setForeground = setForeground,
                 )
             }
 
-            // --- 7. Update the foreground notification with upload counts.
-            // --- (setForeground was already called in step 3.5 before scanning.
-            // --- Here we just update the progress text.)
+            // --- 7. Update foreground notification with total files
             try {
-                setForeground(jobId, 0, filesToUpload)
-            } catch (e: kotlinx.coroutines.CancellationException) {
+                setForeground(jobId, 0, filesToUpload, null)
+            } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Log.w("BackupOrchestrator: setForeground update failed", t)
             }
             try {
-                notifier.showForeground(jobId, 0, filesToUpload)
-            } catch (e: kotlinx.coroutines.CancellationException) {
+                notifier.showForeground(jobId, 0, filesToUpload, null)
+            } catch (e: CancellationException) {
                 throw e
-            } catch (t: Throwable) {
-                Log.w("BackupOrchestrator: showForeground failed", t)
+            } catch (_: Throwable) {}
+
+            // --- 8. Pipelined Upload Loop (newest/selected order + live speed/ETA + adaptive pacing + FLOOD_WAIT retry)
+            val totalBytesAll = eligibleToUpload.sumOf { it.size.coerceAtLeast(0L) }
+            val uploadLoopStartMs = System.currentTimeMillis()
+            var adaptiveDelayMs = 250L
+            var lastNotifMs = 0L
+            var cellularLimitHit = false
+            var abortedMidLoop = false
+            var prefetchedReadyPath: String? = null
+
+            fun stageOptionsFor(f: LocalFile): Pair<com.tgdrive.core.datastore.BackupQuality, Boolean> {
+                val srcUri = sourceUriByPath[f.absolutePath].orEmpty()
+                return prefs.backupQuality to prefs.isFolderEncrypted(srcUri)
             }
 
-            // --- 8. Upload loop
-            for ((i, file) in toUpload.withIndex()) {
-                ensureNotCancelled(jobId)
-
-                // Also honor pause/disable toggled mid-run.
-                val currentPrefs = preferences.data.first()
-                val shouldAbort = currentPrefs.backupPaused || (!isManual && !currentPrefs.backupEnabled)
-                if (shouldAbort) {
-                    Log.i("BackupOrchestrator: aborted mid-run (enabled=${currentPrefs.backupEnabled}, paused=${currentPrefs.backupPaused}, manual=$isManual)")
-                    finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, "CANCELLED", "Cancelled by user")
-                    registry.updatePhase(BackupPhase.Cancelled(filesUploaded, filesToUpload))
-                    notifier.showResult(jobId, filesUploaded, filesSkipped, partial = filesUploaded > 0, failed = false)
-                    return RunOutcome.Cancelled(filesUploaded, filesToUpload)
-                }
-
-                registry.updatePhase(BackupPhase.Uploading(
-                    current = i + 1, total = filesToUpload,
-                    fileName = file.name, bytesSent = 0, bytesTotal = file.size,
-                ))
-
-                try {
-                    val (fileTargetChatId, fileFolderDbId) =
-                        targetByPath[file.absolutePath] ?: (defaultTargetChatId to prefs.backupTargetFolderId.takeIf { it > 0 })
-                    val stagingPath = stagingManager.stage(file.absolutePath, file.name)
-                    if (stagingPath == null) {
-                        Log.w("BackupOrchestrator: failed to stage '${file.name}' — skipping")
-                        continue
-                    }
-                    lastStagingPath = stagingPath
-
-                    var lastUploadProgressMs = 0L
-                    val uploadResult = try {
-                        telegramClient.uploadFile(
-                            chatId = fileTargetChatId,
-                            localPath = stagingPath,
-                            fileName = file.name,
-                            mimeType = file.mimeType,
-                        ) { sent, total ->
-                            val now = System.currentTimeMillis()
-                            if (sent >= total || now - lastUploadProgressMs >= 200L) {
-                                lastUploadProgressMs = now
-                                registry.updatePhase(
-                                    BackupPhase.Uploading(
-                                        current = i + 1,
-                                        total = filesToUpload,
-                                        fileName = file.name,
-                                        bytesSent = sent,
-                                        bytesTotal = total.coerceAtLeast(file.size),
-                                    ),
-                                )
-                            }
+            coroutineScope {
+                var nextStageDeferred: Deferred<StagingManager.StageOutcome>? =
+                    if (eligibleToUpload.isNotEmpty()) {
+                        val first = eligibleToUpload[0]
+                        val (q, enc) = stageOptionsFor(first)
+                        async(dispatchers.io) {
+                            stagingManager.stageForUpload(first.absolutePath, first.name, first.mimeType, first.size, q, enc)
                         }
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        // DON'T delete the staging file — TDLib may still be
-                        // reading it. Leave it for purgeStale().
-                        lastStagingPath = null
-                        throw e
-                    } catch (t: Throwable) {
-                        // Upload failed — also don't delete, just in case
-                        // TDLib is still retrying internally.
-                        lastStagingPath = null
-                        throw t
-                    }
-
-                    val msgId = uploadResult.messageId
-                    val generatedThumb = try {
-                        mediaThumbnailCache.generateFromLocalFile(
-                            chatId = fileTargetChatId,
-                            messageId = msgId,
-                            localPath = stagingPath,
-                            mimeType = file.mimeType,
-                            fileName = file.name,
-                        )
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Throwable) {
+                    } else {
                         null
                     }
 
-                    // Upload succeeded — safe to delete the staging file.
-                    stagingManager.release(stagingPath)
-                    lastStagingPath = null
+                try {
+                    for ((i, file) in eligibleToUpload.withIndex()) {
+                        ensureNotCancelled(jobId)
 
-                    // Record in synced_files.
-                    syncedFileDao.upsert(SyncedFileEntity(
-                        localPath = file.absolutePath,
-                        telegramMessageId = msgId,
-                        sha256 = file.sha256,
-                        size = file.size,
-                        syncedAt = System.currentTimeMillis(),
-                        folderId = fileFolderDbId,
-                    ))
+                        val livePrefs = preferences.data.first()
+                        val shouldAbort = livePrefs.backupPaused || (!isManual && !livePrefs.backupEnabled)
+                        if (shouldAbort) {
+                            abortedMidLoop = true
+                            finalize(
+                                jobId, startedAt, filesScanned, filesUploaded, filesSkipped,
+                                "CANCELLED", "Cancelled by user",
+                                failedCount = failures.size,
+                                failedDetailsJson = BackupFailureRecord.encode(failures),
+                                bytesUploaded = bytesUploadedTotal,
+                            )
+                            registry.updatePhase(BackupPhase.Cancelled(filesUploaded, filesToUpload))
+                            notifier.showResult(
+                                jobId, filesUploaded, filesSkipped,
+                                partial = filesUploaded > 0, failed = false, failedCount = failures.size,
+                            )
+                            return@coroutineScope
+                        }
 
-                    // Mirror into file_cache so the file appears in the browser immediately.
-                    fileCacheDao.upsertAll(listOf(
-                        FileCacheEntity(
-                            messageId = msgId,
-                            chatId = fileTargetChatId,
-                            fileName = file.name,
-                            fileSize = file.size,
-                            mimeType = file.mimeType,
-                            thumbnailPath = generatedThumb,
-                            remoteId = uploadResult.remoteId,
-                            date = System.currentTimeMillis(),
-                            isStarred = false,
-                            lastAccessed = 0L,
-                        )
-                    ))
+                        if (isMetered && livePrefs.backupCellularDailyLimitMb > 0 && usedCellularToday >= cellularLimitBytes) {
+                            cellularLimitHit = true
+                            break
+                        }
 
-                    // Optional: delete the original SAF document.
-                    if (prefs.backupDeleteAfterUpload) {
-                        try {
-                            val uri = android.net.Uri.parse(file.absolutePath)
-                            val deleted = android.provider.DocumentsContract.deleteDocument(ctx.contentResolver, uri)
-                            if (deleted) {
-                                Log.i("BackupOrchestrator: deleted original '${file.name}' after upload")
-                            } else {
-                                Log.w("BackupOrchestrator: SAF provider refused to delete '${file.name}'")
+                        val stageOutcome = nextStageDeferred?.await()
+                            ?: StagingManager.StageOutcome.Failed("No staged file")
+                        prefetchedReadyPath = (stageOutcome as? StagingManager.StageOutcome.Ready)?.path
+
+                        // Kick off staging for N+1 in parallel while N uploads
+                        nextStageDeferred = if (i + 1 < eligibleToUpload.size) {
+                            val nextFile = eligibleToUpload[i + 1]
+                            val (nq, nenc) = stageOptionsFor(nextFile)
+                            async(dispatchers.io) {
+                                stagingManager.stageForUpload(
+                                    nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc,
+                                )
                             }
+                        } else {
+                            null
+                        }
+
+                        val sourceUri = sourceUriByPath[file.absolutePath].orEmpty()
+                        if (stageOutcome is StagingManager.StageOutcome.Failed) {
+                            failures += BackupFailureRecord(file.name, file.absolutePath, stageOutcome.reason, sourceUri)
+                            prefetchedReadyPath = null
+                            continue
+                        }
+                        val staged = stageOutcome as StagingManager.StageOutcome.Ready
+
+                        registry.updatePhase(
+                            BackupPhase.Uploading(
+                                current = i + 1,
+                                total = filesToUpload,
+                                fileName = staged.effectiveName,
+                                bytesSent = 0L,
+                                bytesTotal = staged.effectiveSize,
+                                totalBytesUploaded = bytesUploadedTotal,
+                                totalBytesAll = totalBytesAll,
+                                speedBytesPerSec = 0L,
+                                etaSeconds = -1L,
+                                currentLocalUri = file.absolutePath,
+                            ),
+                        )
+
+                        try {
+                            val (fileTargetChatId, fileFolderDbId) = targetByPath[file.absolutePath]
+                                ?: (defaultTargetChatId to defaultTargetPrefId.takeIf { it > 0 })
+
+                            var lastUploadProgressMs = 0L
+                            val uploadResult = uploadWithFloodWaitRetry(
+                                chatId = fileTargetChatId,
+                                localPath = staged.path,
+                                fileName = staged.effectiveName,
+                                mimeType = staged.effectiveMime,
+                                onFloodWait = { adaptiveDelayMs = 1200L },
+                                onProgress = { sent, total ->
+                                    val now = System.currentTimeMillis()
+                                    if (sent >= total || now - lastUploadProgressMs >= 200L) {
+                                        lastUploadProgressMs = now
+                                        val bytesNow = bytesUploadedTotal + sent
+                                        val elapsedSec = ((now - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
+                                        val speedBps = (bytesNow / elapsedSec).toLong()
+                                        val remBytes = (totalBytesAll - bytesNow).coerceAtLeast(0L)
+                                        val etaSec = if (speedBps > 0L) remBytes / speedBps else -1L
+                                        registry.updatePhase(
+                                            BackupPhase.Uploading(
+                                                current = i + 1,
+                                                total = filesToUpload,
+                                                fileName = staged.effectiveName,
+                                                bytesSent = sent,
+                                                bytesTotal = total.coerceAtLeast(staged.effectiveSize),
+                                                totalBytesUploaded = bytesNow,
+                                                totalBytesAll = totalBytesAll,
+                                                speedBytesPerSec = speedBps,
+                                                etaSeconds = etaSec,
+                                                currentLocalUri = file.absolutePath,
+                                            ),
+                                        )
+                                        if (now - lastNotifMs >= 1500L) {
+                                            lastNotifMs = now
+                                            val sub = buildNotifSubtext(staged.effectiveName, speedBps, etaSec)
+                                            notifier.showForeground(jobId, i + 1, filesToUpload, sub)
+                                        }
+                                    }
+                                },
+                            )
+
+                            val msgId = uploadResult.messageId
+                            val captureMs = stagingManager.extractCaptureTimestampMs(
+                                uriStr = file.absolutePath,
+                                mimeType = file.mimeType,
+                                fallbackLastModified = file.lastModified,
+                            )
+                            val generatedThumb = if (staged.wasEncrypted) {
+                                null
+                            } else {
+                                try {
+                                    mediaThumbnailCache.generateFromLocalFile(
+                                        chatId = fileTargetChatId,
+                                        messageId = msgId,
+                                        localPath = staged.path,
+                                        mimeType = staged.effectiveMime,
+                                        fileName = staged.effectiveName,
+                                    )
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Throwable) {
+                                    null
+                                }
+                            }
+
+                            stagingManager.release(staged.path)
+                            prefetchedReadyPath = null
+
+                            val rootFolderTitle = folderNameByUri[sourceUri].orEmpty()
+                            val virtualPath = buildVirtualPath(
+                                rootFolderTitle = rootFolderTitle,
+                                relativeDir = file.relativePath,
+                                organizeByDate = prefs.backupAutoOrganizeByDate,
+                                captureTimestampMs = captureMs,
+                            )
+
+                            syncedFileDao.upsert(
+                                SyncedFileEntity(
+                                    localPath = file.absolutePath,
+                                    telegramMessageId = msgId,
+                                    sha256 = file.sha256,
+                                    size = file.size,
+                                    syncedAt = System.currentTimeMillis(),
+                                    folderId = fileFolderDbId,
+                                    lastModified = file.lastModified,
+                                ),
+                            )
+
+                            fileCacheDao.upsertAll(
+                                listOf(
+                                    FileCacheEntity(
+                                        messageId = msgId,
+                                        chatId = fileTargetChatId,
+                                        fileName = staged.effectiveName,
+                                        fileSize = staged.effectiveSize,
+                                        mimeType = staged.effectiveMime,
+                                        thumbnailPath = generatedThumb,
+                                        remoteId = uploadResult.remoteId,
+                                        date = captureMs,
+                                        isStarred = false,
+                                        lastAccessed = 0L,
+                                        virtualPath = virtualPath,
+                                        isEncryptedVault = staged.wasEncrypted,
+                                    ),
+                                ),
+                            )
+
+                            if (prefs.backupDeleteAfterUpload) {
+                                runCatching {
+                                    val uri = android.net.Uri.parse(file.absolutePath)
+                                    val deleted = DocumentsContract.deleteDocument(ctx.contentResolver, uri)
+                                    if (!deleted) {
+                                        Log.w("BackupOrchestrator: SAF provider refused to delete '${file.name}'")
+                                    }
+                                }
+                            }
+
+                            filesUploaded++
+                            bytesUploadedTotal += staged.effectiveSize
+
+                            if (isMetered) {
+                                usedCellularToday += staged.effectiveSize
+                                runCatching {
+                                    preferences.update { p ->
+                                        p.copy(
+                                            backupCellularUsedBytes = usedCellularToday,
+                                            backupCellularUsageDay = todayKey,
+                                        )
+                                    }
+                                }
+                                if (prefs.backupCellularDailyLimitMb > 0 && usedCellularToday >= cellularLimitBytes) {
+                                    cellularLimitHit = true
+                                }
+                            }
+
+                            val elapsedTotalSec = ((System.currentTimeMillis() - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
+                            val overallSpeed = (bytesUploadedTotal / elapsedTotalSec).toLong()
+                            val remBytes = (totalBytesAll - bytesUploadedTotal).coerceAtLeast(0L)
+                            val etaSec = if (overallSpeed > 0L) remBytes / overallSpeed else -1L
+                            val sub = buildNotifSubtext(staged.effectiveName, overallSpeed, etaSec)
+                            runCatching { setForeground(jobId, filesUploaded, filesToUpload, sub) }
+                            runCatching { notifier.showForeground(jobId, filesUploaded, filesToUpload, sub) }
+
+                            if (cellularLimitHit) break
+
+                            val stepDelay = when {
+                                staged.effectiveSize < 1_048_576L -> adaptiveDelayMs
+                                staged.effectiveSize < 10_485_760L -> maxOf(adaptiveDelayMs, 450L)
+                                else -> maxOf(adaptiveDelayMs, 750L)
+                            }
+                            delay(stepDelay)
+                        } catch (e: CancellationException) {
+                            prefetchedReadyPath = null
+                            throw e
                         } catch (t: Throwable) {
-                            Log.w("BackupOrchestrator: could not delete original '${file.name}'", t)
+                            prefetchedReadyPath = null
+                            Log.w("BackupOrchestrator: failed to upload ${file.name}", t)
+                            failures += BackupFailureRecord(
+                                fileName = file.name,
+                                localPath = file.absolutePath,
+                                reason = t.message ?: t.javaClass.simpleName,
+                                folderUri = sourceUri,
+                            )
                         }
                     }
-
-                    filesUploaded++
-                    // Update foreground notification progress.
-                    try {
-                        setForeground(jobId, filesUploaded, filesToUpload)
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (_: Throwable) {}
-                    try {
-                        notifier.showForeground(jobId, filesUploaded, filesToUpload)
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (_: Throwable) {}
-
-                    // Rate-limit safety: 1s between sends to avoid Telegram flood limits.
-                    kotlinx.coroutines.delay(1000)
-                } catch (t: kotlinx.coroutines.CancellationException) {
-                    throw t
-                } catch (t: Throwable) {
-                    Log.w("BackupOrchestrator: failed to upload ${file.name}", t)
-                    // Continue with next file — partial failure is OK.
+                } finally {
+                    withContext(NonCancellable) {
+                        stagingManager.release(prefetchedReadyPath)
+                        if (nextStageDeferred?.isCompleted == true) {
+                            val leftover = runCatching { nextStageDeferred.getCompleted() }.getOrNull()
+                            if (leftover is StagingManager.StageOutcome.Ready) {
+                                stagingManager.release(leftover.path)
+                            }
+                        } else {
+                            nextStageDeferred?.cancel()
+                        }
+                    }
                 }
+            }
+
+            // If user paused/disabled mid-loop, propagate Cancelled cleanly
+            if (abortedMidLoop) {
+                return RunOutcome.Cancelled(filesUploaded, filesToUpload)
             }
 
             // --- 9. Finalize
             registry.updatePhase(BackupPhase.Finalizing(filesUploaded, filesToUpload, filesSkipped))
+            val failedCount = failures.size
             val status = when {
-                filesUploaded == filesToUpload -> "SUCCESS"
-                filesUploaded == 0 -> "FAILURE"
+                cellularLimitHit && failedCount == 0 -> "PARTIAL"
+                failedCount == 0 && filesUploaded == filesToUpload -> "SUCCESS"
+                filesUploaded == 0 && failedCount > 0 -> "FAILURE"
                 else -> "PARTIAL"
             }
-            val errMsg = if (status == "FAILURE") "All uploads failed" else null
-            finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, status, errMsg)
+            val errMsg = when {
+                cellularLimitHit -> "Daily mobile data limit reached (${prefs.backupCellularDailyLimitMb} MB)"
+                status == "FAILURE" -> failures.firstOrNull()?.reason ?: "All uploads failed"
+                else -> null
+            }
+            finalize(
+                jobId = jobId,
+                startedAt = startedAt,
+                scanned = filesScanned,
+                uploaded = filesUploaded,
+                skipped = filesSkipped,
+                status = status,
+                errMsg = errMsg,
+                failedCount = failedCount,
+                failedDetailsJson = BackupFailureRecord.encode(failures),
+                bytesUploaded = bytesUploadedTotal,
+            )
 
             notifier.showResult(
                 jobId = jobId,
@@ -545,121 +801,141 @@ class BackupOrchestrator @Inject constructor(
                 skipped = filesSkipped,
                 partial = status == "PARTIAL",
                 failed = status == "FAILURE",
+                failedCount = failedCount,
             )
 
             val phase = when (status) {
                 "SUCCESS" -> BackupPhase.Done(filesUploaded, filesToUpload, filesSkipped, 0)
-                "PARTIAL" -> BackupPhase.Done(filesUploaded, filesToUpload, filesSkipped, filesToUpload - filesUploaded)
-                else -> BackupPhase.Failed(errMsg ?: "All uploads failed", 0, filesToUpload)
+                "PARTIAL" -> BackupPhase.Done(filesUploaded, filesToUpload, filesSkipped, failedCount)
+                else -> BackupPhase.Failed(errMsg ?: "All uploads failed", filesUploaded, filesToUpload)
             }
             registry.updatePhase(phase)
             return when (status) {
                 "SUCCESS" -> RunOutcome.Success(filesUploaded, filesSkipped, filesToUpload)
                 "PARTIAL" -> RunOutcome.Partial(filesUploaded, filesToUpload, filesSkipped)
-                else -> RunOutcome.Failed(errMsg ?: "All uploads failed", 0, filesToUpload)
+                else -> RunOutcome.Failed(errMsg ?: "All uploads failed", filesUploaded, filesToUpload, retryable = !cellularLimitHit)
             }
-
         } catch (t: CancellationException) {
-            // Cancellation arrives as CancellationException.
-            //
-            // IMPORTANT: When a coroutine is cancelled, suspend functions called
-            // from this catch block will throw CancellationException immediately
-            // because the coroutine's Job is in "Cancelling" state. To run
-            // cleanup code that MUST complete (DB writes, notifications), we
-            // use `withContext(NonCancellable) { ... }` which switches to a
-            // context that cannot be cancelled.
-            //
-            // Previously, `finalize()` was called directly here, and its
-            // internal `catch (t: Throwable)` swallowed the CancellationException
-            // — a coroutine anti-pattern that left the coroutine in a "zombie"
-            // state and caused cascading failures (the app crashed after
-            // showing "Cancelled").
             Log.i("BackupOrchestrator: cancelled (uploaded=$filesUploaded/$filesToUpload)")
-            // DON'T delete lastStagingPath — TDLib may still be reading it.
-            // Leave it for purgeStale() to clean up after 1 hour.
-            // stagingManager.release(lastStagingPath)  // ← removed
-            // Run cleanup in a NonCancellable context so DB writes complete.
             withContext(NonCancellable) {
                 try {
-                    finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, "CANCELLED", "Cancelled")
-                } catch (t: Throwable) {
-                    Log.w("BackupOrchestrator: finalize failed during cancellation", t)
+                    finalize(
+                        jobId = jobId,
+                        startedAt = startedAt,
+                        scanned = filesScanned,
+                        uploaded = filesUploaded,
+                        skipped = filesSkipped,
+                        status = "CANCELLED",
+                        errMsg = "Cancelled",
+                        failedCount = failures.size,
+                        failedDetailsJson = BackupFailureRecord.encode(failures),
+                        bytesUploaded = bytesUploadedTotal,
+                    )
+                } catch (e: Throwable) {
+                    Log.w("BackupOrchestrator: finalize failed during cancellation", e)
                 }
             }
-            try { notifier.showResult(jobId, filesUploaded, filesSkipped, partial = filesUploaded > 0, failed = false) } catch (_: Throwable) {}
+            runCatching {
+                notifier.showResult(
+                    jobId = jobId,
+                    uploaded = filesUploaded,
+                    skipped = filesSkipped,
+                    partial = filesUploaded > 0,
+                    failed = false,
+                    failedCount = failures.size,
+                )
+            }
             registry.updatePhase(BackupPhase.Cancelled(filesUploaded, filesToUpload))
-            throw t  // Propagate so the Worker can return Result.success(CANCELLED).
+            throw t
         } catch (t: Throwable) {
-            // Catch-all for unexpected errors (OOM, SQLiteException, etc.).
             Log.e("BackupOrchestrator: fatal error", t)
-            // DON'T delete lastStagingPath — TDLib may still be reading it.
-            // stagingManager.release(lastStagingPath)  // ← removed
             withContext(NonCancellable) {
                 try {
-                    finalize(jobId, startedAt, filesScanned, filesUploaded, filesSkipped, "FAILURE", t.message)
-                } catch (t: Throwable) {
-                    Log.w("BackupOrchestrator: finalize failed during error recovery", t)
+                    finalize(
+                        jobId = jobId,
+                        startedAt = startedAt,
+                        scanned = filesScanned,
+                        uploaded = filesUploaded,
+                        skipped = filesSkipped,
+                        status = "FAILURE",
+                        errMsg = t.message,
+                        failedCount = failures.size.coerceAtLeast(1),
+                        failedDetailsJson = BackupFailureRecord.encode(failures),
+                        bytesUploaded = bytesUploadedTotal,
+                    )
+                } catch (e: Throwable) {
+                    Log.w("BackupOrchestrator: finalize failed during error recovery", e)
                 }
             }
-            try { notifier.showResult(jobId, filesUploaded, filesSkipped, partial = false, failed = true) } catch (_: Throwable) {}
+            runCatching {
+                notifier.showResult(jobId, filesUploaded, filesSkipped, partial = false, failed = true, failedCount = failures.size)
+            }
             registry.updatePhase(BackupPhase.Failed(t.message ?: "Unexpected error", filesUploaded, filesToUpload))
             return RunOutcome.Failed(t.message ?: "Unexpected error", filesUploaded, filesToUpload)
         } finally {
-            // C5 FIX: Use NonCancellable + cancelAndJoin() so the watcher
-            // stops cleanly even if runBackup was cancelled.
             withContext(NonCancellable) {
-                try { watcherJob.cancelAndJoin() } catch (_: Throwable) {}
+                try {
+                    watcherJob.cancelAndJoin()
+                } catch (_: Throwable) {}
             }
         }
     }
 
-    /**
-     * Mark the active job as cancelled. Called by [BackupActionReceiver].
-     *
-     * This is a soft cancel: the orchestrator polls
-     * [ActiveBackupRegistry.isCancellationRequested] at every chunk boundary
-     * and exits cleanly. Hard cancel (WorkManager.cancelAllWork) is also
-     * supported — the orchestrator's catch blocks will clean up staging.
-     */
+    private suspend fun uploadWithFloodWaitRetry(
+        chatId: Long,
+        localPath: String,
+        fileName: String,
+        mimeType: String,
+        onFloodWait: () -> Unit,
+        onProgress: (sentBytes: Long, totalBytes: Long) -> Unit,
+    ) = try {
+        telegramClient.uploadFile(chatId, localPath, fileName, mimeType, onProgress)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (t: Throwable) {
+        val waitSec = parseFloodWaitSeconds(t.message)
+        if (waitSec != null && waitSec in 1..60) {
+            onFloodWait()
+            Log.w("BackupOrchestrator: hit FLOOD_WAIT_${waitSec}s — backing off and retrying '$fileName'")
+            delay((waitSec + 1L) * 1000L)
+            telegramClient.uploadFile(chatId, localPath, fileName, mimeType, onProgress)
+        } else {
+            throw t
+        }
+    }
+
     fun requestCancellation(jobId: String) {
         Log.i("BackupOrchestrator: cancellation requested for $jobId")
         registry.requestCancellation(jobId)
     }
 
-    /**
-     * ZIP mode: zip each folder's files into a single .zip and upload that.
-     *
-     * Instead of uploading N individual files, we create one .zip per
-     * source folder and upload it as a single message. This:
-     *   - Reduces message count (1 per folder instead of N per folder)
-     *   - Keeps files organized by folder
-     *   - Reduces TDLib upload overhead
-     *
-     * The .zip is created in the staging directory, uploaded, then deleted.
-     */
     private suspend fun runZipMode(
         jobId: String,
         startedAt: Long,
         isManual: Boolean,
-        prefs: com.tgdrive.core.datastore.AppPreferencesData,
+        prefs: AppPreferencesData,
         folderUris: List<String>,
+        folderNameByUri: Map<String, String>,
         scannedByUri: Map<String, List<LocalFile>>,
         toUploadByUri: Map<String, List<LocalFile>>,
         resolveTargetCached: suspend (Long) -> Long,
         filesScanned: Int,
         filesSkipped: Int,
-        setForeground: suspend (String, Int, Int) -> Unit,
+        initialFailures: MutableList<BackupFailureRecord>,
+        setForeground: suspend (String, Int, Int, String?) -> Unit,
     ): RunOutcome {
-        var foldersUploaded = 0
+        var foldersSucceeded = 0
         var foldersFailed = 0
+        var filesPackedAndUploaded = 0
+        var bytesUploadedTotal = 0L
         val foldersTotal = folderUris.size
         val excludePatterns = ExcludePatternMatcher.parse(prefs.backupExcludePatterns)
         val excludeMatcher: ((String) -> Boolean)? =
             if (excludePatterns.isEmpty()) null else { name -> ExcludePatternMatcher.matches(name, excludePatterns) }
 
         try {
-            setForeground(jobId, 0, foldersTotal)
-        } catch (e: kotlinx.coroutines.CancellationException) {
+            setForeground(jobId, 0, foldersTotal, "Preparing ZIP archives…")
+        } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
             Log.w("BackupOrchestrator: setForeground (zip) failed", t)
@@ -675,7 +951,7 @@ class BackupOrchestrator @Inject constructor(
             ),
         )
 
-        val stagingDir = java.io.File(ctx.cacheDir, "backup_staging").apply { mkdirs() }
+        val stagingDir = File(ctx.cacheDir, "backup_staging").apply { mkdirs() }
         val maxPartBytes = runCatching { telegramClient.safeZipChunkLimitBytes() }
             .getOrDefault(TelegramClient.SAFE_CHUNK_LIMIT_STANDARD)
 
@@ -685,45 +961,33 @@ class BackupOrchestrator @Inject constructor(
             val currentPrefs = preferences.data.first()
             val shouldAbort = currentPrefs.backupPaused || (!isManual && !currentPrefs.backupEnabled)
             if (shouldAbort) {
-                finalize(jobId, startedAt, filesScanned, foldersUploaded, filesSkipped, "CANCELLED", "Cancelled by user")
-                registry.updatePhase(BackupPhase.Cancelled(foldersUploaded, foldersTotal))
-                notifier.showResult(jobId, foldersUploaded, filesSkipped, partial = foldersUploaded > 0, failed = false)
-                return RunOutcome.Cancelled(foldersUploaded, foldersTotal)
+                finalize(
+                    jobId, startedAt, filesScanned, filesPackedAndUploaded, filesSkipped,
+                    "CANCELLED", "Cancelled by user",
+                    failedCount = initialFailures.size,
+                    failedDetailsJson = BackupFailureRecord.encode(initialFailures),
+                    bytesUploaded = bytesUploadedTotal,
+                )
+                registry.updatePhase(BackupPhase.Cancelled(filesPackedAndUploaded, filesScanned))
+                notifier.showResult(jobId, filesPackedAndUploaded, filesSkipped, partial = filesPackedAndUploaded > 0, failed = false)
+                return RunOutcome.Cancelled(filesPackedAndUploaded, filesScanned)
             }
 
             val folderToUpload = toUploadByUri[folderUri].orEmpty()
-            val filesToRecordForFolder = if (prefs.backupZipIncremental) {
-                folderToUpload
-            } else {
-                scannedByUri[folderUri].orEmpty()
-            }
+            val filesToRecordForFolder = if (prefs.backupZipIncremental) folderToUpload else scannedByUri[folderUri].orEmpty()
             if (prefs.backupZipIncremental && folderToUpload.isEmpty()) {
-                Log.i("BackupOrchestrator: incremental ZIP skipped $folderUri (no new/changed files)")
-                foldersUploaded++
+                foldersSucceeded++
                 continue
             }
 
-            val folderName = try {
-                val uri = android.net.Uri.parse(folderUri)
-                val docFile = androidx.documentfile.provider.DocumentFile.fromTreeUri(ctx, uri)
-                docFile?.name ?: "folder_${System.currentTimeMillis()}"
-            } catch (_: Throwable) {
-                "folder_${System.currentTimeMillis()}"
-            }
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
-            val zipBaseName = if (prefs.backupZipIncremental) {
-                "${folderName}_inc_$timestamp"
-            } else {
-                "${folderName}_$timestamp"
-            }
-
+            val folderName = folderNameByUri[folderUri] ?: fallbackFolderName(folderUri)
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(java.util.Date())
+            val zipBaseName = if (prefs.backupZipIncremental) "${folderName}_inc_$timestamp" else "${folderName}_$timestamp"
             val folderPrefTarget = prefs.targetFolderFor(folderUri)
             val destChatId = resolveTargetCached(folderPrefTarget)
-            val includedUris = if (prefs.backupZipIncremental) {
-                folderToUpload.map { it.absolutePath }.toSet()
-            } else {
-                null
-            }
+            val encryptZip = prefs.isFolderEncrypted(folderUri)
+            val zipPassword = if (encryptZip) backupCrypto.zipVaultPassword() else null
+            val includedUris = if (prefs.backupZipIncremental) folderToUpload.map { it.absolutePath }.toSet() else null
 
             registry.updatePhase(
                 BackupPhase.Uploading(
@@ -735,7 +999,7 @@ class BackupOrchestrator @Inject constructor(
                 ),
             )
 
-            var manifestFile: java.io.File? = null
+            var manifestFile: File? = null
             try {
                 val uploadedParts = mutableListOf<UploadedZipPartRecord>()
                 val summary = ZipUploader.zipFolderInParts(
@@ -744,7 +1008,7 @@ class BackupOrchestrator @Inject constructor(
                     workDir = stagingDir,
                     baseZipName = zipBaseName,
                     maxPartBytes = maxPartBytes,
-                    password = null,
+                    password = zipPassword,
                     excludeMatcher = excludeMatcher,
                     includedUris = includedUris,
                 ) { part ->
@@ -752,11 +1016,12 @@ class BackupOrchestrator @Inject constructor(
                     val partName = part.partFile.name
                     val partSize = part.partFile.length()
                     var lastZipProgressMs = 0L
-                    val uploadResult = telegramClient.uploadFile(
+                    val uploadResult = uploadWithFloodWaitRetry(
                         chatId = destChatId,
                         localPath = part.partFile.absolutePath,
                         fileName = partName,
                         mimeType = "application/zip",
+                        onFloodWait = {},
                     ) { sent, total ->
                         val now = System.currentTimeMillis()
                         if (sent >= total || now - lastZipProgressMs >= 200L) {
@@ -768,23 +1033,29 @@ class BackupOrchestrator @Inject constructor(
                                     fileName = partName,
                                     bytesSent = sent,
                                     bytesTotal = total.coerceAtLeast(partSize),
+                                    totalBytesUploaded = bytesUploadedTotal + sent,
+                                    totalBytesAll = bytesUploadedTotal + total.coerceAtLeast(partSize),
                                 ),
                             )
                         }
                     }
 
-                    val zipThumb = try {
-                        mediaThumbnailCache.generateFromLocalFile(
-                            chatId = destChatId,
-                            messageId = uploadResult.messageId,
-                            localPath = part.partFile.absolutePath,
-                            mimeType = "application/zip",
-                            fileName = partName,
-                        )
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Throwable) {
+                    val zipThumb = if (encryptZip) {
                         null
+                    } else {
+                        try {
+                            mediaThumbnailCache.generateFromLocalFile(
+                                chatId = destChatId,
+                                messageId = uploadResult.messageId,
+                                localPath = part.partFile.absolutePath,
+                                mimeType = "application/zip",
+                                fileName = partName,
+                            )
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                            null
+                        }
                     }
                     fileCacheDao.upsertAll(
                         listOf(
@@ -797,20 +1068,19 @@ class BackupOrchestrator @Inject constructor(
                                 thumbnailPath = zipThumb,
                                 remoteId = uploadResult.remoteId,
                                 date = System.currentTimeMillis(),
+                                isEncryptedVault = encryptZip,
                             ),
                         ),
                     )
-                    try {
+                    bytesUploadedTotal += partSize
+                    runCatching {
                         zipIndexService.indexPartEntries(
                             chatId = destChatId,
                             zipMessageId = uploadResult.messageId,
                             zipFileName = partName,
                             entryPaths = part.entries,
-                            encrypted = false,
+                            encrypted = encryptZip,
                         )
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Throwable) {
                     }
                     uploadedParts += UploadedZipPartRecord(
                         fileName = partName,
@@ -825,6 +1095,12 @@ class BackupOrchestrator @Inject constructor(
                 if (summary.totalFilesProcessed == 0 || uploadedParts.isEmpty()) {
                     Log.w("BackupOrchestrator: no eligible files zipped for $folderUri — skipping")
                     foldersFailed++
+                    initialFailures += BackupFailureRecord(
+                        fileName = folderName,
+                        localPath = folderUri,
+                        reason = "No eligible files could be packed into ZIP",
+                        folderUri = folderUri,
+                    )
                     continue
                 }
 
@@ -833,7 +1109,7 @@ class BackupOrchestrator @Inject constructor(
                         outputDir = stagingDir,
                         baseName = zipBaseName,
                         folderName = folderName,
-                        encrypted = false,
+                        encrypted = encryptZip,
                         parts = uploadedParts,
                     )
                     manifestFile = mFile
@@ -855,9 +1131,11 @@ class BackupOrchestrator @Inject constructor(
                                 thumbnailPath = null,
                                 remoteId = mResult.remoteId,
                                 date = System.currentTimeMillis(),
+                                isEncryptedVault = encryptZip,
                             ),
                         ),
                     )
+                    bytesUploadedTotal += mSize
                 }
 
                 val syncedMsgId = uploadedParts.last().messageId
@@ -873,49 +1151,137 @@ class BackupOrchestrator @Inject constructor(
                                 size = localFile.size,
                                 syncedAt = nowMs,
                                 folderId = folderDbId,
+                                lastModified = localFile.lastModified,
                             ),
                         )
                     }
                 }
 
-                foldersUploaded++
-                Log.i("BackupOrchestrator: uploaded ${uploadedParts.size} ZIP part(s) for $folderName ($foldersUploaded/$foldersTotal)")
-            } catch (e: kotlinx.coroutines.CancellationException) {
+                filesPackedAndUploaded += summary.totalFilesProcessed
+                foldersSucceeded++
+            } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Log.w("BackupOrchestrator: zip upload failed for $folderUri", t)
                 foldersFailed++
+                initialFailures += BackupFailureRecord(
+                    fileName = folderName,
+                    localPath = folderUri,
+                    reason = t.message ?: t.javaClass.simpleName,
+                    folderUri = folderUri,
+                )
             } finally {
                 runCatching { manifestFile?.delete() }
             }
         }
 
         val status = when {
-            foldersUploaded == foldersTotal && foldersFailed == 0 -> "SUCCESS"
-            foldersUploaded == 0 -> "FAILURE"
+            foldersSucceeded == foldersTotal && foldersFailed == 0 && initialFailures.isEmpty() -> "SUCCESS"
+            foldersSucceeded == 0 -> "FAILURE"
             else -> "PARTIAL"
         }
-        val errMsg = if (status == "FAILURE") "All ZIP uploads failed" else null
-        finalize(jobId, startedAt, filesScanned, foldersUploaded, filesSkipped, status, errMsg)
+        val errMsg = if (status == "FAILURE") (initialFailures.firstOrNull()?.reason ?: "All ZIP uploads failed") else null
+        finalize(
+            jobId = jobId,
+            startedAt = startedAt,
+            scanned = filesScanned,
+            uploaded = filesPackedAndUploaded,
+            skipped = filesSkipped,
+            status = status,
+            errMsg = errMsg,
+            failedCount = initialFailures.size,
+            failedDetailsJson = BackupFailureRecord.encode(initialFailures),
+            bytesUploaded = bytesUploadedTotal,
+        )
         notifier.showResult(
             jobId = jobId,
-            uploaded = foldersUploaded,
+            uploaded = filesPackedAndUploaded,
             skipped = filesSkipped,
             partial = status == "PARTIAL",
             failed = status == "FAILURE",
+            failedCount = initialFailures.size,
         )
         val phase = when (status) {
-            "SUCCESS" -> BackupPhase.Done(foldersUploaded, foldersTotal, filesSkipped, 0)
-            "PARTIAL" -> BackupPhase.Done(foldersUploaded, foldersTotal, filesSkipped, foldersFailed)
-            else -> BackupPhase.Failed(errMsg ?: "All ZIP uploads failed", 0, foldersTotal)
+            "SUCCESS" -> BackupPhase.Done(filesPackedAndUploaded, filesScanned, filesSkipped, 0)
+            "PARTIAL" -> BackupPhase.Done(filesPackedAndUploaded, filesScanned, filesSkipped, initialFailures.size)
+            else -> BackupPhase.Failed(errMsg ?: "All ZIP uploads failed", 0, filesScanned)
         }
         registry.updatePhase(phase)
         return when (status) {
-            "SUCCESS" -> RunOutcome.Success(uploaded = foldersUploaded, skipped = filesSkipped, total = foldersTotal)
-            "PARTIAL" -> RunOutcome.Partial(uploaded = foldersUploaded, total = foldersTotal, skipped = filesSkipped)
-            else -> RunOutcome.Failed(errMsg ?: "All ZIP uploads failed", 0, foldersTotal)
+            "SUCCESS" -> RunOutcome.Success(uploaded = filesPackedAndUploaded, skipped = filesSkipped, total = filesScanned)
+            "PARTIAL" -> RunOutcome.Partial(uploaded = filesPackedAndUploaded, total = filesScanned, skipped = filesSkipped)
+            else -> RunOutcome.Failed(errMsg ?: "All ZIP uploads failed", 0, filesScanned)
         }
     }
+
+    private fun checkBatterySkipReason(minBatteryPercent: Int): String? {
+        val power = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val battery = ctx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        val isCharging = runCatching { battery?.isCharging == true }.getOrDefault(false)
+        if (isCharging) return null
+        val pct = runCatching { battery?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1 }.getOrDefault(-1)
+        if (pct in 1 until minBatteryPercent) {
+            return "Paused to save battery ($pct%)"
+        }
+        if (runCatching { power?.isPowerSaveMode == true }.getOrDefault(false)) {
+            return "Paused while Battery Saver is active"
+        }
+        return null
+    }
+
+    private fun isNetworkMetered(): Boolean {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        return runCatching { cm?.isActiveNetworkMetered == true }.getOrDefault(false)
+    }
+
+    private fun matchesBackupFilters(
+        file: LocalFile,
+        prefs: AppPreferencesData,
+        isMetered: Boolean,
+        isManual: Boolean,
+    ): Boolean {
+        if (prefs.backupOnlyNewAfterMs > 0L && file.lastModified > 0L && file.lastModified < prefs.backupOnlyNewAfterMs) {
+            return false
+        }
+        if (prefs.backupMaxFileSizeMb > 0) {
+            val maxBytes = prefs.backupMaxFileSizeMb.toLong() * 1024L * 1024L
+            if (file.size > maxBytes) return false
+        }
+        val bucket = classifyFile(file.mimeType, file.name)
+        when (prefs.backupMediaFilter) {
+            BackupMediaFilter.ALL_FILES -> Unit
+            BackupMediaFilter.PHOTOS_AND_VIDEOS -> if (bucket != FileBucket.IMAGES && bucket != FileBucket.VIDEOS) return false
+            BackupMediaFilter.PHOTOS_ONLY -> if (bucket != FileBucket.IMAGES) return false
+        }
+        if (isMetered && !isManual && prefs.backupSkipVideosOnCellular && bucket == FileBucket.VIDEOS) {
+            return false
+        }
+        return true
+    }
+
+    private fun fallbackFolderName(folderUri: String): String =
+        runCatching {
+            val parsed = android.net.Uri.parse(folderUri)
+            DocumentFile.fromTreeUri(ctx, parsed)?.name
+        }.getOrNull()
+            ?: (android.net.Uri.decode(folderUri) ?: folderUri)
+                .substringAfterLast(':')
+                .substringAfterLast('/')
+                .ifBlank { "Backup" }
+
+    private fun buildNotifSubtext(fileName: String, speedBps: Long, etaSec: Long): String =
+        buildString {
+            append(fileName)
+            if (speedBps > 0L) {
+                append(" · ")
+                append(speedBps.toHumanSize())
+                append("/s")
+            }
+            if (etaSec > 0L) {
+                append(" · ~")
+                append(formatEtaShort(etaSec))
+            }
+        }
 
     private suspend fun ensureNotCancelled(jobId: String) {
         if (registry.isCancellationRequested(jobId)) {
@@ -925,58 +1291,104 @@ class BackupOrchestrator @Inject constructor(
     }
 
     private suspend fun resolveTargetChatId(folderId: Long): Long {
-        if (folderId <= 0) return telegramClient.myUserId()  // Saved Messages
+        if (folderId <= 0) return telegramClient.myUserId()
         val folder = folderDao.getById(folderId)
         return folder?.channelId ?: telegramClient.myUserId()
     }
 
-    /**
-     * Write the final sync_log row + delete old entries.
-     *
-     * **Cancellation safety:** This function catches all exceptions EXCEPT
-     * `CancellationException` — the latter is re-thrown so the coroutine
-     * framework can properly propagate cancellation. Previously, catching
-     * `Throwable` (which includes `CancellationException`) was a coroutine
-     * anti-pattern that caused "zombie" coroutines and cascading failures.
-     *
-     * When called from a cancelled coroutine, the caller MUST wrap this in
-     * `withContext(NonCancellable) { ... }` to ensure the DB writes complete.
-     */
     private suspend fun finalize(
-        jobId: String, startedAt: Long, scanned: Int,
-        uploaded: Int, skipped: Int, status: String, errMsg: String?,
+        jobId: String,
+        startedAt: Long,
+        scanned: Int,
+        uploaded: Int,
+        skipped: Int,
+        status: String,
+        errMsg: String?,
+        failedCount: Int = 0,
+        failedDetailsJson: String? = null,
+        bytesUploaded: Long = 0L,
     ) {
         try {
             val existing = syncLogDao.get(jobId)
             syncLogDao.upsert(
                 (existing ?: SyncLogEntity(
-                    jobId = jobId, startedAt = startedAt, completedAt = null, status = status,
+                    jobId = jobId,
+                    startedAt = startedAt,
+                    completedAt = null,
+                    status = status,
                 )).copy(
                     completedAt = System.currentTimeMillis(),
-                    filesScanned = scanned, filesUploaded = uploaded,
-                    filesSkipped = skipped, status = status, errorMessage = errMsg,
-                )
+                    filesScanned = scanned,
+                    filesUploaded = uploaded,
+                    filesSkipped = skipped,
+                    status = status,
+                    errorMessage = errMsg,
+                    failedCount = failedCount,
+                    failedDetailsJson = failedDetailsJson,
+                    bytesUploaded = bytesUploaded,
+                ),
             )
             syncLogDao.deleteOlderThan(System.currentTimeMillis() - (30L * 24 * 60 * 60 * 1000))
             if (uploaded > 0) {
                 cloudSyncManager.schedulePushMetadata()
             }
         } catch (t: CancellationException) {
-            // Re-throw cancellation — NEVER swallow it. Swallowing
-            // CancellationException is a coroutine anti-pattern that leaves
-            // the coroutine in a "zombie" state and causes cascading failures.
             throw t
         } catch (t: Throwable) {
             Log.w("BackupOrchestrator: finalize failed", t)
         }
     }
 
-    /** Outcome of a backup run. Used by the Worker to decide Result.success/failure. */
     sealed class RunOutcome {
         data class Success(val uploaded: Int, val skipped: Int, val total: Int) : RunOutcome()
         data class Partial(val uploaded: Int, val total: Int, val skipped: Int) : RunOutcome()
         data class Cancelled(val uploaded: Int, val total: Int) : RunOutcome()
-        data class Failed(val message: String, val uploaded: Int, val total: Int) : RunOutcome()
+        data class Failed(
+            val message: String,
+            val uploaded: Int,
+            val total: Int,
+            val retryable: Boolean = true,
+        ) : RunOutcome()
         data class Skipped(val reason: String) : RunOutcome()
+    }
+
+    companion object {
+        private val FLOOD_WAIT_REGEX = Regex("(?:FLOOD_WAIT_|retry after\\s+)(\\d+)", RegexOption.IGNORE_CASE)
+
+        internal fun parseFloodWaitSeconds(message: String?): Int? {
+            if (message.isNullOrBlank()) return null
+            return FLOOD_WAIT_REGEX.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        }
+
+        internal fun buildVirtualPath(
+            rootFolderTitle: String,
+            relativeDir: String,
+            organizeByDate: Boolean,
+            captureTimestampMs: Long,
+        ): String {
+            val segments = ArrayList<String>(4)
+            fun appendClean(raw: String) {
+                raw.trim('/').split('/').filter { it.isNotBlank() && it != "." && it != ".." }.forEach { segments += it }
+            }
+            if (rootFolderTitle.isNotBlank()) appendClean(rootFolderTitle)
+            if (relativeDir.isNotBlank()) {
+                appendClean(relativeDir)
+            } else if (organizeByDate && captureTimestampMs > 0L) {
+                val z = Instant.ofEpochMilli(captureTimestampMs).atZone(ZoneId.systemDefault())
+                segments += z.year.toString()
+                segments += z.monthValue.toString().padStart(2, '0')
+            }
+            return segments.joinToString("/")
+        }
+
+        internal fun formatEtaShort(seconds: Long): String {
+            if (seconds < 60L) return "${seconds}s"
+            val mins = seconds / 60L
+            val remSec = seconds % 60L
+            if (mins < 60L) return "${mins}m ${remSec}s"
+            val hrs = mins / 60L
+            val remMin = mins % 60L
+            return "${hrs}h ${remMin}m"
+        }
     }
 }

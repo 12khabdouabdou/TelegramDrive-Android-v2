@@ -51,21 +51,33 @@ class ScheduledUploadScheduler @Inject constructor(
             val delayMinutes = delayMs / (60 * 1000)
 
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(
+                    if (prefs.backupWifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED,
+                )
+                .setRequiresBatteryNotLow(true)
+                .setRequiresCharging(prefs.backupChargingOnly)
                 .build()
 
-            // Use the existing BackupWorker with special input data
             val req = PeriodicWorkRequestBuilder<com.tgdrive.feature.autobackup.worker.BackupWorker>(
-                24, TimeUnit.HOURS
+                24,
+                TimeUnit.HOURS,
             )
                 .addTag("scheduled_upload")
                 .setConstraints(constraints)
-                .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
+                .setInitialDelay(delayMinutes.coerceAtLeast(1L), TimeUnit.MINUTES)
                 .setInputData(
                     androidx.work.Data.Builder()
-                        .putString(com.tgdrive.feature.autobackup.worker.BackupWorker.KEY_JOB_ID, "scheduled_${System.currentTimeMillis()}")
+                        .putString(com.tgdrive.feature.autobackup.worker.BackupWorker.KEY_JOB_ID, "scheduled")
                         .putBoolean(com.tgdrive.feature.autobackup.worker.BackupWorker.KEY_IS_MANUAL, false)
-                        .build()
+                        .putString(
+                            com.tgdrive.feature.autobackup.worker.BackupWorker.KEY_OVERRIDE_FOLDER_URI,
+                            prefs.scheduledUploadFolderUri,
+                        )
+                        .putLong(
+                            com.tgdrive.feature.autobackup.worker.BackupWorker.KEY_OVERRIDE_TARGET_ID,
+                            prefs.scheduledUploadTargetFolderId,
+                        )
+                        .build(),
                 )
                 .build()
 
