@@ -9,7 +9,7 @@ package com.tgdrive.feature.autobackup
  *   - `*name*` — contains `name`
  *   - `name*` — starts with `name`
  *   - `.thumbnails/` — matches any directory named `.thumbnails` (pruned during scan)
- *   - `Sent/` or `Sub/*` — matches directories or relative paths containing `/`
+ *   - `Sent/` or `Sub/temp*` — matches directories or relative paths containing `/`
  *
  * Multiple patterns are separated by commas.
  */
