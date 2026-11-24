@@ -2,14 +2,12 @@ package com.tgdrive.feature.browser
 
 import android.content.Context
 import android.net.Uri
-import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
-import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileSort
@@ -18,17 +16,29 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
+import com.tgdrive.core.download.DecryptOutcome
 import com.tgdrive.core.download.DownloadItem
+import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.MediaThumbnailCache
+import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.UploadEncryptionSpec
+import com.tgdrive.core.download.UploadItem
+import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.UploadTracker
-import com.tgdrive.core.download.index.ZipIndexService
+import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.EncryptedFileFormat
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.telegram.TelegramFolder
 import com.tgdrive.core.telegram.TelegramMessage
-import com.tgdrive.core.zip.UploadedZipPartRecord
+import com.tgdrive.core.zip.ZipExcludeMatcher
+import com.tgdrive.core.zip.ZipSelectionSummary
 import com.tgdrive.core.zip.ZipUploader
+import com.tgdrive.feature.upload.FileReviewAction
+import com.tgdrive.feature.upload.ZipUploadOptions
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -71,6 +81,20 @@ private val THUMBNAILABLE_EXTS =
         "3gp",
     )
 
+data class DecryptDialogState(
+    val item: FileCacheEntity,
+    val localFile: File? = null,
+    val format: EncryptedFileFormat? = null,
+    val downloading: Boolean = false,
+    val decrypting: Boolean = false,
+    val error: String? = null,
+)
+
+data class DecryptedOpenEvent(
+    val id: Long,
+    val outcome: DecryptOutcome.Success,
+)
+
 data class FolderUiState(
     val items: List<FileCacheEntity> = emptyList(),
     val selectedIds: Set<Long> = emptySet(),
@@ -81,8 +105,15 @@ data class FolderUiState(
     val viewMode: FileViewMode = FileViewMode.GRID,
     val fileFilter: FileFilter = FileFilter.ALL,
     val fileSort: FileSort = FileSort.DATE_DESC,
-    val uploads: List<UploadProgress> = emptyList(),
+    val uploads: List<UploadItem> = emptyList(),
     val pdfThumbnails: Map<Long, String> = emptyMap(),
+    val pendingReviewFiles: List<com.tgdrive.core.download.UploadFileItem> = emptyList(),
+    val pendingZipTreeUri: Uri? = null,
+    val pendingZipFolderName: String? = null,
+    val zipPreviewSummary: ZipSelectionSummary? = null,
+    val zipPreviewLoading: Boolean = false,
+    val decryptDialog: DecryptDialogState? = null,
+    val hasSavedBackupPassphrase: Boolean = false,
 )
 
 data class FolderSnackbarEvent(
@@ -90,17 +121,6 @@ data class FolderSnackbarEvent(
     val message: String,
     val canUndoTrash: Boolean = false,
 )
-
-data class UploadProgress(
-    val id: Long,
-    val name: String,
-    val size: Long,
-    val progress: Float,
-    val status: UploadStatus,
-    val errorMessage: String? = null,
-)
-
-enum class UploadStatus { UPLOADING, DONE, FAILED }
 
 @HiltViewModel
 class FolderViewModel
@@ -110,15 +130,15 @@ class FolderViewModel
         private val fileCacheDao: FileCacheDao,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
-        val downloadManager: com.tgdrive.core.download.DownloadManager,
+        val downloadManager: DownloadManager,
         val audioPlayerController: com.tgdrive.core.audio.AudioPlayerController,
         private val uploadTracker: UploadTracker,
+        private val uploadManager: UploadManager,
+        private val backupCrypto: BackupCrypto,
         private val offlinePinStore: OfflinePinStore,
         private val trashEntryDao: TrashEntryDao,
-        private val zipIndexService: ZipIndexService,
         private val cloudSyncManager: CloudSyncManager,
         private val mediaThumbnailCache: MediaThumbnailCache,
-        private val savedStateHandle: SavedStateHandle,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
         private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
@@ -127,66 +147,45 @@ class FolderViewModel
         private val _refreshing = MutableStateFlow(false)
         private val _error = MutableStateFlow<String?>(null)
         private val _search = MutableStateFlow("")
-        private val _uploads = MutableStateFlow<List<UploadProgress>>(emptyList())
         private val _pdfThumbnails = MutableStateFlow<Map<Long, String>>(emptyMap())
         private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
         val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
         private val _isSavedMessages = MutableStateFlow(false)
         val isSavedMessages: StateFlow<Boolean> = _isSavedMessages.asStateFlow()
 
+        private val _pendingReviewFiles = MutableStateFlow<List<com.tgdrive.core.download.UploadFileItem>>(emptyList())
+        private val _pendingZipFolder = MutableStateFlow<Pair<Uri?, String?>>(null to null)
+        private val _zipPreviewSummary = MutableStateFlow<ZipSelectionSummary?>(null)
+        private val _zipPreviewLoading = MutableStateFlow(false)
+        private val _decryptDialog = MutableStateFlow<DecryptDialogState?>(null)
+        private val _decryptedOpenEvent = MutableStateFlow<DecryptedOpenEvent?>(null)
+        val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = _decryptedOpenEvent.asStateFlow()
+
         private var currentChatId: Long? = null
-        private var pendingZipPassword: String? = null
         private var bindResolveJob: Job? = null
         private var bindJob: Job? = null
         private var pdfWatchJob: Job? = null
         private var refreshJob: Job? = null
         private var searchJob: Job? = null
         private var audioPlayWaitJob: Job? = null
+        private var zipInspectJob: Job? = null
+        private var decryptWaitJob: Job? = null
         private var lastTrashedBatch: List<TrashEntryEntity> = emptyList()
 
         private val _items = MutableStateFlow<List<FileCacheEntity>>(emptyList())
+        private val _boundChatId = MutableStateFlow<Long?>(null)
         private var oldestMessageId: Long = 0L
         private var hasMoreMessages: Boolean = true
 
-        val state: StateFlow<FolderUiState> =
-            combine(
-                _items,
-                _selected,
-                _loading,
-                _refreshing,
-                _error,
-            ) { items, selected, loading, refreshing, error ->
-                FolderCoreState(items, selected, loading, refreshing, error)
-            }.let { core ->
-                combine(core, _search, preferences.data, _uploads, _pdfThumbnails) { c, search, prefs, uploads, pdfThumbs ->
-                    val searched =
-                        if (search.isBlank()) {
-                            c.items
-                        } else {
-                            c.items.filter {
-                                it.fileName.contains(
-                                    search,
-                                    ignoreCase = true,
-                                )
-                            }
-                        }
-                    val filtered = applyFilter(searched, prefs.fileFilter)
-                    val sorted = applySort(filtered, prefs.fileSort)
-                    FolderUiState(
-                        items = sorted,
-                        selectedIds = c.selected,
-                        loading = c.loading,
-                        refreshing = c.refreshing,
-                        error = c.error,
-                        search = search,
-                        viewMode = prefs.fileViewMode,
-                        fileFilter = prefs.fileFilter,
-                        fileSort = prefs.fileSort,
-                        uploads = uploads,
-                        pdfThumbnails = pdfThumbs,
-                    )
-                }.flowOn(dispatchers.default)
-            }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
+        init {
+            viewModelScope.launch(dispatchers.io) {
+                uploadManager.completedChatEvents.collect { doneChatId ->
+                    if (doneChatId == currentChatId) {
+                        refresh()
+                    }
+                }
+            }
+        }
 
         private data class FolderCoreState(
             val items: List<FileCacheEntity>,
@@ -195,6 +194,79 @@ class FolderViewModel
             val refreshing: Boolean,
             val error: String?,
         )
+
+        private data class FolderOverlayState(
+            val reviewFiles: List<com.tgdrive.core.download.UploadFileItem>,
+            val zipFolder: Pair<Uri?, String?>,
+            val zipSummary: ZipSelectionSummary?,
+            val zipSummaryLoading: Boolean,
+            val decryptDialog: DecryptDialogState?,
+        )
+
+        val state: StateFlow<FolderUiState> =
+            combine(
+                combine(_items, _selected, _loading, _refreshing, _error) { items, selected, loading, refreshing, error ->
+                    FolderCoreState(items, selected, loading, refreshing, error)
+                },
+                combine(
+                    _pendingReviewFiles,
+                    _pendingZipFolder,
+                    _zipPreviewSummary,
+                    _zipPreviewLoading,
+                    _decryptDialog,
+                ) { review, zipFolder, summary, summaryLoading, decrypt ->
+                    FolderOverlayState(review, zipFolder, summary, summaryLoading, decrypt)
+                },
+                combine(_search, preferences.data, uploadManager.uploads, _pdfThumbnails, _boundChatId) {
+                        search,
+                        prefs,
+                        uploadQueue,
+                        pdfThumbs,
+                        boundId,
+                    ->
+                    listOf(search, prefs, uploadQueue, pdfThumbs, boundId)
+                },
+            ) { c, overlays, aux ->
+                val search = aux[0] as String
+                val prefs = aux[1] as com.tgdrive.core.datastore.AppPreferencesData
+                val uploadQueue = aux[2] as com.tgdrive.core.download.UploadQueueState
+                @Suppress("UNCHECKED_CAST")
+                val pdfThumbs = aux[3] as Map<Long, String>
+                val boundId = aux[4] as Long?
+
+                val searched =
+                    if (search.isBlank()) {
+                        c.items
+                    } else {
+                        c.items.filter { it.fileName.contains(search, ignoreCase = true) }
+                    }
+                val filtered = applyFilter(searched, prefs.fileFilter)
+                val sorted = applySort(filtered, prefs.fileSort)
+                val chatUploads = uploadQueue.items.filter {
+                    boundId == null || it.chatId == boundId || it.chatId == 0L
+                }
+                FolderUiState(
+                    items = sorted,
+                    selectedIds = c.selected,
+                    loading = c.loading,
+                    refreshing = c.refreshing,
+                    error = c.error,
+                    search = search,
+                    viewMode = prefs.fileViewMode,
+                    fileFilter = prefs.fileFilter,
+                    fileSort = prefs.fileSort,
+                    uploads = chatUploads,
+                    pdfThumbnails = pdfThumbs,
+                    pendingReviewFiles = overlays.reviewFiles,
+                    pendingZipTreeUri = overlays.zipFolder.first,
+                    pendingZipFolderName = overlays.zipFolder.second,
+                    zipPreviewSummary = overlays.zipSummary,
+                    zipPreviewLoading = overlays.zipSummaryLoading,
+                    decryptDialog = overlays.decryptDialog,
+                    hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+                )
+            }.flowOn(dispatchers.default)
+                .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
 
         fun bind(chatId: Long) {
             if (chatId == 0L) {
@@ -216,6 +288,7 @@ class FolderViewModel
         private fun bindResolved(chatId: Long) {
             if (chatId == currentChatId) return
             currentChatId = chatId
+            _boundChatId.value = chatId
             bindJob?.cancel()
             pdfWatchJob?.cancel()
             refreshJob?.cancel()
@@ -429,30 +502,8 @@ class FolderViewModel
             _snackbarEvent.value = FolderSnackbarEvent(System.nanoTime(), message, canUndoTrash = false)
         }
 
-        fun setPendingZipOptions(zipName: String?, password: String?) {
-            savedStateHandle[KEY_PENDING_ZIP_NAME] = zipName
-            savedStateHandle[KEY_PENDING_ZIP_ENCRYPTED] = !password.isNullOrBlank()
-            pendingZipPassword = password
-        }
-
-        fun clearPendingZipOptions() {
-            savedStateHandle.remove<String?>(KEY_PENDING_ZIP_NAME)
-            savedStateHandle.remove<Boolean>(KEY_PENDING_ZIP_ENCRYPTED)
-            pendingZipPassword = null
-        }
-
-        fun onZipFolderPicked(treeUri: Uri?) {
-            val zipName = savedStateHandle.get<String?>(KEY_PENDING_ZIP_NAME)
-            val encryptedRequired = savedStateHandle.get<Boolean>(KEY_PENDING_ZIP_ENCRYPTED) ?: false
-            val password = pendingZipPassword
-            clearPendingZipOptions()
-
-            if (treeUri == null) return
-            if (encryptedRequired && password.isNullOrBlank()) {
-                _error.value = "ZIP encryption password was cleared while in background; please enter it again"
-                return
-            }
-            uploadFolderAsZip(treeUri, zipName = zipName, password = password)
+        fun clearDecryptedOpenEvent() {
+            _decryptedOpenEvent.value = null
         }
 
         fun toggleStar(messageId: Long) {
@@ -526,7 +577,7 @@ class FolderViewModel
                 try {
                     fileCacheDao.updateFileName(chatId, messageId, newName)
                     cloudSyncManager.noteFileRenamed(chatId, messageId, newName)
-                    Log.i("renameFile: updated local cache for msgId=$messageId → '$newName'")
+                    Log.i("renameFile: updated local cache for msgId=$messageId -> '$newName'")
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
@@ -542,7 +593,6 @@ class FolderViewModel
                 _error.value = "No files to restore"
                 return
             }
-            Log.i("restoreFolder: downloading ${toDownload.size} files to local storage")
             viewModelScope.launch(dispatchers.io) {
                 for (item in toDownload) {
                     if (getLocalPath(item.messageId) == null) {
@@ -689,7 +739,7 @@ class FolderViewModel
             }
         }
 
-        suspend fun listFoldersForMove(): List<com.tgdrive.core.telegram.TelegramFolder> =
+        suspend fun listFoldersForMove(): List<TelegramFolder> =
             try {
                 telegramClient.listFolders()
             } catch (t: Throwable) {
@@ -697,324 +747,246 @@ class FolderViewModel
                 emptyList()
             }
 
-        fun uploadFromUris(uris: List<Uri>) {
-            val chatId = currentChatId ?: return
+        // ---- Unified Upload Workflows ----
+
+        fun prepareFileUploadReview(uris: List<Uri>) {
+            if (uris.isEmpty()) return
             viewModelScope.launch(dispatchers.io) {
-                val maxLimit = runCatching { telegramClient.maxUploadSizeBytes() }
-                    .getOrDefault(TelegramClient.MAX_FILE_SIZE_STANDARD)
-                for (uri in uris) {
-                    val id =
-                        java.util.UUID
-                            .randomUUID()
-                            .mostSignificantBits and Long.MAX_VALUE
-                    val trackerKey = "folder_ul_$id"
-                    val name = queryDisplayName(uri) ?: "file_$id"
+                val resolved = uploadManager.resolveFileItems(uris)
+                _pendingReviewFiles.value = resolved
+            }
+        }
 
-                    val fileSize = queryFileSize(uri)
-                    if (fileSize != null && fileSize > maxLimit) {
-                        val limitGb = maxLimit / (1024L * 1024 * 1024)
-                        _uploads.update {
-                            it +
-                                UploadProgress(id, name, fileSize, 0f, UploadStatus.FAILED, "File exceeds $limitGb GB limit")
-                        }
-                        continue
-                    }
+        fun dismissFileUploadReview() {
+            _pendingReviewFiles.value = emptyList()
+        }
 
-                    val staging = copyToStaging(uri, name) ?: continue
-
-                    val realSize = staging.length()
-                    if (realSize > 0L) {
-                        val existing = fileCacheDao.findDuplicate(chatId, name, realSize)
-                        if (existing != null) {
-                            Log.i("uploadFromUris: skipping '$name' — already uploaded")
-                            staging.delete()
-                            _uploads.update {
-                                it +
-                                    UploadProgress(
-                                        id,
-                                        name,
-                                        realSize,
-                                        1f,
-                                        UploadStatus.DONE,
-                                        "Already uploaded — skipped",
-                                    )
-                            }
-                            continue
-                        }
-                    }
-
-                    _uploads.update { it + UploadProgress(id, name, realSize, 0f, UploadStatus.UPLOADING) }
-                    uploadTracker.beginUpload(trackerKey, chatId, name, realSize)
-                    try {
-                        val result =
-                            telegramClient.uploadFile(
-                                chatId = chatId,
-                                localPath = staging.absolutePath,
-                                fileName = name,
-                                mimeType = guessMime(name),
-                            ) { sent, total ->
-                                val p = if (total <= 0) 0f else sent.toFloat() / total.toFloat()
-                                _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
-                                uploadTracker.updateProgress(trackerKey, sent, total)
-                            }
-                        val localThumb =
-                            mediaThumbnailCache.generateFromLocalFile(
-                                chatId = chatId,
-                                messageId = result.messageId,
-                                localPath = staging.absolutePath,
-                                mimeType = guessMime(name),
-                                fileName = name,
-                            )
-                        fileCacheDao.upsertAll(
-                            listOf(
-                                FileCacheEntity(
-                                    messageId = result.messageId,
-                                    chatId = chatId,
-                                    fileName = name,
-                                    fileSize = realSize,
-                                    mimeType = guessMime(name),
-                                    thumbnailPath = localThumb,
-                                    remoteId = result.remoteId,
-                                    date = System.currentTimeMillis(),
-                                ),
+        fun confirmFileReview(action: FileReviewAction) {
+            val chatId = currentChatId ?: return
+            _pendingReviewFiles.value = emptyList()
+            when (action) {
+                is FileReviewAction.NormalUpload -> {
+                    uploadManager.enqueueFiles(chatId, action.files, action.options)
+                }
+                is FileReviewAction.PackAsZip -> {
+                    val encEnabled = action.options.useVaultKey || !action.options.password.isNullOrBlank()
+                    uploadManager.enqueueUrisAsZip(
+                        files = action.files,
+                        request = ZipUploadRequest(
+                            chatId = chatId,
+                            baseName = action.options.name,
+                            compressionMode = action.options.compressionMode,
+                            maxPartBytesOverride = action.options.maxPartBytesOverride,
+                            excludePatterns = action.options.excludePatterns,
+                            encryption = UploadEncryptionSpec(
+                                enabled = encEnabled,
+                                useVaultKey = action.options.useVaultKey,
+                                customPassphrase = action.options.password,
                             ),
-                        )
-                        uploadTracker.completeUpload(trackerKey)
-                        _uploads.update { list ->
-                            list.map {
-                                if (it.id == id) {
-                                    it.copy(status = UploadStatus.DONE, progress = 1f)
-                                } else {
-                                    it
-                                }
-                            }
-                        }
-                        Log.i("uploadFromUris: uploaded '$name' → messageId=${result.messageId}")
-                        refresh()
-                    } catch (e: CancellationException) {
-                        uploadTracker.failUpload(trackerKey, "Cancelled")
-                        throw e
-                    } catch (t: Throwable) {
-                        Log.w("Upload failed for $name", t)
-                        uploadTracker.failUpload(trackerKey, t.message ?: "Upload failed")
-                        _uploads.update { list ->
-                            list.map {
-                                if (it.id == id) {
-                                    it.copy(status = UploadStatus.FAILED, errorMessage = t.message ?: "Upload failed")
-                                } else {
-                                    it
-                                }
-                            }
-                        }
-                    } finally {
-                        staging.delete()
-                    }
+                        ),
+                    )
                 }
             }
         }
 
-        fun uploadFolderAsZip(
+        fun uploadFolderAsNormal(
             treeUri: Uri,
-            zipName: String? = null,
-            password: String? = null,
+            options: NormalUploadOptions,
         ) {
             val chatId = currentChatId ?: return
-            viewModelScope.launch(dispatchers.io) {
-                val id =
-                    java.util.UUID
-                        .randomUUID()
-                        .mostSignificantBits and Long.MAX_VALUE
-                val name =
-                    zipName?.takeIf { it.isNotBlank() }?.let { sanitizeZipName(it) }
-                        ?: "folder_${System.currentTimeMillis()}"
-                _uploads.update {
-                    it +
-                        UploadProgress(
-                            id,
-                            if (password.isNullOrBlank()) "Zipping folder…" else "Zipping + encrypting…",
-                            0,
-                            0f,
-                            UploadStatus.UPLOADING,
-                        )
-                }
-                val stagingDir = File(appContext.cacheDir, "upload_staging").apply { mkdirs() }
-                var manifestFile: File? = null
+            uploadManager.enqueueFolderAsNormalFiles(chatId, treeUri, options)
+        }
+
+        fun onZipFolderPicked(
+            treeUri: Uri?,
+            folderDisplayName: String? = null,
+        ) {
+            if (treeUri == null) {
+                dismissZipDialog()
+                return
+            }
+            val cleanName = folderDisplayName?.takeIf { it.isNotBlank() }
+            _pendingZipFolder.value = treeUri to cleanName
+            inspectZipFolder(treeUri, excludePatterns = "", maxPartBytesOverride = null)
+        }
+
+        fun inspectZipFolder(
+            treeUri: Uri,
+            excludePatterns: String,
+            maxPartBytesOverride: Long?,
+        ) {
+            zipInspectJob?.cancel()
+            zipInspectJob = viewModelScope.launch(dispatchers.io) {
+                _zipPreviewLoading.value = true
                 try {
-                    val maxPartBytes = runCatching { telegramClient.safeZipChunkLimitBytes() }
+                    val patterns = ZipExcludeMatcher.parse(excludePatterns)
+                    val accountCap = runCatching { telegramClient.safeZipChunkLimitBytes() }
                         .getOrDefault(TelegramClient.SAFE_CHUNK_LIMIT_STANDARD)
-                    val uploadedParts = mutableListOf<UploadedZipPartRecord>()
-                    val summary = ZipUploader.zipFolderInParts(
+                    val maxPart = maxPartBytesOverride?.takeIf { it > 0L }?.coerceAtMost(accountCap) ?: accountCap
+                    val summary = ZipUploader.inspectTreeSummary(
                         context = appContext,
                         treeUri = treeUri,
-                        workDir = stagingDir,
-                        baseZipName = name,
-                        maxPartBytes = maxPartBytes,
-                        password = password,
-                    ) { part ->
-                        val partFileName = part.partFile.name
-                        val partLen = part.partFile.length()
-                        val partTrackerKey = "folder_zip_${id}_${part.partIndex}"
-                        _uploads.update { list ->
-                            list.map {
-                                if (it.id == id) {
-                                    it.copy(name = partFileName, size = partLen, progress = 0f)
-                                } else {
-                                    it
-                                }
-                            }
-                        }
-                        uploadTracker.beginUpload(partTrackerKey, chatId, partFileName, partLen)
-                        try {
-                            val result = telegramClient.uploadFile(
-                                chatId = chatId,
-                                localPath = part.partFile.absolutePath,
-                                fileName = partFileName,
-                                mimeType = "application/zip",
-                            ) { sent, total ->
-                                val p = if (total <= 0) 0f else sent.toFloat() / total.toFloat()
-                                _uploads.update { list -> list.map { if (it.id == id) it.copy(progress = p) else it } }
-                                uploadTracker.updateProgress(partTrackerKey, sent, total)
-                            }
-                            uploadTracker.completeUpload(partTrackerKey)
-                            val partThumb =
-                                if (password.isNullOrBlank()) {
-                                    mediaThumbnailCache.generateFromLocalFile(
-                                        chatId = chatId,
-                                        messageId = result.messageId,
-                                        localPath = part.partFile.absolutePath,
-                                        mimeType = "application/zip",
-                                        fileName = partFileName,
-                                    )
-                                } else {
-                                    null
-                                }
-                            fileCacheDao.upsertAll(
-                                listOf(
-                                    FileCacheEntity(
-                                        messageId = result.messageId,
-                                        chatId = chatId,
-                                        fileName = partFileName,
-                                        fileSize = partLen,
-                                        mimeType = "application/zip",
-                                        thumbnailPath = partThumb,
-                                        remoteId = result.remoteId,
-                                        date = System.currentTimeMillis(),
-                                    ),
-                                ),
-                            )
-                            try {
-                                zipIndexService.indexPartEntries(
-                                    chatId = chatId,
-                                    zipMessageId = result.messageId,
-                                    zipFileName = partFileName,
-                                    entryPaths = part.entries,
-                                    encrypted = !password.isNullOrBlank(),
-                                )
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (_: Throwable) {
-                            }
-                            uploadedParts += UploadedZipPartRecord(
-                                fileName = partFileName,
-                                fileSizeBytes = partLen,
-                                partIndex = part.partIndex,
-                                isSplitVolume = part.isSplitVolume,
-                                messageId = result.messageId,
-                                entries = part.entries,
-                            )
-                        } catch (t: Throwable) {
-                            uploadTracker.failUpload(partTrackerKey, t.message)
-                            throw t
-                        }
-                    }
-
-                    if (summary.totalFilesProcessed == 0 || uploadedParts.isEmpty()) {
-                        _uploads.update { list ->
-                            list.map {
-                                if (it.id == id) {
-                                    it.copy(status = UploadStatus.FAILED, errorMessage = "No files found in selected folder")
-                                } else {
-                                    it
-                                }
-                            }
-                        }
-                        return@launch
-                    }
-
-                    if (uploadedParts.size > 1) {
-                        val mFile = ZipUploader.writeManifestJsonFile(
-                            outputDir = stagingDir,
-                            baseName = name,
-                            folderName = name,
-                            encrypted = !password.isNullOrBlank(),
-                            parts = uploadedParts,
-                        )
-                        manifestFile = mFile
-                        val mLen = mFile.length()
-                        val mKey = "folder_zip_${id}_manifest"
-                        uploadTracker.beginUpload(mKey, chatId, mFile.name, mLen)
-                        val mResult = telegramClient.uploadFile(
-                            chatId = chatId,
-                            localPath = mFile.absolutePath,
-                            fileName = mFile.name,
-                            mimeType = "application/json",
-                        ) { sent, total ->
-                            uploadTracker.updateProgress(mKey, sent, total)
-                        }
-                        uploadTracker.completeUpload(mKey)
-                        fileCacheDao.upsertAll(
-                            listOf(
-                                FileCacheEntity(
-                                    messageId = mResult.messageId,
-                                    chatId = chatId,
-                                    fileName = mFile.name,
-                                    fileSize = mLen,
-                                    mimeType = "application/json",
-                                    thumbnailPath = null,
-                                    remoteId = mResult.remoteId,
-                                    date = System.currentTimeMillis(),
-                                ),
-                            ),
-                        )
-                        showSnackbar("Uploaded ${uploadedParts.size} ZIP parts + manifest")
-                    }
-
-                    _uploads.update { list ->
-                        list.map {
-                            if (it.id == id) {
-                                val finalLabel = if (uploadedParts.size > 1) {
-                                    "${name}_part001..${uploadedParts.size}.zip"
-                                } else {
-                                    uploadedParts.first().fileName
-                                }
-                                it.copy(name = finalLabel, status = UploadStatus.DONE, progress = 1f)
-                            } else {
-                                it
-                            }
-                        }
-                    }
-                    refresh()
+                        maxPartBytes = maxPart,
+                        excludeMatcher = if (patterns.isEmpty()) {
+                            null
+                        } else {
+                            { relPath, name -> ZipExcludeMatcher.matchesPath(relPath, name, patterns) }
+                        },
+                    )
+                    _zipPreviewSummary.value = summary
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
-                    Log.w("uploadFolderAsZip failed", t)
-                    _uploads.update { list ->
-                        list.map {
-                            if (it.id == id) {
-                                it.copy(status = UploadStatus.FAILED, errorMessage = t.message ?: "Upload failed")
-                            } else {
-                                it
-                            }
-                        }
-                    }
+                    Log.w("inspectZipFolder failed", t)
                 } finally {
-                    runCatching { manifestFile?.delete() }
+                    _zipPreviewLoading.value = false
                 }
             }
         }
 
+        fun confirmZipFolderUpload(options: ZipUploadOptions) {
+            val treeUri = _pendingZipFolder.value.first ?: return
+            val chatId = currentChatId ?: return
+            dismissZipDialog()
+            val encEnabled = options.useVaultKey || !options.password.isNullOrBlank()
+            uploadManager.enqueueFolderAsZip(
+                treeUri = treeUri,
+                request = ZipUploadRequest(
+                    chatId = chatId,
+                    baseName = options.name,
+                    compressionMode = options.compressionMode,
+                    maxPartBytesOverride = options.maxPartBytesOverride,
+                    excludePatterns = options.excludePatterns,
+                    encryption = UploadEncryptionSpec(
+                        enabled = encEnabled,
+                        useVaultKey = options.useVaultKey,
+                        customPassphrase = options.password,
+                    ),
+                ),
+            )
+        }
+
+        fun dismissZipDialog() {
+            zipInspectJob?.cancel()
+            _pendingZipFolder.value = null to null
+            _zipPreviewSummary.value = null
+            _zipPreviewLoading.value = false
+        }
+
+        fun cancelUpload(uploadId: String) {
+            uploadManager.cancel(uploadId)
+        }
+
+        fun retryUpload(uploadId: String) {
+            uploadManager.retry(uploadId)
+        }
+
         fun clearFinishedUploads() {
-            _uploads.update { list -> list.filter { it.status == UploadStatus.UPLOADING } }
+            uploadTracker.clearCompleted()
+        }
+
+        // ---- Decryption Workflow (.tgenc) ----
+
+        fun startDecryptFlow(item: FileCacheEntity) {
+            decryptWaitJob?.cancel()
+            val localPath = getLocalPath(item.messageId)
+            val localFile = localPath?.let(::File)?.takeIf { it.isFile }
+            if (localFile != null) {
+                val fmt = uploadManager.detectEncryptedFormat(localFile)
+                _decryptDialog.value = DecryptDialogState(
+                    item = item,
+                    localFile = localFile,
+                    format = fmt,
+                )
+                return
+            }
+            if (item.remoteId.isBlank()) {
+                _error.value = "File has no remote ID — can't download"
+                return
+            }
+            _decryptDialog.value = DecryptDialogState(
+                item = item,
+                downloading = true,
+            )
+            downloadFile(item)
+            decryptWaitJob = viewModelScope.launch(dispatchers.io) {
+                val terminal = downloadManager.state
+                    .map { st ->
+                        st.items.find { it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId) }
+                    }
+                    .first { dl ->
+                        dl == null ||
+                            dl.status == DownloadStatus.DONE ||
+                            dl.status == DownloadStatus.FAILED ||
+                            dl.status == DownloadStatus.CANCELLED
+                    }
+                when (terminal?.status) {
+                    DownloadStatus.DONE -> {
+                        val f = terminal.localPath?.let(::File)?.takeIf { it.isFile }
+                        if (f != null) {
+                            val fmt = uploadManager.detectEncryptedFormat(f)
+                            _decryptDialog.update { cur ->
+                                cur?.copy(localFile = f, format = fmt, downloading = false, error = null)
+                            }
+                        } else {
+                            _decryptDialog.update { cur ->
+                                cur?.copy(downloading = false, error = "Downloaded file could not be opened")
+                            }
+                        }
+                    }
+                    DownloadStatus.FAILED -> {
+                        _decryptDialog.update { cur ->
+                            cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
+                        }
+                    }
+                    else -> {
+                        _decryptDialog.value = null
+                    }
+                }
+            }
+        }
+
+        fun decryptTarget(
+            passphrase: String?,
+            saveToDownloads: Boolean,
+        ) {
+            val current = _decryptDialog.value ?: return
+            val localFile = current.localFile
+            if (localFile == null || !localFile.isFile) {
+                _decryptDialog.update { it?.copy(error = "Waiting for download to complete…") }
+                return
+            }
+            viewModelScope.launch(dispatchers.io) {
+                _decryptDialog.update { it?.copy(decrypting = true, error = null) }
+                when (
+                    val outcome = uploadManager.decryptLocalFile(
+                        encryptedFile = localFile,
+                        originalDisplayName = current.item.fileName,
+                        passphrase = passphrase,
+                        saveToDownloads = saveToDownloads,
+                    )
+                ) {
+                    is DecryptOutcome.Success -> {
+                        _decryptDialog.value = null
+                        if (saveToDownloads) {
+                            showSnackbar("Saved decrypted file: ${outcome.displayName}")
+                        } else {
+                            _decryptedOpenEvent.value = DecryptedOpenEvent(System.nanoTime(), outcome)
+                        }
+                    }
+                    is DecryptOutcome.WrongPassphrase -> {
+                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
+                    }
+                    is DecryptOutcome.Failed -> {
+                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
+                    }
+                }
+            }
+        }
+
+        fun dismissDecryptDialog() {
+            decryptWaitJob?.cancel()
+            _decryptDialog.value = null
         }
 
         fun downloadFile(item: FileCacheEntity) {
@@ -1049,7 +1021,6 @@ class FolderViewModel
                         }
                         _error.value = null
                         showSnackbar("Share link copied to clipboard")
-                        Log.i("shareLink: copied → $link")
                     } else {
                         _error.value = "Share links are only available for channel folders (not Saved Messages)"
                     }
@@ -1121,7 +1092,7 @@ class FolderViewModel
                     ?.takeIf { it.status == DownloadStatus.DONE }
                     ?.localPath ?: return null
             if (!File(path).exists()) {
-                Log.w("getLocalPath: file evicted from cache → $path")
+                Log.w("getLocalPath: file evicted from cache -> $path")
                 return null
             }
             return path
@@ -1159,6 +1130,7 @@ class FolderViewModel
                             source.inputStream().use { it.copyTo(out) }
                         } ?: throw IllegalStateException("Could not open Downloads stream")
                     } else {
+                        @Suppress("DEPRECATION")
                         val dir =
                             android.os.Environment.getExternalStoragePublicDirectory(
                                 android.os.Environment.DIRECTORY_DOWNLOADS,
@@ -1181,18 +1153,16 @@ class FolderViewModel
         ): List<FileCacheEntity> {
             if (filter == FileFilter.ALL) return items
             return items.filter { item ->
-                val bucket =
-                    com.tgdrive.core.common
-                        .classifyFile(item.mimeType, item.fileName)
+                val bucket = classifyFile(item.mimeType, item.fileName)
                 when (filter) {
                     FileFilter.ALL -> true
-                    FileFilter.IMAGES -> bucket == com.tgdrive.core.common.FileBucket.IMAGES
-                    FileFilter.VIDEOS -> bucket == com.tgdrive.core.common.FileBucket.VIDEOS
-                    FileFilter.AUDIO -> bucket == com.tgdrive.core.common.FileBucket.AUDIO
+                    FileFilter.IMAGES -> bucket == FileBucket.IMAGES
+                    FileFilter.VIDEOS -> bucket == FileBucket.VIDEOS
+                    FileFilter.AUDIO -> bucket == FileBucket.AUDIO
                     FileFilter.DOCUMENTS ->
-                        bucket == com.tgdrive.core.common.FileBucket.PDF ||
-                            bucket == com.tgdrive.core.common.FileBucket.DOCUMENTS
-                    FileFilter.ARCHIVES -> bucket == com.tgdrive.core.common.FileBucket.ARCHIVES
+                        bucket == FileBucket.PDF ||
+                            bucket == FileBucket.DOCUMENTS
+                    FileFilter.ARCHIVES -> bucket == FileBucket.ARCHIVES
                 }
             }
         }
@@ -1226,86 +1196,6 @@ class FolderViewModel
             viewModelScope.launch(dispatchers.io) { preferences.update { it.copy(fileSort = sort) } }
         }
 
-        private fun queryDisplayName(uri: Uri): String? =
-            try {
-                appContext.contentResolver
-                    .query(
-                        uri,
-                        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
-                        null,
-                        null,
-                        null,
-                    )?.use { c ->
-                        if (c.moveToFirst()) c.getString(0) else null
-                    }
-            } catch (t: Throwable) {
-                null
-            }
-
-        private fun queryFileSize(uri: Uri): Long? =
-            try {
-                appContext.contentResolver
-                    .query(
-                        uri,
-                        arrayOf(android.provider.OpenableColumns.SIZE),
-                        null,
-                        null,
-                        null,
-                    )?.use { c ->
-                        if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
-                    }
-            } catch (t: Throwable) {
-                null
-            }
-
-        private fun copyToStaging(
-            uri: Uri,
-            name: String,
-        ): File? {
-            return try {
-                val stagingDir = File(appContext.cacheDir, "upload_staging").apply { mkdirs() }
-                val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
-                val target = File(stagingDir, "${System.currentTimeMillis()}_$safe")
-                appContext.contentResolver.openInputStream(uri)?.use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                } ?: return null
-                target
-            } catch (t: Throwable) {
-                Log.w("Failed to copy $name", t)
-                null
-            }
-        }
-
-        private fun sanitizeZipName(name: String): String {
-            var sanitized = name.trim()
-            if (sanitized.endsWith(".zip", ignoreCase = true)) {
-                sanitized = sanitized.dropLast(4)
-            }
-            sanitized = sanitized.replace(Regex("[/\\\\:*?\"<>|]"), "_")
-            return sanitized.ifBlank { "folder_${System.currentTimeMillis()}" }
-        }
-
-        private fun guessMime(name: String): String {
-            val ext = name.substringAfterLast('.', "").lowercase()
-            return when (ext) {
-                "jpg", "jpeg" -> "image/jpeg"
-                "png" -> "image/png"
-                "gif" -> "image/gif"
-                "webp" -> "image/webp"
-                "mp4" -> "video/mp4"
-                "mkv" -> "video/x-matroska"
-                "mov" -> "video/quicktime"
-                "mp3" -> "audio/mpeg"
-                "wav" -> "audio/wav"
-                "flac" -> "audio/flac"
-                "pdf" -> "application/pdf"
-                "zip" -> "application/zip"
-                "txt" -> "text/plain"
-                "json" -> "application/json"
-                else -> "application/octet-stream"
-            }
-        }
-
         private fun hasThumbnailableKind(entity: FileCacheEntity): Boolean {
             val ext = entity.fileName.substringAfterLast('.', "").lowercase()
             return ext in THUMBNAILABLE_EXTS ||
@@ -1324,9 +1214,4 @@ class FolderViewModel
                 remoteId = fileRemoteId,
                 date = date,
             )
-
-        companion object {
-            private const val KEY_PENDING_ZIP_NAME = "pending_zip_name"
-            private const val KEY_PENDING_ZIP_ENCRYPTED = "pending_zip_encrypted"
-        }
     }

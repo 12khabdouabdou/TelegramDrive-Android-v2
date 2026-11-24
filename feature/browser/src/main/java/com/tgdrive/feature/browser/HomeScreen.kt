@@ -79,11 +79,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.documentfile.provider.DocumentFile
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -101,6 +103,8 @@ import com.tgdrive.designsystem.components.TintedGlassPanel
 import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.folders.CreateFolderSheet
+import com.tgdrive.feature.upload.FileUploadReviewDialog
+import com.tgdrive.feature.upload.ZipUploadOptionsDialog
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -123,11 +127,18 @@ fun HomeScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbarMsg by vm.snackbar.collectAsStateWithLifecycle()
+    val pendingReview by vm.pendingReviewFiles.collectAsStateWithLifecycle()
+    val pendingZipFolder by vm.pendingZipFolder.collectAsStateWithLifecycle()
+    val zipPreviewSummary by vm.zipPreviewSummary.collectAsStateWithLifecycle()
+    val zipPreviewLoading by vm.zipPreviewLoading.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val snackbarHostState = remember { SnackbarHostState() }
     var showQuickCreate by remember { mutableStateOf(false) }
     var showCreateFolder by remember { mutableStateOf(false) }
     var selectedTargetChatId by remember { mutableLongStateOf(0L) }
+    var zipExcludesDraft by remember { mutableStateOf("") }
+    var zipPartCapDraft by remember { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(state.savedMessagesChatId) {
         if (selectedTargetChatId == 0L && state.savedMessagesChatId != 0L) {
@@ -146,7 +157,19 @@ fun HomeScreen(
     ) { uris: List<Uri> ->
         if (uris.isNotEmpty()) {
             val target = selectedTargetChatId.takeIf { it != 0L } ?: state.savedMessagesChatId
-            vm.uploadFilesToChat(target, uris)
+            vm.prepareFileReview(target, uris)
+        }
+    }
+
+    val zipFolderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val target = selectedTargetChatId.takeIf { it != 0L } ?: state.savedMessagesChatId
+            val folderName = runCatching { DocumentFile.fromTreeUri(context, uri)?.name }.getOrNull()
+            zipExcludesDraft = ""
+            zipPartCapDraft = null
+            vm.onZipFolderPicked(target, uri, folderName)
         }
     }
 
@@ -533,14 +556,10 @@ fun HomeScreen(
                 QuickSheetActionRow(
                     icon = Icons.Filled.FolderZip,
                     title = stringResource(R.string.home_quick_upload_zip),
-                    subtitle = stringResource(R.string.home_quick_upload_zip_desc),
+                    subtitle = stringResource(R.string.home_quick_upload_zip_desc_direct),
                     onClick = {
-                        val target = selectedTargetChatId.takeIf { it != 0L } ?: state.savedMessagesChatId
-                        val title = state.folders.firstOrNull { it.channelId == target }?.title ?: savedTitle
                         showQuickCreate = false
-                        if (target != 0L) {
-                            onOpenFolder(target, title)
-                        }
+                        zipFolderPicker.launch(null)
                     },
                 )
                 QuickSheetActionRow(
@@ -563,6 +582,34 @@ fun HomeScreen(
                 showCreateFolder = false
                 vm.refreshFolders()
             },
+        )
+    }
+
+    pendingReview?.let { (_, files) ->
+        if (files.isNotEmpty()) {
+            FileUploadReviewDialog(
+                initialFiles = files,
+                onDismiss = vm::dismissFileReview,
+                onConfirm = vm::confirmFileReview,
+            )
+        }
+    }
+
+    pendingZipFolder?.let { (_, treeUri, folderName) ->
+        ZipUploadOptionsDialog(
+            initialName = folderName,
+            summary = zipPreviewSummary,
+            summaryLoading = zipPreviewLoading,
+            onExcludePatternsChanged = { pat ->
+                zipExcludesDraft = pat
+                vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)
+            },
+            onMaxPartSizeChanged = { cap ->
+                zipPartCapDraft = cap
+                vm.inspectZipFolder(treeUri, zipExcludesDraft, cap)
+            },
+            onDismiss = vm::dismissZipDialog,
+            onConfirm = vm::confirmZipFolderUpload,
         )
     }
 }

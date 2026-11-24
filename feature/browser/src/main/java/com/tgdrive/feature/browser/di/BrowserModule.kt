@@ -1,6 +1,7 @@
 package com.tgdrive.feature.browser.di
 
 import com.tgdrive.core.zip.ZipUploader
+import com.tgdrive.feature.browser.ZipAllExtractor
 import com.tgdrive.feature.browser.ZipExtractor
 import com.tgdrive.feature.browser.ZipLister
 import dagger.Module
@@ -11,7 +12,7 @@ import java.io.File
 import javax.inject.Singleton
 
 /**
- * Wires [ZipLister] / [ZipExtractor] to the production [ZipUploader] singleton.
+ * Wires [ZipLister] / [ZipExtractor] / [ZipAllExtractor] to [ZipUploader].
  *
  * Tests substitute these by constructing the ViewModel directly with
  * in-memory fakes (see [com.tgdrive.feature.browser.TestZipUploader]).
@@ -33,20 +34,15 @@ object BrowserModule {
             extractSingleEntry(zipPath, entryName, outputDir, password)
         }
 
+    @Provides
+    @Singleton
+    fun provideZipAllExtractor(): ZipAllExtractor =
+        ZipAllExtractor { zipPath, outputDir, password ->
+            ZipUploader.extractAll(zipPath, outputDir, password)
+        }
+
     /**
-     * Extract a single entry from a ZIP archive.
-     *
-     * zip4j doesn't have a direct "extract one entry" API, so we use
-     * `ZipFile.getFileHeader(entryName)` + `extractFile(header, outputDir)`.
-     *
-     * Path resolution: zip4j's `extractFile(header, destPath)` preserves
-     * the entry's internal path — extracting `subfolder/photo.jpg` to
-     * `destPath/subfolder/photo.jpg` (not just `destPath/photo.jpg`).
-     * The actual extracted file is at `destPath + "/" + header.fileName`,
-     * so we return THAT, not the last path segment. Returning the wrong
-     * path here means the UI tries to open a non-existent file and the
-     * external app silently fails — root cause of the
-     * "can't open videos/pictures from password-protected ZIP" bug.
+     * Extract a single entry from a ZIP archive preserving the entry's internal subpath.
      */
     private fun extractSingleEntry(
         zipPath: String,
@@ -58,7 +54,7 @@ object BrowserModule {
             outputDir.mkdirs()
             val outRoot = outputDir.canonicalFile.canonicalPath + File.separator
             val openZip =
-                if (password != null) {
+                if (!password.isNullOrBlank()) {
                     net.lingala.zip4j.ZipFile(File(zipPath), password.toCharArray())
                 } else {
                     net.lingala.zip4j.ZipFile(File(zipPath))

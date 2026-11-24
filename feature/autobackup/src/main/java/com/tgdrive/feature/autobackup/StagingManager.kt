@@ -94,6 +94,24 @@ class StagingManager @Inject constructor(
         expectedSize: Long,
         quality: BackupQuality,
         encrypt: Boolean,
+    ): StageOutcome = stageForUpload(
+        uriStr = uriStr,
+        displayName = displayName,
+        mimeType = mimeType,
+        expectedSize = expectedSize,
+        quality = quality,
+        encrypt = encrypt,
+        useCustomPassphrase = false,
+    )
+
+    fun stageForUpload(
+        uriStr: String,
+        displayName: String,
+        mimeType: String,
+        expectedSize: Long,
+        quality: BackupQuality,
+        encrypt: Boolean,
+        useCustomPassphrase: Boolean,
     ): StageOutcome {
         val neededBytes = if (encrypt) expectedSize * 2L else expectedSize
         if (!hasEnoughDiskSpace(neededBytes)) {
@@ -124,7 +142,7 @@ class StagingManager @Inject constructor(
         if (encrypt) {
             val encFile = File(stagingDir, "${currentFile.name}.tgenc")
             return try {
-                backupCrypto.encryptFile(currentFile, encFile)
+                backupCrypto.encryptFileWithBackupSettings(currentFile, encFile, useCustomPassphrase)
                 currentFile.delete()
                 StageOutcome.Ready(
                     path = encFile.absolutePath,

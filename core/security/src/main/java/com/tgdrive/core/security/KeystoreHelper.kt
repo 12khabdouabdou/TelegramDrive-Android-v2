@@ -148,6 +148,9 @@ class KeystoreHelper @Inject constructor(
     fun putString(key: String, value: String): Boolean =
         safeWrite { it.putString(key, value) }
 
+    fun remove(key: String): Boolean =
+        safeWrite { it.remove(key) }
+
     fun getApiCreds(): ApiCredentials? =
         safeRead { prefs ->
             val id = prefs.getString(KEY_API_ID, null)?.trim()

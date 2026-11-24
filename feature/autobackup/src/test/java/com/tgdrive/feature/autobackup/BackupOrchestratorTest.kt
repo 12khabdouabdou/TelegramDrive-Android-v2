@@ -273,4 +273,39 @@ class BackupOrchestratorTest {
         assertThat(captured.failedCount).isEqualTo(1)
         assertThat(BackupFailureRecord.decode(captured.failedDetailsJson).single().fileName).isEqualTo("huge.mkv")
     }
+
+    @Test
+    fun `global backupEncryptAll encrypts unflagged folder backups`() = runTest(testDispatcher) {
+        val folderUri = "content://com.android.externalstorage.documents/tree/primary%3ADocs"
+        prefsFlow.value = prefsFlow.value.copy(
+            backupFolderUris = setOf(folderUri),
+            backupEncryptAll = true,
+            backupEncryptedFolderUris = emptySet(),
+        )
+        val doc = LocalFile("content://doc/tax", "tax.pdf", 200L, 2_000L, "application/pdf")
+        coEvery { folderScanner.scanDetailed(folderUri, any(), any()) } returns FolderScanResult(
+            files = listOf(doc),
+            folderName = "Docs",
+        )
+        every { stagingManager.stageForUpload(any(), any(), any(), any(), any(), any()) } answers {
+            val encryptedFlag = arg<Boolean>(5)
+            assertThat(encryptedFlag).isTrue()
+            StagingManager.StageOutcome.Ready(
+                "/tmp/tax.pdf.tgenc",
+                "tax.pdf.tgenc",
+                "application/octet-stream",
+                260L,
+                wasEncrypted = true,
+            )
+        }
+        coEvery { telegramClient.uploadFile(any(), any(), any(), any(), any()) } returns UploadResult(120L, "rem120")
+
+        val outcome = orchestrator.runBackup(jobId = "job_global_enc", isManual = true)
+
+        assertThat(outcome).isEqualTo(BackupOrchestrator.RunOutcome.Success(uploaded = 1, skipped = 0, total = 1))
+        val cacheEntries = mutableListOf<List<FileCacheEntity>>()
+        coVerify { fileCacheDao.upsertAll(capture(cacheEntries)) }
+        assertThat(cacheEntries.single().single().isEncryptedVault).isTrue()
+        assertThat(cacheEntries.single().single().fileName).isEqualTo("tax.pdf.tgenc")
+    }
 }

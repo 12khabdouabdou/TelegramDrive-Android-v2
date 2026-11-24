@@ -46,4 +46,15 @@ class AppPreferencesDataTest {
     fun `file view mode enum has 2 entries`() {
         assertThat(FileViewMode.entries).hasSize(2)
     }
+
+    @Test
+    fun `global backupEncryptAll overrides per folder encryption set`() {
+        val defaultPrefs = AppPreferencesData(backupEncryptedFolderUris = setOf("content://folder/a"))
+        assertThat(defaultPrefs.isFolderEncrypted("content://folder/a")).isTrue()
+        assertThat(defaultPrefs.isFolderEncrypted("content://folder/b")).isFalse()
+
+        val globalPrefs = defaultPrefs.copy(backupEncryptAll = true)
+        assertThat(globalPrefs.isFolderEncrypted("content://folder/a")).isTrue()
+        assertThat(globalPrefs.isFolderEncrypted("content://folder/b")).isTrue()
+    }
 }

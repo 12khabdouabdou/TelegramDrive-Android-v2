@@ -21,6 +21,7 @@ import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.entity.FolderEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.feature.autobackup.diff.DiffEngine
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -52,6 +53,7 @@ data class AutoBackupUiState(
     val historyLoaded: Boolean = false,
     val folderStats: Map<String, FolderBackupSummary> = emptyMap(),
     val scanningPending: Boolean = false,
+    val hasCustomPassphrase: Boolean = false,
 )
 
 @HiltViewModel
@@ -64,6 +66,7 @@ class AutoBackupViewModel @Inject constructor(
     private val diffEngine: DiffEngine,
     private val scheduler: BackupScheduler,
     private val registry: ActiveBackupRegistry,
+    private val backupCrypto: BackupCrypto,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val ctx: Context,
 ) : ViewModel() {
@@ -76,14 +79,17 @@ class AutoBackupViewModel @Inject constructor(
 
     private val _pendingPreviews = MutableStateFlow<Map<String, PendingPreview>>(emptyMap())
     private val _scanningPending = MutableStateFlow(false)
+    private val _hasCustomPassphrase = MutableStateFlow(backupCrypto.hasCustomBackupPassphrase())
 
     val state: StateFlow<AutoBackupUiState> = combine(
         preferences.data,
         folderDao.observeAll(),
         syncLogDao.observeRecent(),
         syncedFileDao.observeAll(),
-        combine(_pendingPreviews, _scanningPending) { previews, scanning -> previews to scanning },
-    ) { prefs, folders, history, syncedFiles, (previews, scanning) ->
+        combine(_pendingPreviews, _scanningPending, _hasCustomPassphrase) { previews, scanning, hasPass ->
+            Triple(previews, scanning, hasPass)
+        },
+    ) { prefs, folders, history, syncedFiles, (previews, scanning, hasPass) ->
         val stats = buildFolderSummaries(prefs.backupFolderUris, syncedFiles, previews)
         AutoBackupUiState(
             prefs = prefs,
@@ -92,6 +98,7 @@ class AutoBackupViewModel @Inject constructor(
             historyLoaded = true,
             folderStats = stats,
             scanningPending = scanning,
+            hasCustomPassphrase = hasPass,
         )
     }.catch { t -> Log.w("AutoBackupViewModel: state flow error", t) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AutoBackupUiState())
@@ -402,6 +409,37 @@ class AutoBackupViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             try { preferences.update { it.copy(backupExcludePatterns = v) } }
             catch (t: Throwable) { Log.w("AutoBackup: setExcludePatterns failed", t) }
+        }
+    }
+
+    fun setEncryptAll(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            try { preferences.update { it.copy(backupEncryptAll = enabled) } }
+            catch (t: Throwable) { Log.w("AutoBackup: setEncryptAll failed", t) }
+        }
+    }
+
+    fun setCustomBackupPassphrase(passphrase: String?) {
+        viewModelScope.launch(dispatchers.io) {
+            try {
+                backupCrypto.setCustomBackupPassphrase(passphrase)
+                val configured = backupCrypto.hasCustomBackupPassphrase()
+                _hasCustomPassphrase.value = configured
+                preferences.update { it.copy(backupUseCustomPassphrase = configured) }
+            } catch (t: Throwable) {
+                Log.w("AutoBackup: setCustomBackupPassphrase failed", t)
+            }
+        }
+    }
+
+    fun setUseCustomPassphrase(useCustom: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            try {
+                val allowed = useCustom && backupCrypto.hasCustomBackupPassphrase()
+                preferences.update { it.copy(backupUseCustomPassphrase = allowed) }
+            } catch (t: Throwable) {
+                Log.w("AutoBackup: setUseCustomPassphrase failed", t)
+            }
         }
     }
 

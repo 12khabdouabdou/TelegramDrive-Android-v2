@@ -11,8 +11,8 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Tracks active and recent uploads across FolderViewModel & AutoBackup so the unified
- * Transfers tab and [TransferKeepAliveWorker] have live upload progress, speed, and ETA.
+ * Process-wide live upload queue tracker shared by [UploadManager],
+ * [TransferKeepAliveWorker], `FolderScreen`, and the unified Transfers tab.
  */
 @Singleton
 class UploadTracker @Inject constructor(
@@ -25,6 +25,25 @@ class UploadTracker @Inject constructor(
     private val samples = ConcurrentHashMap<String, SpeedSample>()
 
     fun beginUpload(id: String, chatId: Long, fileName: String, totalBytes: Long) {
+        start(
+            id = id,
+            chatId = chatId,
+            fileName = fileName,
+            totalBytes = totalBytes,
+            status = UploadStatus.UPLOADING,
+        )
+    }
+
+    fun start(
+        id: String,
+        fileName: String,
+        totalBytes: Long,
+        chatId: Long = 0L,
+        status: UploadStatus = UploadStatus.QUEUED,
+        statusDetail: String? = null,
+        isEncrypted: Boolean = false,
+        canCancel: Boolean = true,
+    ) {
         val now = System.currentTimeMillis()
         samples[id] = SpeedSample(lastMs = now, lastBytes = 0L, smoothedBps = 0L)
         val item = UploadItem(
@@ -34,13 +53,54 @@ class UploadTracker @Inject constructor(
             totalBytes = totalBytes.coerceAtLeast(0L),
             uploadedBytes = 0L,
             progress = 0f,
-            status = UploadStatus.UPLOADING,
+            status = status,
+            statusDetail = statusDetail,
+            isEncrypted = isEncrypted,
+            canCancel = canCancel,
+            canRetry = false,
             startedAtMs = now,
         )
         _state.update { cur ->
             cur.copy(items = cur.items.filterNot { it.id == id } + item)
         }
         TransferKeepAliveWorker.ensureRunning(ctx)
+    }
+
+    fun updatePhase(
+        id: String,
+        status: UploadStatus,
+        detail: String? = null,
+        progress: Float? = null,
+        totalBytes: Long? = null,
+        fileName: String? = null,
+        isEncrypted: Boolean? = null,
+    ) {
+        if (status == UploadStatus.UPLOADING) {
+            samples.computeIfAbsent(id) {
+                SpeedSample(lastMs = System.currentTimeMillis(), lastBytes = 0L, smoothedBps = 0L)
+            }
+        }
+        _state.update { cur ->
+            cur.copy(
+                items = cur.items.map { item ->
+                    if (item.id != id) {
+                        item
+                    } else {
+                        item.copy(
+                            status = status,
+                            statusDetail = detail,
+                            progress = progress?.coerceIn(0f, 1f) ?: item.progress,
+                            totalBytes = totalBytes?.coerceAtLeast(0L) ?: item.totalBytes,
+                            fileName = fileName ?: item.fileName,
+                            isEncrypted = isEncrypted ?: item.isEncrypted,
+                            errorMessage = if (status.isActive) null else item.errorMessage,
+                            canCancel = status.isActive,
+                            canRetry = status == UploadStatus.FAILED || status == UploadStatus.CANCELLED,
+                        )
+                    }
+                },
+            )
+        }
     }
 
     fun updateProgress(id: String, sentBytes: Long, totalBytes: Long) {
@@ -71,11 +131,14 @@ class UploadTracker @Inject constructor(
                         item
                     } else {
                         item.copy(
+                            status = UploadStatus.UPLOADING,
                             uploadedBytes = safeSent,
                             totalBytes = if (safeTotal > 0L) safeTotal else item.totalBytes,
                             progress = progress,
                             speedBytesPerSec = speedBps,
                             etaSeconds = etaSeconds,
+                            canCancel = true,
+                            canRetry = false,
                         )
                     }
                 },
@@ -83,7 +146,7 @@ class UploadTracker @Inject constructor(
         }
     }
 
-    fun completeUpload(id: String) {
+    fun completeUpload(id: String, detail: String? = null) {
         samples.remove(id)
         _state.update { cur ->
             cur.copy(
@@ -97,6 +160,10 @@ class UploadTracker @Inject constructor(
                             speedBytesPerSec = 0L,
                             etaSeconds = null,
                             status = UploadStatus.DONE,
+                            statusDetail = detail ?: item.statusDetail,
+                            errorMessage = null,
+                            canCancel = false,
+                            canRetry = false,
                         )
                     }
                 },
@@ -105,6 +172,10 @@ class UploadTracker @Inject constructor(
     }
 
     fun failUpload(id: String, message: String?) {
+        markFailed(id = id, message = message, canRetry = true)
+    }
+
+    fun markFailed(id: String, message: String?, canRetry: Boolean = true) {
         samples.remove(id)
         _state.update { cur ->
             cur.copy(
@@ -116,7 +187,33 @@ class UploadTracker @Inject constructor(
                             speedBytesPerSec = 0L,
                             etaSeconds = null,
                             status = UploadStatus.FAILED,
+                            statusDetail = null,
                             errorMessage = message,
+                            canCancel = false,
+                            canRetry = canRetry,
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    fun markCancelled(id: String) {
+        samples.remove(id)
+        _state.update { cur ->
+            cur.copy(
+                items = cur.items.map { item ->
+                    if (item.id != id) {
+                        item
+                    } else {
+                        item.copy(
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            status = UploadStatus.CANCELLED,
+                            statusDetail = "Cancelled",
+                            errorMessage = null,
+                            canCancel = false,
+                            canRetry = true,
                         )
                     }
                 },
@@ -131,7 +228,7 @@ class UploadTracker @Inject constructor(
 
     fun clearCompleted() {
         _state.update { cur ->
-            cur.copy(items = cur.items.filter { it.status == UploadStatus.UPLOADING })
+            cur.copy(items = cur.items.filter { it.status.isActive })
         }
     }
 }
@@ -148,9 +245,30 @@ data class UploadItem(
     val status: UploadStatus = UploadStatus.UPLOADING,
     val errorMessage: String? = null,
     val startedAtMs: Long = System.currentTimeMillis(),
+    val statusDetail: String? = null,
+    val isEncrypted: Boolean = false,
+    val canCancel: Boolean = true,
+    val canRetry: Boolean = false,
 )
 
-enum class UploadStatus { UPLOADING, DONE, FAILED }
+enum class UploadStatus {
+    QUEUED,
+    PREPARING,
+    PACKING,
+    ENCRYPTING,
+    UPLOADING,
+    DONE,
+    FAILED,
+    CANCELLED,
+    ;
+
+    val isActive: Boolean
+        get() = this == QUEUED ||
+            this == PREPARING ||
+            this == PACKING ||
+            this == ENCRYPTING ||
+            this == UPLOADING
+}
 
 data class UploadQueueState(
     val items: List<UploadItem> = emptyList(),

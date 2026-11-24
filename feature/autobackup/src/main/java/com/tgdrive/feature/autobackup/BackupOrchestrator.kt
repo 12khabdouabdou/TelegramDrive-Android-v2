@@ -507,7 +507,15 @@ class BackupOrchestrator @Inject constructor(
                         val first = eligibleToUpload[0]
                         val (q, enc) = stageOptionsFor(first)
                         async(dispatchers.io) {
-                            stagingManager.stageForUpload(first.absolutePath, first.name, first.mimeType, first.size, q, enc)
+                            if (prefs.backupUseCustomPassphrase) {
+                                stagingManager.stageForUpload(
+                                    first.absolutePath, first.name, first.mimeType, first.size, q, enc, true,
+                                )
+                            } else {
+                                stagingManager.stageForUpload(
+                                    first.absolutePath, first.name, first.mimeType, first.size, q, enc,
+                                )
+                            }
                         }
                     } else {
                         null
@@ -550,9 +558,15 @@ class BackupOrchestrator @Inject constructor(
                             val nextFile = eligibleToUpload[i + 1]
                             val (nq, nenc) = stageOptionsFor(nextFile)
                             async(dispatchers.io) {
-                                stagingManager.stageForUpload(
-                                    nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc,
-                                )
+                                if (prefs.backupUseCustomPassphrase) {
+                                    stagingManager.stageForUpload(
+                                        nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc, true,
+                                    )
+                                } else {
+                                    stagingManager.stageForUpload(
+                                        nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc,
+                                    )
+                                }
                             }
                         } else {
                             null
@@ -986,7 +1000,7 @@ class BackupOrchestrator @Inject constructor(
             val folderPrefTarget = prefs.targetFolderFor(folderUri)
             val destChatId = resolveTargetCached(folderPrefTarget)
             val encryptZip = prefs.isFolderEncrypted(folderUri)
-            val zipPassword = if (encryptZip) backupCrypto.zipVaultPassword() else null
+            val zipPassword = if (encryptZip) backupCrypto.activeBackupZipPassword(prefs.backupUseCustomPassphrase) else null
             val includedUris = if (prefs.backupZipIncremental) folderToUpload.map { it.absolutePath }.toSet() else null
 
             registry.updatePhase(
@@ -1011,6 +1025,7 @@ class BackupOrchestrator @Inject constructor(
                     password = zipPassword,
                     excludeMatcher = excludeMatcher,
                     includedUris = includedUris,
+                    compressionMode = com.tgdrive.core.zip.ZipCompressionMode.SMART,
                 ) { part ->
                     ensureNotCancelled(jobId)
                     val partName = part.partFile.name

@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -68,6 +70,7 @@ import com.tgdrive.app.R
 import com.tgdrive.app.RootViewModel
 import com.tgdrive.app.ShareTargetFolder
 import com.tgdrive.core.datastore.FileFilter
+import com.tgdrive.core.zip.ZipCompressionMode
 import com.tgdrive.feature.autobackup.AutoBackupScreen
 import com.tgdrive.feature.browser.CategoryFilesScreen
 import com.tgdrive.feature.browser.FolderScreen
@@ -356,7 +359,15 @@ private fun ShareUploadDialog(
     folders: List<ShareTargetFolder>,
     inProgress: Boolean,
     message: String?,
-    onConfirm: (targetChatId: Long?, packAsZip: Boolean, zipName: String?, zipPassword: String?) -> Unit,
+    onConfirm: (
+        targetChatId: Long?,
+        packAsZip: Boolean,
+        zipName: String?,
+        zipPassword: String?,
+        encryptFiles: Boolean,
+        useVaultKey: Boolean,
+        compressionMode: ZipCompressionMode,
+    ) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var selectedChatId by remember(folders) {
@@ -364,6 +375,9 @@ private fun ShareUploadDialog(
     }
     var packAsZip by remember { mutableStateOf(false) }
     var zipName by remember { mutableStateOf("") }
+    var compressionMode by remember { mutableStateOf(ZipCompressionMode.SMART) }
+    var encryptFiles by remember { mutableStateOf(false) }
+    var useVaultKey by remember { mutableStateOf(true) }
     var zipPassword by remember { mutableStateOf("") }
 
     AlertDialog(
@@ -461,15 +475,75 @@ private fun ShareUploadDialog(
                         enabled = !inProgress,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    OutlinedTextField(
-                        value = zipPassword,
-                        onValueChange = { zipPassword = it },
-                        label = { Text(stringResource(R.string.share_zip_password_label)) },
-                        singleLine = true,
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = compressionMode == ZipCompressionMode.SMART,
+                            onClick = { compressionMode = ZipCompressionMode.SMART },
+                            label = { Text("Smart") },
+                        )
+                        FilterChip(
+                            selected = compressionMode == ZipCompressionMode.STORE,
+                            onClick = { compressionMode = ZipCompressionMode.STORE },
+                            label = { Text("Store") },
+                        )
+                        FilterChip(
+                            selected = compressionMode == ZipCompressionMode.DEFLATE,
+                            onClick = { compressionMode = ZipCompressionMode.DEFLATE },
+                            label = { Text("Deflate") },
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = !inProgress) { encryptFiles = !encryptFiles }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = encryptFiles,
                         enabled = !inProgress,
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth(),
+                        onCheckedChange = null,
                     )
+                    Text(
+                        text = stringResource(R.string.share_encrypt_files),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+                if (encryptFiles) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = useVaultKey,
+                            onClick = { useVaultKey = true },
+                            label = { Text(stringResource(R.string.share_encrypt_vault_key)) },
+                        )
+                        FilterChip(
+                            selected = !useVaultKey,
+                            onClick = { useVaultKey = false },
+                            label = { Text(stringResource(R.string.share_encrypt_custom_password)) },
+                        )
+                    }
+                    if (!useVaultKey) {
+                        OutlinedTextField(
+                            value = zipPassword,
+                            onValueChange = { zipPassword = it },
+                            label = { Text(stringResource(R.string.share_zip_password_label)) },
+                            singleLine = true,
+                            enabled = !inProgress,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
                 if (inProgress) {
                     Spacer(Modifier.height(4.dp))
@@ -491,9 +565,12 @@ private fun ShareUploadDialog(
                         packAsZip,
                         zipName.takeIf { it.isNotBlank() },
                         zipPassword.takeIf { it.isNotBlank() },
+                        encryptFiles,
+                        useVaultKey,
+                        compressionMode,
                     )
                 },
-                enabled = !inProgress,
+                enabled = !inProgress && (!encryptFiles || useVaultKey || zipPassword.length >= 4),
             ) {
                 Text(stringResource(R.string.share_upload_action))
             }

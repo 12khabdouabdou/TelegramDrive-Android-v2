@@ -39,11 +39,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.ZipFile
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.security.KeystoreHelper
@@ -764,6 +766,7 @@ class TdLibTelegramClient(
                 mime.startsWith("image/") || ext in IMAGE_THUMB_EXTS -> decodeUploadImageThumb(localPath)
                 mime.startsWith("video/") || ext in VIDEO_THUMB_EXTS -> decodeUploadVideoThumb(localPath)
                 mime == "application/pdf" || ext == "pdf" -> decodeUploadPdfThumb(localPath)
+                mime == "application/zip" || ext == "zip" -> decodeUploadZipCoverThumb(localPath)
                 else -> null
             }
         } catch (_: Throwable) {
@@ -874,6 +877,52 @@ class TdLibTelegramClient(
                     bmp
                 }
             }
+        }
+    }
+
+    private fun decodeUploadZipCoverThumb(localPath: String): Bitmap? {
+        return ZipFile(File(localPath)).use { zip ->
+            val entries = zip.entries()
+            var candidate: java.util.zip.ZipEntry? = null
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (entry.isDirectory) continue
+                val ext = entry.name.substringAfterLast('.', "").lowercase()
+                if (ext in IMAGE_THUMB_EXTS && entry.size in 1L..MAX_ZIP_COVER_BYTES) {
+                    candidate = entry
+                    break
+                }
+            }
+            val hit = candidate ?: return@use null
+            val bytes = zip.getInputStream(hit).use { input ->
+                val buf = ByteArray(16 * 1024)
+                val out = ByteArrayOutputStream()
+                var total = 0L
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    total += n
+                    if (total > MAX_ZIP_COVER_BYTES) return@use null
+                    out.write(buf, 0, n)
+                }
+                out.toByteArray()
+            }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@use null
+            var sample = 1
+            while (bounds.outWidth / sample > 640 || bounds.outHeight / sample > 640) {
+                sample *= 2
+            }
+            BitmapFactory.decodeByteArray(
+                bytes,
+                0,
+                bytes.size,
+                BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                },
+            )
         }
     }
 
@@ -1285,6 +1334,7 @@ class TdLibTelegramClient(
         private const val UPLOAD_STALL_TIMEOUT_MS = 90_000L
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256
+        private const val MAX_ZIP_COVER_BYTES = 10L * 1024 * 1024
         private val IMAGE_THUMB_EXTS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
         private val VIDEO_THUMB_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
     }

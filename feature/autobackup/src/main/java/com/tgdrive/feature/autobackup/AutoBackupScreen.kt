@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
@@ -50,6 +51,8 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
@@ -83,6 +86,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
@@ -131,6 +138,7 @@ fun AutoBackupScreen(
 
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
     var showTimePickerDialog by remember { mutableStateOf(false) }
+    var showPassphraseDialog by remember { mutableStateOf(false) }
     var targetOverrideUri by remember { mutableStateOf<String?>(null) }
     var permissionVersion by remember { mutableIntStateOf(0) }
     var dismissBatteryBanner by remember { mutableStateOf(false) }
@@ -229,6 +237,21 @@ fun AutoBackupScreen(
                 showTimePickerDialog = false
                 vm.setScheduleTime(h, m)
             },
+        )
+    }
+
+    if (showPassphraseDialog) {
+        BackupPassphraseDialog(
+            hasSavedPassphrase = state.hasCustomPassphrase,
+            onSavePassphrase = { passphrase ->
+                showPassphraseDialog = false
+                vm.setCustomBackupPassphrase(passphrase)
+            },
+            onResetToVaultKey = {
+                showPassphraseDialog = false
+                vm.setCustomBackupPassphrase(null)
+            },
+            onDismiss = { showPassphraseDialog = false },
         )
     }
 
@@ -967,6 +990,48 @@ fun AutoBackupScreen(
                         },
                     )
                     EditorialSwitchRow(
+                        icon = Icons.Filled.Lock,
+                        iconTint = MaterialTheme.colorScheme.tertiary,
+                        title = stringResource(R.string.backup_encrypt_all_title),
+                        description = stringResource(R.string.backup_encrypt_all_desc),
+                        checked = prefs.backupEncryptAll,
+                        onChange = vm::setEncryptAll,
+                    )
+                    val keyModeSummary = if (prefs.backupUseCustomPassphrase && state.hasCustomPassphrase) {
+                        stringResource(R.string.backup_key_mode_passphrase)
+                    } else {
+                        stringResource(R.string.backup_key_mode_vault)
+                    }
+                    SectionCard(stringResource(R.string.backup_key_mode_title)) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { showPassphraseDialog = true }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Filled.LockOpen,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = keyModeSummary,
+                                style = TgTypography.Display.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                            )
+                            Text(
+                                text = stringResource(R.string.backup_change),
+                                style = TgTypography.Display.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    EditorialSwitchRow(
                         icon = Icons.Filled.Archive,
                         iconTint = MaterialTheme.colorScheme.primary,
                         title = stringResource(R.string.backup_zip_folders),
@@ -1057,6 +1122,111 @@ private fun ShortcutCard(
             Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
+}
+
+@Composable
+private fun BackupPassphraseDialog(
+    hasSavedPassphrase: Boolean,
+    onSavePassphrase: (String) -> Unit,
+    onResetToVaultKey: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var passphrase by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var showPwd by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val errEmpty = stringResource(R.string.backup_passphrase_error_empty)
+    val errShort = stringResource(R.string.backup_passphrase_error_short)
+    val errMismatch = stringResource(R.string.backup_passphrase_error_mismatch)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        title = {
+            Text(
+                stringResource(R.string.backup_passphrase_dialog_title),
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    stringResource(R.string.backup_passphrase_dialog_desc),
+                    style = TgTypography.Display.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = passphrase,
+                    onValueChange = {
+                        passphrase = it
+                        error = null
+                    },
+                    label = { Text(stringResource(R.string.backup_passphrase_label)) },
+                    singleLine = true,
+                    visualTransformation = if (showPwd) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = ImeAction.Next,
+                    ),
+                    trailingIcon = {
+                        IconButton(onClick = { showPwd = !showPwd }) {
+                            Icon(
+                                if (showPwd) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = null,
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = {
+                        confirm = it
+                        error = null
+                    },
+                    label = { Text(stringResource(R.string.backup_passphrase_confirm)) },
+                    singleLine = true,
+                    visualTransformation = if (showPwd) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = ImeAction.Done,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                error?.let {
+                    Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    passphrase.isBlank() -> error = errEmpty
+                    passphrase.length < 4 -> error = errShort
+                    passphrase != confirm -> error = errMismatch
+                    else -> onSavePassphrase(passphrase)
+                }
+            }) {
+                Text(stringResource(R.string.backup_save), fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (hasSavedPassphrase) {
+                    TextButton(onClick = onResetToVaultKey) {
+                        Text(stringResource(R.string.backup_use_vault_key))
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text(stringResource(R.string.backup_dismiss))
+                }
+            }
+        },
+    )
 }
 
 @Composable

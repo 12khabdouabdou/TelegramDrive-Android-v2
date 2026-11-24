@@ -34,10 +34,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Visibility
@@ -155,6 +157,7 @@ fun ZipBrowserScreen(
     var searchQuery by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var showPasswordDialog by remember { mutableStateOf<String?>(null) }
+    var passwordForExtractAll by remember { mutableStateOf(false) }
     var imageViewerPath by remember { mutableStateOf<String?>(null) }
 
     val noViewerMsg = stringResource(R.string.zip_browser_no_viewer)
@@ -182,13 +185,19 @@ fun ZipBrowserScreen(
         }
     }
 
-    // Show extraction failures as a snackbar while keeping the entry list intact.
+    // Show extraction failures or status messages as snackbars while keeping the entry list intact.
     LaunchedEffect(state.error, state.zipReady) {
         val err = state.error ?: return@LaunchedEffect
         if (state.zipReady) {
             vm.clearError()
             snackbarHostState.showSnackbar(err)
         }
+    }
+
+    LaunchedEffect(state.statusMessage) {
+        val msg = state.statusMessage ?: return@LaunchedEffect
+        vm.clearStatusMessage()
+        snackbarHostState.showSnackbar(msg)
     }
 
     LaunchedEffect(state.extractedPath) {
@@ -279,6 +288,33 @@ fun ZipBrowserScreen(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                    if (state.zipReady && state.entries.isNotEmpty()) {
+                        if (state.extractingAll) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.padding(end = 8.dp).size(22.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            IconButton(onClick = {
+                                passwordForExtractAll = false
+                                vm.extractAllToDownloads(
+                                    onNeedPassword = {
+                                        passwordForExtractAll = true
+                                        showPasswordDialog = currentPath.ifBlank {
+                                            downloadItem?.fileName ?: "archive.zip"
+                                        }
+                                    },
+                                )
+                            }) {
+                                Icon(
+                                    Icons.Filled.Download,
+                                    contentDescription = stringResource(R.string.zip_browser_extract_all),
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
                 }
 
                 // In-ZIP live search bar
@@ -353,10 +389,9 @@ fun ZipBrowserScreen(
                             onFolderClick = { folder -> currentPath = folder.fullPrefix },
                             onFileClick = { fileNode ->
                                 val entry = fileNode.entry
-                                if (entry.isEncrypted && !vm.hasCachedPassword()) {
+                                passwordForExtractAll = false
+                                vm.openOrPromptEntry(entry) {
                                     showPasswordDialog = entry.name
-                                } else {
-                                    vm.extractEntry(entry.name)
                                 }
                             },
                         )
@@ -374,15 +409,42 @@ fun ZipBrowserScreen(
                 PasswordDialog(
                     entryName = entryName,
                     password = passwordInput,
+                    hasSavedBackupPassphrase = state.hasSavedBackupPassphrase,
                     onPasswordChange = { passwordInput = it },
+                    onUnlockWithVaultKey = {
+                        showPasswordDialog = null
+                        passwordInput = ""
+                        if (passwordForExtractAll) {
+                            passwordForExtractAll = false
+                            vm.unlockWithVaultKey(entryName = null)
+                        } else {
+                            vm.unlockWithVaultKey(entryName = entryName)
+                        }
+                    },
+                    onUnlockWithSavedPassphrase = {
+                        showPasswordDialog = null
+                        passwordInput = ""
+                        if (passwordForExtractAll) {
+                            passwordForExtractAll = false
+                            vm.unlockWithVaultKey(entryName = null, useSavedBackupPassphrase = true)
+                        } else {
+                            vm.unlockWithVaultKey(entryName = entryName, useSavedBackupPassphrase = true)
+                        }
+                    },
                     onConfirm = {
                         val pwd = passwordInput.ifBlank { null }
                         passwordInput = ""
                         showPasswordDialog = null
-                        vm.extractEntry(entryName, pwd)
+                        if (passwordForExtractAll) {
+                            passwordForExtractAll = false
+                            vm.extractAllToDownloads(pwd)
+                        } else {
+                            vm.extractEntry(entryName, pwd)
+                        }
                     },
                     onDismiss = {
                         passwordInput = ""
+                        passwordForExtractAll = false
                         showPasswordDialog = null
                     },
                 )
@@ -917,7 +979,10 @@ private fun EntryLeading(
 private fun PasswordDialog(
     entryName: String,
     password: String,
+    hasSavedBackupPassphrase: Boolean = false,
     onPasswordChange: (String) -> Unit,
+    onUnlockWithVaultKey: () -> Unit = {},
+    onUnlockWithSavedPassphrase: () -> Unit = {},
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -942,6 +1007,26 @@ private fun PasswordDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = TgTypography.Display.bodySmall,
                 )
+                OutlinedButton(
+                    onClick = onUnlockWithVaultKey,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(
+                        Icons.Filled.LockOpen,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text(stringResource(R.string.zip_browser_unlock_vault))
+                }
+                if (hasSavedBackupPassphrase) {
+                    OutlinedButton(
+                        onClick = onUnlockWithSavedPassphrase,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(stringResource(R.string.zip_browser_use_saved_passphrase))
+                    }
+                }
                 OutlinedTextField(
                     value = password,
                     onValueChange = onPasswordChange,

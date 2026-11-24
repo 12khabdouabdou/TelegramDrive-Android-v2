@@ -3,12 +3,21 @@ package com.tgdrive.core.zip
 import android.content.Context
 import android.net.Uri
 import android.os.StatFs
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import com.tgdrive.core.common.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import net.lingala.zip4j.ZipFile
 import net.lingala.zip4j.io.outputstream.ZipOutputStream as Zip4jOutputStream
 import net.lingala.zip4j.model.ZipParameters
 import net.lingala.zip4j.model.enums.AesKeyStrength
+import net.lingala.zip4j.model.enums.CompressionLevel
 import net.lingala.zip4j.model.enums.CompressionMethod
 import net.lingala.zip4j.model.enums.EncryptionMethod
 import java.io.BufferedOutputStream
@@ -21,13 +30,38 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 
+enum class ZipCompressionMode {
+    SMART,
+    STORE,
+    DEFLATE,
+}
+
+data class ZipProgress(
+    val filesPacked: Int,
+    val totalFiles: Int,
+    val bytesPacked: Long,
+    val totalBytes: Long,
+    val currentFileName: String,
+    val partIndex: Int,
+)
+
+data class ZipSelectionSummary(
+    val fileCount: Int,
+    val totalBytes: Long,
+    val estimatedParts: Int,
+    val freeCacheBytes: Long,
+    val hasEnoughSpace: Boolean,
+)
+
 /**
- * Zips a SAF folder tree into single or standalone multi-part .zip files (with
- * Zip4j split-volume fallback for single files exceeding the Telegram cap),
- * optionally AES-256 encrypted, and safely lists/extracts ZIP archives.
+ * Zips SAF folder trees and arbitrary URI selections into single or standalone multi-part
+ * `.zip` archives (with Zip4j split-volume fallback for single files exceeding the Telegram cap),
+ * smart per-extension compression, pipelined part packing, cooperative cancellation, AES-256
+ * encryption, and safe Zip-Slip-guarded extraction.
  */
 object ZipUploader {
 
+    const val DEFAULT_PART_MAX_BYTES = 1_900L * 1024 * 1024
     private const val MAX_EXTRACT_ENTRIES = 10_000
     private const val MAX_EXTRACT_TOTAL_BYTES = 4L * 1024 * 1024 * 1024
     private const val MAX_COMPRESSION_RATIO = 100L
@@ -35,6 +69,34 @@ object ZipUploader {
     private const val MIN_ZIP4J_SPLIT_BYTES = 65_536L
     private const val PART_HEADER_MARGIN_BYTES = 8_192L
     private const val COPY_BUFFER_SIZE = 64 * 1024
+    private const val PROGRESS_INTERVAL_MS = 250L
+    private const val PIPELINE_BUFFER_SAFETY_BYTES = 128L * 1024 * 1024
+
+    private val INCOMPRESSIBLE_EXTS = setOf(
+        "jpg", "jpeg", "heic", "heif", "webp", "png", "gif",
+        "mp4", "mkv", "mov", "webm", "avi", "3gp", "m4v",
+        "mp3", "aac", "m4a", "ogg", "opus", "flac",
+        "zip", "7z", "rar", "gz", "bz2", "xz", "apk", "pdf", "tgenc",
+    )
+
+    private val DOC_CHILD_PROJECTION = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_SIZE,
+    )
+
+    fun resolveCompressionMethod(
+        fileName: String,
+        mode: ZipCompressionMode = ZipCompressionMode.SMART,
+    ): CompressionMethod = when (mode) {
+        ZipCompressionMode.STORE -> CompressionMethod.STORE
+        ZipCompressionMode.DEFLATE -> CompressionMethod.DEFLATE
+        ZipCompressionMode.SMART -> {
+            val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+            if (ext in INCOMPRESSIBLE_EXTS) CompressionMethod.STORE else CompressionMethod.DEFLATE
+        }
+    }
 
     fun sanitizeZipBaseName(rawName: String): String {
         val cleaned = rawName
@@ -67,12 +129,14 @@ object ZipUploader {
                 Log.w("ZipUploader: fromTreeUri returned null")
                 return null
             }
-            if (!password.isNullOrBlank()) {
-                zipWithPassword(context, root, zipFile, password, excludeMatcher)
-            } else {
-                zipPlain(context, root, zipFile, excludeMatcher)
-            }
-            Log.i("ZipUploader: zipped → ${zipFile.absolutePath} (${zipFile.length()} bytes)")
+            zipStreamSingle(
+                context = context,
+                root = root,
+                zipFile = zipFile,
+                password = password,
+                excludeMatcher = excludeMatcher,
+            )
+            Log.i("ZipUploader: zipped -> ${zipFile.absolutePath} (${zipFile.length()} bytes)")
             zipFile.absolutePath
         } catch (t: Throwable) {
             Log.w("ZipUploader: failed", t)
@@ -80,29 +144,6 @@ object ZipUploader {
         }
     }
 
-    private fun zipPlain(
-        context: Context,
-        root: DocumentFile,
-        zipFile: File,
-        excludeMatcher: ((String) -> Boolean)? = null,
-    ) {
-        zipStreamSingle(context, root, zipFile, password = null, excludeMatcher = excludeMatcher)
-    }
-
-    private fun zipWithPassword(
-        context: Context,
-        root: DocumentFile,
-        zipFile: File,
-        password: String,
-        excludeMatcher: ((String) -> Boolean)? = null,
-    ) {
-        zipStreamSingle(context, root, zipFile, password = password, excludeMatcher = excludeMatcher)
-    }
-
-    /**
-     * Streams all files in [root] into a single [zipFile] in O(N) time using Zip4j's
-     * [Zip4jOutputStream], supporting optional AES-256 encryption without re-reading the archive.
-     */
     private fun zipStreamSingle(
         context: Context,
         root: DocumentFile,
@@ -132,7 +173,7 @@ object ZipUploader {
                             } else {
                                 "$basePath$name"
                             }
-                            val params = buildZipParameters(entryPath, usePassword)
+                            val params = buildZipParameters(entryPath, usePassword, ZipCompressionMode.SMART)
                             context.contentResolver.openInputStream(child.uri)?.use { input ->
                                 zos.putNextEntry(params)
                                 input.copyTo(zos, COPY_BUFFER_SIZE)
@@ -153,27 +194,104 @@ object ZipUploader {
      * Falls back to [File.usableSpace] on non-Android JVM environments (e.g. unit tests).
      */
     fun hasEnoughFreeSpace(workDir: File, requiredBytes: Long): Boolean {
+        return availableBytesFor(workDir) >= requiredBytes
+    }
+
+    fun availableBytesFor(dir: File): Long {
         val probe = when {
-            workDir.exists() -> workDir
-            workDir.parentFile?.exists() == true -> workDir.parentFile!!
+            dir.exists() -> dir
+            dir.parentFile?.exists() == true -> dir.parentFile!!
             else -> {
-                workDir.mkdirs()
-                workDir
+                dir.mkdirs()
+                dir
             }
         }
-        val available = try {
+        return try {
             StatFs(probe.absolutePath).availableBytes
         } catch (_: Throwable) {
             probe.usableSpace
         }
-        return available >= requiredBytes
+    }
+
+    suspend fun inspectTreeSummary(
+        context: Context,
+        treeUri: Uri,
+        maxPartBytes: Long = DEFAULT_PART_MAX_BYTES,
+        excludeMatcher: ((relPath: String, name: String) -> Boolean)? = null,
+    ): ZipSelectionSummary {
+        val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        val entries = if (!rootDocId.isNullOrBlank()) {
+            collectTreeEntriesViaCursor(
+                context = context,
+                treeUri = treeUri,
+                rootDocId = rootDocId,
+                rootName = rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "folder" },
+                excludeMatcher = null,
+                excludePathMatcher = excludeMatcher,
+                includedRelativePaths = null,
+                includedUris = null,
+            )
+        } else {
+            val root = DocumentFile.fromTreeUri(context, treeUri)
+            if (root != null) {
+                collectTreeEntriesFallback(
+                    context = context,
+                    dir = root,
+                    rootName = root.name ?: "folder",
+                    subPath = "",
+                    excludeMatcher = null,
+                    excludePathMatcher = excludeMatcher,
+                    includedRelativePaths = null,
+                    includedUris = null,
+                )
+            } else {
+                emptyList()
+            }
+        }
+        return buildSelectionSummary(context, entries.size, entries.sumOf { it.sizeBytes.coerceAtLeast(0L) }, maxPartBytes)
+    }
+
+    suspend fun inspectUrisSummary(
+        context: Context,
+        uris: List<Uri>,
+        maxPartBytes: Long = DEFAULT_PART_MAX_BYTES,
+    ): ZipSelectionSummary {
+        var total = 0L
+        for (uri in uris) {
+            currentCoroutineContext().ensureActive()
+            total += resolveUriSize(context, uri)
+        }
+        return buildSelectionSummary(context, uris.size, total, maxPartBytes)
+    }
+
+    private fun buildSelectionSummary(
+        context: Context,
+        fileCount: Int,
+        totalBytes: Long,
+        maxPartBytes: Long,
+    ): ZipSelectionSummary {
+        val safeMax = maxPartBytes.coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES + PART_HEADER_MARGIN_BYTES)
+        val estimatedParts = if (fileCount == 0) {
+            0
+        } else {
+            ((totalBytes + safeMax - 1L) / safeMax).toInt().coerceAtLeast(1)
+        }
+        val freeBytes = availableBytesFor(context.cacheDir)
+        val minNeeded = minOf(totalBytes, safeMax) + PIPELINE_BUFFER_SAFETY_BYTES
+        return ZipSelectionSummary(
+            fileCount = fileCount,
+            totalBytes = totalBytes,
+            estimatedParts = estimatedParts,
+            freeCacheBytes = freeBytes,
+            hasEnoughSpace = freeBytes >= minNeeded,
+        )
     }
 
     /**
      * Option A: Streams SAF folder entries into standalone numbered ZIP parts
      * (`<baseZipName>_part001.zip`, `<baseZipName>_part002.zip`, ...), invoking [onPartReady]
      * after each part closes so callers can upload it immediately and let us delete it
-     * before creating the next part.
+     * before creating the next part (or pack 1 part ahead when pipelining is safe).
      *
      * Any single file larger than [maxPartBytes] falls back to a Zip4j split-volume sub-archive
      * (`<baseZipName>_partNNN_split.z01`, ..., `.zip`) so single files > 2 GB / 4 GB also succeed.
@@ -188,12 +306,25 @@ object ZipUploader {
         excludeMatcher: ((String) -> Boolean)? = null,
         includedRelativePaths: Set<String>? = null,
         includedUris: Set<String>? = null,
+        compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
+        enablePipeline: Boolean = true,
+        excludePathMatcher: ((relPath: String, name: String) -> Boolean)? = null,
+        onZipProgress: (suspend (ZipProgress) -> Unit)? = null,
         onPartReady: suspend (ZipPartOutput) -> Unit,
     ): ChunkedZipSummary {
         val root = DocumentFile.fromTreeUri(context, treeUri)
             ?: error("Could not open folder URI: $treeUri")
         val rootName = root.name ?: "folder"
-        val entries = collectTreeEntries(context, root, rootName, "", excludeMatcher, includedRelativePaths, includedUris)
+        val entries = collectTreeEntries(
+            context = context,
+            treeUri = treeUri,
+            root = root,
+            rootName = rootName,
+            excludeMatcher = excludeMatcher,
+            excludePathMatcher = excludePathMatcher,
+            includedRelativePaths = includedRelativePaths,
+            includedUris = includedUris,
+        )
         return zipSourcesInParts(
             entries = entries,
             workDir = workDir,
@@ -201,27 +332,270 @@ object ZipUploader {
             maxPartBytes = maxPartBytes,
             password = password,
             checkFreeSpace = true,
+            compressionMode = compressionMode,
+            enablePipeline = enablePipeline,
+            onZipProgress = onZipProgress,
             onPartReady = onPartReady,
         )
     }
 
-    private fun collectTreeEntries(
+    /**
+     * Packs an arbitrary list of SAF [uris] into standalone or split ZIP parts using Option A chunking.
+     */
+    suspend fun zipUrisInParts(
+        context: Context,
+        uris: List<Uri>,
+        workDir: File,
+        baseZipName: String,
+        customNames: Map<Uri, String> = emptyMap(),
+        maxPartBytes: Long = DEFAULT_PART_MAX_BYTES,
+        password: String? = null,
+        compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
+        enablePipeline: Boolean = true,
+        onZipProgress: (suspend (ZipProgress) -> Unit)? = null,
+        onPartReady: suspend (ZipPartOutput) -> Unit,
+    ): ChunkedZipSummary {
+        val usedNames = HashSet<String>(uris.size)
+        val entries = ArrayList<ZipSourceEntry>(uris.size)
+        uris.forEachIndexed { idx, uri ->
+            currentCoroutineContext().ensureActive()
+            val rawName = customNames[uri]?.takeIf { it.isNotBlank() }
+                ?: resolveUriDisplayName(context, uri)
+                ?: "file_${idx + 1}"
+            val safeName = deduplicateEntryName(sanitizeZipBaseName(rawName), usedNames)
+            val size = resolveUriSize(context, uri)
+            entries.add(
+                ZipSourceEntry(
+                    relativePath = safeName,
+                    sizeBytes = size,
+                    openStream = { context.contentResolver.openInputStream(uri) },
+                ),
+            )
+        }
+        return zipSourcesInParts(
+            entries = entries,
+            workDir = workDir,
+            baseZipName = baseZipName,
+            maxPartBytes = maxPartBytes,
+            password = password,
+            checkFreeSpace = true,
+            compressionMode = compressionMode,
+            enablePipeline = enablePipeline,
+            onZipProgress = onZipProgress,
+            onPartReady = onPartReady,
+        )
+    }
+
+    /**
+     * Wraps a single oversized local file into Zip4j split volumes (`.z01`, ..., `.zip`),
+     * streaming each volume through [onPartReady] and deleting temporary volumes afterwards.
+     */
+    suspend fun zipSingleFileSplit(
+        sourceFile: File,
+        displayName: String,
+        workDir: File,
+        maxPartBytes: Long,
+        password: String? = null,
+        onPartReady: suspend (ZipPartOutput) -> Unit,
+    ): ChunkedZipSummary {
+        require(sourceFile.isFile) { "Source file does not exist: ${sourceFile.absolutePath}" }
+        require(maxPartBytes >= MIN_ZIP4J_SPLIT_BYTES + PART_HEADER_MARGIN_BYTES) {
+            "maxPartBytes must be at least ${MIN_ZIP4J_SPLIT_BYTES + PART_HEADER_MARGIN_BYTES} bytes"
+        }
+        workDir.mkdirs()
+        val safeLeaf = sanitizeZipBaseName(displayName)
+        val stem = sanitizeZipBaseName(safeLeaf.substringBeforeLast('.').ifBlank { safeLeaf })
+        val usePassword = !password.isNullOrBlank()
+        val splitOutZip = File(workDir, "$stem.zip")
+        if (splitOutZip.exists()) splitOutZip.delete()
+        val params = buildZipParameters(safeLeaf, usePassword, ZipCompressionMode.STORE)
+        val splitLen = (maxPartBytes - PART_HEADER_MARGIN_BYTES).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
+        val zf = if (usePassword) ZipFile(splitOutZip, password!!.toCharArray()) else ZipFile(splitOutZip)
+        zf.use { zip ->
+            zip.createSplitZipFile(listOf(sourceFile), params, true, splitLen)
+        }
+        val volumes = collectOrderedSplitVolumes(workDir, stem, splitOutZip)
+        var emitted = 0
+        try {
+            volumes.forEach { vol ->
+                currentCoroutineContext().ensureActive()
+                emitted++
+                val isFinalZip = vol.extension.equals("zip", ignoreCase = true)
+                onPartReady(
+                    ZipPartOutput(
+                        partFile = vol,
+                        partIndex = emitted,
+                        isSplitVolume = true,
+                        splitGroupBaseName = stem,
+                        entries = if (isFinalZip) listOf(safeLeaf) else emptyList(),
+                        uncompressedBytes = if (isFinalZip) sourceFile.length() else 0L,
+                    ),
+                )
+            }
+        } finally {
+            volumes.forEach { vol -> runCatching { if (vol.exists()) vol.delete() } }
+        }
+        return ChunkedZipSummary(
+            totalFilesProcessed = 1,
+            totalPartsEmitted = emitted,
+            totalUncompressedBytes = sourceFile.length(),
+            hadSplitVolumes = true,
+        )
+    }
+
+    private suspend fun collectTreeEntries(
+        context: Context,
+        treeUri: Uri,
+        root: DocumentFile,
+        rootName: String,
+        excludeMatcher: ((String) -> Boolean)?,
+        excludePathMatcher: ((relPath: String, name: String) -> Boolean)?,
+        includedRelativePaths: Set<String>?,
+        includedUris: Set<String>?,
+    ): List<ZipSourceEntry> {
+        val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        if (!rootDocId.isNullOrBlank()) {
+            val cursorResult = runCatching {
+                collectTreeEntriesViaCursor(
+                    context = context,
+                    treeUri = treeUri,
+                    rootDocId = rootDocId,
+                    rootName = rootName,
+                    excludeMatcher = excludeMatcher,
+                    excludePathMatcher = excludePathMatcher,
+                    includedRelativePaths = includedRelativePaths,
+                    includedUris = includedUris,
+                )
+            }.getOrNull()
+            if (cursorResult != null) return cursorResult
+        }
+        return collectTreeEntriesFallback(
+            context = context,
+            dir = root,
+            rootName = rootName,
+            subPath = "",
+            excludeMatcher = excludeMatcher,
+            excludePathMatcher = excludePathMatcher,
+            includedRelativePaths = includedRelativePaths,
+            includedUris = includedUris,
+        )
+    }
+
+    private suspend fun collectTreeEntriesViaCursor(
+        context: Context,
+        treeUri: Uri,
+        rootDocId: String,
+        rootName: String,
+        excludeMatcher: ((String) -> Boolean)?,
+        excludePathMatcher: ((relPath: String, name: String) -> Boolean)?,
+        includedRelativePaths: Set<String>?,
+        includedUris: Set<String>?,
+    ): List<ZipSourceEntry>? {
+        data class DirNode(val docId: String, val subPath: String)
+        data class ChildRow(val docId: String, val name: String, val isDir: Boolean, val size: Long)
+
+        val resolver = context.contentResolver
+        val out = ArrayList<ZipSourceEntry>(128)
+        val stack = ArrayDeque<DirNode>()
+        stack.add(DirNode(rootDocId, ""))
+        var dirsVisited = 0
+
+        while (stack.isNotEmpty()) {
+            currentCoroutineContext().ensureActive()
+            val node = stack.removeFirst()
+            dirsVisited++
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, node.docId)
+            val rows = ArrayList<ChildRow>()
+            val cursor = try {
+                resolver.query(childrenUri, DOC_CHILD_PROJECTION, null, null, null)
+            } catch (_: Throwable) {
+                null
+            }
+            if (cursor == null) {
+                if (dirsVisited == 1) return null
+                continue
+            }
+            cursor.use { c ->
+                val idIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                if (idIdx < 0 || nameIdx < 0) return@use
+                while (c.moveToNext()) {
+                    val cId = c.getString(idIdx) ?: continue
+                    val cName = c.getString(nameIdx) ?: continue
+                    val mime = if (mimeIdx >= 0) c.getString(mimeIdx).orEmpty() else ""
+                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                    val size = if (!isDir && sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx) else 0L
+                    rows.add(ChildRow(cId, cName, isDir, size.coerceAtLeast(0L)))
+                }
+            }
+            rows.sortBy { it.name.lowercase(Locale.US) }
+            val subDirs = ArrayList<DirNode>()
+            for (row in rows) {
+                val relInsideRoot = if (node.subPath.isEmpty()) row.name else "${node.subPath}${row.name}"
+                if (row.isDir) {
+                    val dirRel = "$relInsideRoot/"
+                    if (excludeMatcher?.invoke(row.name) == true) continue
+                    if (excludePathMatcher?.invoke(dirRel, row.name) == true) continue
+                    subDirs.add(DirNode(row.docId, dirRel))
+                } else {
+                    if (excludeMatcher?.invoke(row.name) == true) continue
+                    if (excludePathMatcher?.invoke(relInsideRoot, row.name) == true) continue
+                    if (includedRelativePaths != null && relInsideRoot !in includedRelativePaths) continue
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, row.docId)
+                    if (includedUris != null && docUri.toString() !in includedUris) continue
+                    out.add(
+                        ZipSourceEntry(
+                            relativePath = "$rootName/$relInsideRoot",
+                            sizeBytes = row.size,
+                            openStream = { resolver.openInputStream(docUri) },
+                        ),
+                    )
+                }
+            }
+            // Prepend sorted subdirectories so traversal remains depth-first alphabetical
+            for (idx in subDirs.indices.reversed()) {
+                stack.addFirst(subDirs[idx])
+            }
+        }
+        return out
+    }
+
+    private suspend fun collectTreeEntriesFallback(
         context: Context,
         dir: DocumentFile,
         rootName: String,
         subPath: String,
         excludeMatcher: ((String) -> Boolean)?,
+        excludePathMatcher: ((relPath: String, name: String) -> Boolean)?,
         includedRelativePaths: Set<String>?,
         includedUris: Set<String>?,
     ): List<ZipSourceEntry> {
         val out = mutableListOf<ZipSourceEntry>()
         dir.listFiles().sortedBy { it.name.orEmpty().lowercase(Locale.US) }.forEach { child ->
+            currentCoroutineContext().ensureActive()
             val name = child.name ?: return@forEach
             val relInsideRoot = if (subPath.isEmpty()) name else "$subPath$name"
             if (child.isDirectory) {
-                out.addAll(collectTreeEntries(context, child, rootName, "$relInsideRoot/", excludeMatcher, includedRelativePaths, includedUris))
+                val dirRel = "$relInsideRoot/"
+                if (excludeMatcher?.invoke(name) == true) return@forEach
+                if (excludePathMatcher?.invoke(dirRel, name) == true) return@forEach
+                out.addAll(
+                    collectTreeEntriesFallback(
+                        context = context,
+                        dir = child,
+                        rootName = rootName,
+                        subPath = dirRel,
+                        excludeMatcher = excludeMatcher,
+                        excludePathMatcher = excludePathMatcher,
+                        includedRelativePaths = includedRelativePaths,
+                        includedUris = includedUris,
+                    ),
+                )
             } else if (child.isFile) {
                 if (excludeMatcher?.invoke(name) == true) return@forEach
+                if (excludePathMatcher?.invoke(relInsideRoot, name) == true) return@forEach
                 if (includedRelativePaths != null && relInsideRoot !in includedRelativePaths) return@forEach
                 if (includedUris != null && child.uri.toString() !in includedUris) return@forEach
                 val zipEntryPath = "$rootName/$relInsideRoot"
@@ -238,7 +612,9 @@ object ZipUploader {
     }
 
     /**
-     * Pure stream-based Option A chunked zipper (also directly unit-testable on the JVM).
+     * Pure stream-based Option A chunked zipper (directly unit-testable on the JVM).
+     * When [enablePipeline] is enabled and [workDir] has room for 2 parts, packs part `N+1`
+     * asynchronously while [onPartReady] uploads part `N`.
      */
     suspend fun zipSourcesInParts(
         entries: List<ZipSourceEntry>,
@@ -247,6 +623,9 @@ object ZipUploader {
         maxPartBytes: Long,
         password: String? = null,
         checkFreeSpace: Boolean = true,
+        compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
+        enablePipeline: Boolean = true,
+        onZipProgress: (suspend (ZipProgress) -> Unit)? = null,
         onPartReady: suspend (ZipPartOutput) -> Unit,
     ): ChunkedZipSummary {
         require(maxPartBytes >= MIN_ZIP4J_SPLIT_BYTES + PART_HEADER_MARGIN_BYTES) {
@@ -259,18 +638,101 @@ object ZipUploader {
             throw SecurityException("Rejected unsafe zip base name: $baseZipName")
         }
 
+        val totalEstimated = entries.sumOf { it.sizeBytes.coerceAtLeast(0L) }
         if (checkFreeSpace) {
-            val totalEstimated = entries.sumOf { it.sizeBytes.coerceAtLeast(0L) }
             val neededOnce = minOf(maxPartBytes, maxOf(totalEstimated, 1L)) + (16L * 1024 * 1024)
             if (!hasEnoughFreeSpace(workDir, neededOnce)) {
-                throw IllegalStateException("Insufficient storage space to create ZIP part (need at least ${neededOnce / (1024 * 1024)} MB free)")
+                throw IllegalStateException(
+                    "Insufficient storage space to create ZIP part (need at least ${neededOnce / (1024 * 1024)} MB free)",
+                )
             }
         }
 
+        val canPipeline = enablePipeline && entries.size > 1 && (
+            !checkFreeSpace ||
+                hasEnoughFreeSpace(workDir, minOf(totalEstimated, maxPartBytes * 2L) + PIPELINE_BUFFER_SAFETY_BYTES)
+            )
+
+        if (!canPipeline) {
+            return packEntriesSequential(
+                entries = entries,
+                workDir = workDir,
+                safeBase = safeBase,
+                maxPartBytes = maxPartBytes,
+                password = password,
+                compressionMode = compressionMode,
+                totalEstimatedBytes = totalEstimated,
+                onZipProgress = onZipProgress,
+                onPartReady = { part ->
+                    try {
+                        onPartReady(part)
+                    } finally {
+                        if (part.partFile.exists()) part.partFile.delete()
+                    }
+                },
+            )
+        }
+
+        return coroutineScope {
+            val channel = Channel<ZipPartOutput>(
+                capacity = 1,
+                onUndeliveredElement = { leftover -> runCatching { leftover.partFile.delete() } },
+            )
+            val producer = async {
+                try {
+                    packEntriesSequential(
+                        entries = entries,
+                        workDir = workDir,
+                        safeBase = safeBase,
+                        maxPartBytes = maxPartBytes,
+                        password = password,
+                        compressionMode = compressionMode,
+                        totalEstimatedBytes = totalEstimated,
+                        onZipProgress = onZipProgress,
+                        onPartReady = { part -> channel.send(part) },
+                    )
+                } catch (t: Throwable) {
+                    channel.close(t)
+                    throw t
+                } finally {
+                    channel.close()
+                }
+            }
+            try {
+                for (part in channel) {
+                    currentCoroutineContext().ensureActive()
+                    try {
+                        onPartReady(part)
+                    } finally {
+                        if (part.partFile.exists()) part.partFile.delete()
+                    }
+                }
+                producer.await()
+            } catch (t: Throwable) {
+                producer.cancel()
+                while (true) {
+                    val rem = channel.tryReceive().getOrNull() ?: break
+                    runCatching { rem.partFile.delete() }
+                }
+                runCatching { producer.await() }
+                throw t
+            }
+        }
+    }
+
+    private suspend fun packEntriesSequential(
+        entries: List<ZipSourceEntry>,
+        workDir: File,
+        safeBase: String,
+        maxPartBytes: Long,
+        password: String?,
+        compressionMode: ZipCompressionMode,
+        totalEstimatedBytes: Long,
+        onZipProgress: (suspend (ZipProgress) -> Unit)?,
+        onPartReady: suspend (ZipPartOutput) -> Unit,
+    ): ChunkedZipSummary {
         val usePassword = !password.isNullOrBlank()
         val softLimit = (maxPartBytes - PART_HEADER_MARGIN_BYTES).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
-        // Reserve ~5% margin when deciding before an entry whether to roll over so central
-        // directory + AES headers never push an already-open part past Telegram's hard cap.
         val entryFitCeiling = (maxPartBytes * 95L / 100L).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
 
         var nextPartIndex = 1
@@ -278,6 +740,7 @@ object ZipUploader {
         var totalParts = 0
         var totalUncompressed = 0L
         var hadSplit = false
+        var lastProgressMs = 0L
 
         var currentFile: File? = null
         var currentCountingOut: CountingOutputStream? = null
@@ -328,20 +791,22 @@ object ZipUploader {
                             uncompressedBytes = uncompressedSnapshot,
                         ),
                     )
+                } else if (partFile.exists()) {
+                    partFile.delete()
                 }
-            } finally {
+            } catch (t: Throwable) {
                 if (partFile.exists()) partFile.delete()
+                throw t
             }
         }
 
         try {
-            for (entry in entries) {
-                val safeRelPath = entry.relativePath.trimStart('/')
-                    .replace("..", "_")
+            val totalEntryCount = entries.size
+            for ((entryIdx, entry) in entries.withIndex()) {
+                currentCoroutineContext().ensureActive()
+                val safeRelPath = entry.relativePath.trimStart('/').replace("..", "_")
                 if (safeRelPath.isEmpty()) continue
 
-                // Single entry itself exceeds maxPartBytes -> emit current standalone part first,
-                // then split this single oversized file into Zip4j .z01/.zip volumes.
                 if (entry.sizeBytes > entryFitCeiling) {
                     flushCurrentPart()
                     hadSplit = true
@@ -350,6 +815,7 @@ object ZipUploader {
                     val stageDir = File(workDir, "${splitBase}_stage").apply { mkdirs() }
                     val leafName = sanitizeZipBaseName(safeRelPath.substringAfterLast('/'))
                     val stagedFile = File(stageDir, leafName)
+                    var emittedVolumes: List<File> = emptyList()
                     try {
                         val opened = entry.openStream()
                         if (opened == null) {
@@ -358,12 +824,12 @@ object ZipUploader {
                         }
                         opened.use { input ->
                             FileOutputStream(stagedFile).use { out ->
-                                input.copyTo(out, COPY_BUFFER_SIZE)
+                                copyStreamWithCancelCheck(input, out)
                             }
                         }
                         val splitOutZip = File(workDir, "$splitBase.zip")
                         if (splitOutZip.exists()) splitOutZip.delete()
-                        val params = buildZipParameters(safeRelPath, usePassword)
+                        val params = buildZipParameters(safeRelPath, usePassword, compressionMode)
                         val splitLen = (maxPartBytes - PART_HEADER_MARGIN_BYTES).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
                         val zf = if (usePassword) {
                             ZipFile(splitOutZip, password!!.toCharArray())
@@ -373,33 +839,48 @@ object ZipUploader {
                         zf.use { zip ->
                             zip.createSplitZipFile(listOf(stagedFile), params, true, splitLen)
                         }
-                        val volumes = collectOrderedSplitVolumes(workDir, splitBase, splitOutZip)
-                        volumes.forEach { vol ->
-                            try {
-                                totalParts++
-                                onPartReady(
-                                    ZipPartOutput(
-                                        partFile = vol,
-                                        partIndex = totalParts,
-                                        isSplitVolume = true,
-                                        splitGroupBaseName = splitBase,
-                                        entries = if (vol.extension.equals("zip", ignoreCase = true)) listOf(safeRelPath) else emptyList(),
-                                        uncompressedBytes = if (vol.extension.equals("zip", ignoreCase = true)) entry.sizeBytes else 0L,
-                                    ),
-                                )
-                            } finally {
-                                if (vol.exists()) vol.delete()
-                            }
+                        emittedVolumes = collectOrderedSplitVolumes(workDir, splitBase, splitOutZip)
+                        emittedVolumes.forEach { vol ->
+                            currentCoroutineContext().ensureActive()
+                            totalParts++
+                            onPartReady(
+                                ZipPartOutput(
+                                    partFile = vol,
+                                    partIndex = totalParts,
+                                    isSplitVolume = true,
+                                    splitGroupBaseName = splitBase,
+                                    entries = if (vol.extension.equals("zip", ignoreCase = true)) {
+                                        listOf(safeRelPath)
+                                    } else {
+                                        emptyList()
+                                    },
+                                    uncompressedBytes = if (vol.extension.equals("zip", ignoreCase = true)) {
+                                        entry.sizeBytes
+                                    } else {
+                                        0L
+                                    },
+                                ),
+                            )
                         }
                         totalFiles++
                         totalUncompressed += entry.sizeBytes
+                        onZipProgress?.invoke(
+                            ZipProgress(
+                                filesPacked = totalFiles,
+                                totalFiles = totalEntryCount,
+                                bytesPacked = totalUncompressed,
+                                totalBytes = totalEstimatedBytes.coerceAtLeast(totalUncompressed),
+                                currentFileName = safeRelPath.substringAfterLast('/'),
+                                partIndex = totalParts.coerceAtLeast(1),
+                            ),
+                        )
                     } finally {
+                        emittedVolumes.forEach { vol -> runCatching { if (vol.exists()) vol.delete() } }
                         stageDir.deleteRecursively()
                     }
                     continue
                 }
 
-                // Standalone part rollover check BEFORE writing entry
                 val currentBytes = currentCountingOut?.bytesWritten ?: 0L
                 if (currentZipOut != null &&
                     currentEntries.isNotEmpty() &&
@@ -415,13 +896,28 @@ object ZipUploader {
                 val stream = entry.openStream() ?: continue
                 stream.use { input ->
                     val zos = currentZipOut!!
-                    zos.putNextEntry(buildZipParameters(safeRelPath, usePassword))
-                    val copied = input.copyTo(zos, COPY_BUFFER_SIZE)
+                    zos.putNextEntry(buildZipParameters(safeRelPath, usePassword, compressionMode))
+                    val copied = copyStreamWithCancelCheck(input, zos)
                     zos.closeEntry()
                     currentEntries.add(safeRelPath)
                     currentUncompressed += copied
                     totalFiles++
                     totalUncompressed += copied
+                }
+
+                val now = System.currentTimeMillis()
+                if (onZipProgress != null && (entryIdx == totalEntryCount - 1 || now - lastProgressMs >= PROGRESS_INTERVAL_MS)) {
+                    lastProgressMs = now
+                    onZipProgress(
+                        ZipProgress(
+                            filesPacked = totalFiles,
+                            totalFiles = totalEntryCount,
+                            bytesPacked = totalUncompressed,
+                            totalBytes = totalEstimatedBytes.coerceAtLeast(totalUncompressed),
+                            currentFileName = safeRelPath.substringAfterLast('/'),
+                            partIndex = (nextPartIndex - 1).coerceAtLeast(1),
+                        ),
+                    )
                 }
 
                 if ((currentCountingOut?.bytesWritten ?: 0L) >= softLimit) {
@@ -444,6 +940,21 @@ object ZipUploader {
             totalUncompressedBytes = totalUncompressed,
             hadSplitVolumes = hadSplit,
         )
+    }
+
+    private suspend fun copyStreamWithCancelCheck(input: InputStream, output: OutputStream): Long {
+        val buf = ByteArray(COPY_BUFFER_SIZE)
+        var total = 0L
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val n = input.read(buf)
+            if (n < 0) break
+            if (n > 0) {
+                output.write(buf, 0, n)
+                total += n
+            }
+        }
+        return total
     }
 
     private fun collectOrderedSplitVolumes(dir: File, splitBase: String, finalZip: File): List<File> {
@@ -558,9 +1069,17 @@ object ZipUploader {
         }
     }
 
-    private fun buildZipParameters(entryPath: String, encrypt: Boolean): ZipParameters {
+    private fun buildZipParameters(
+        entryPath: String,
+        encrypt: Boolean,
+        compressionMode: ZipCompressionMode,
+    ): ZipParameters {
+        val method = resolveCompressionMethod(entryPath, compressionMode)
         return ZipParameters().apply {
-            compressionMethod = CompressionMethod.DEFLATE
+            compressionMethod = method
+            if (method == CompressionMethod.DEFLATE) {
+                compressionLevel = CompressionLevel.NORMAL
+            }
             fileNameInZip = entryPath
             if (encrypt) {
                 encryptionMethod = EncryptionMethod.AES
@@ -589,47 +1108,72 @@ object ZipUploader {
 
     /**
      * Extract a ZIP file safely with Zip-Slip and zip-bomb bounds.
-     * Supports both plain and AES-encrypted ZIPs (if password is provided).
+     * Supports both plain and AES-encrypted ZIPs (if [password] is provided).
      */
     fun extractZip(zipPath: String, outputDir: File, password: String? = null): List<String>? {
         return try {
-            outputDir.mkdirs()
-            val outRoot = outputDir.canonicalFile.canonicalPath + File.separator
-            val zipFile = File(zipPath)
-            val openZip = if (password != null) ZipFile(zipFile, password.toCharArray()) else ZipFile(zipFile)
-            openZip.use { zip ->
-                val headers = zip.fileHeaders
-                if (headers.size > MAX_EXTRACT_ENTRIES) {
-                    throw SecurityException("ZIP exceeds maximum entry count ($MAX_EXTRACT_ENTRIES)")
-                }
-                var totalBytes = 0L
-                for (header in headers) {
-                    val uncomp = header.uncompressedSize.coerceAtLeast(0L)
-                    totalBytes += uncomp
-                    if (totalBytes > MAX_EXTRACT_TOTAL_BYTES) {
-                        throw SecurityException("ZIP uncompressed size exceeds 2 GB limit")
-                    }
-                    if (uncomp > RATIO_CHECK_MIN_BYTES && header.compressedSize > 0L) {
-                        val ratio = uncomp / header.compressedSize
-                        if (ratio > MAX_COMPRESSION_RATIO) {
-                            throw SecurityException("Suspicious compression ratio ($ratio:1) in entry ${header.fileName}")
-                        }
-                    }
-                    val targetCanonical = File(outputDir, header.fileName).canonicalFile.canonicalPath
-                    if (!targetCanonical.startsWith(outRoot) && targetCanonical != outputDir.canonicalFile.canonicalPath) {
-                        throw SecurityException("Zip-Slip entry rejected: ${header.fileName}")
-                    }
-                }
-                zip.extractAll(outputDir.absolutePath)
-            }
-            val extracted = mutableListOf<String>()
-            outputDir.walkTopDown().filter { it.isFile }.forEach { extracted.add(it.absolutePath) }
-            Log.i("ZipUploader: extracted ${extracted.size} files → ${outputDir.absolutePath}")
-            extracted
+            val extractedFiles = extractAll(zipPath = zipPath, outputDir = outputDir, password = password)
+            extractedFiles.map { it.absolutePath }
         } catch (t: Throwable) {
             Log.w("ZipUploader: extractZip failed", t)
             null
         }
+    }
+
+    /**
+     * Extracts all entries in [zipPath] into [outputDir] with Zip-Slip, entry-count,
+     * uncompressed-size, and compression-ratio safety checks. Throws on bad password or
+     * invalid archive structure.
+     */
+    fun extractAll(
+        zipPath: String,
+        outputDir: File,
+        password: String? = null,
+        onProgress: ((extractedCount: Int, totalCount: Int, currentName: String) -> Unit)? = null,
+    ): List<File> {
+        outputDir.mkdirs()
+        val outCanonical = outputDir.canonicalFile.canonicalPath
+        val outRoot = outCanonical + File.separator
+        val zipFile = File(zipPath)
+        val openZip = if (!password.isNullOrBlank()) {
+            ZipFile(zipFile, password.toCharArray())
+        } else {
+            ZipFile(zipFile)
+        }
+        val extractedFiles = mutableListOf<File>()
+        openZip.use { zip ->
+            val headers = zip.fileHeaders
+            if (headers.size > MAX_EXTRACT_ENTRIES) {
+                throw SecurityException("ZIP exceeds maximum entry count ($MAX_EXTRACT_ENTRIES)")
+            }
+            var totalBytes = 0L
+            for (header in headers) {
+                val uncomp = header.uncompressedSize.coerceAtLeast(0L)
+                totalBytes += uncomp
+                if (totalBytes > MAX_EXTRACT_TOTAL_BYTES) {
+                    throw SecurityException("ZIP uncompressed size exceeds 4 GB limit")
+                }
+                if (uncomp > RATIO_CHECK_MIN_BYTES && header.compressedSize > 0L) {
+                    val ratio = uncomp / header.compressedSize
+                    if (ratio > MAX_COMPRESSION_RATIO) {
+                        throw SecurityException("Suspicious compression ratio ($ratio:1) in entry ${header.fileName}")
+                    }
+                }
+                val targetCanonical = File(outputDir, header.fileName).canonicalFile.canonicalPath
+                if (!targetCanonical.startsWith(outRoot) && targetCanonical != outCanonical) {
+                    throw SecurityException("Zip-Slip entry rejected: ${header.fileName}")
+                }
+            }
+            val fileHeaders = headers.filterNot { it.isDirectory }
+            fileHeaders.forEachIndexed { idx, header ->
+                zip.extractFile(header, outputDir.absolutePath)
+                val outFile = File(outputDir, header.fileName)
+                if (outFile.isFile) extractedFiles.add(outFile)
+                onProgress?.invoke(idx + 1, fileHeaders.size, header.fileName)
+            }
+        }
+        Log.i("ZipUploader: extractAll extracted ${extractedFiles.size} files -> ${outputDir.absolutePath}")
+        return extractedFiles
     }
 
     fun listZipEntries(zipPath: String): List<Pair<String, Long>> {
@@ -829,6 +1373,7 @@ object ZipUploader {
         uris: List<Uri>,
         outputFile: File,
         password: String? = null,
+        compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
     ): List<String> {
         require(uris.isNotEmpty()) { "At least one URI is required" }
         outputFile.parentFile?.mkdirs()
@@ -847,15 +1392,7 @@ object ZipUploader {
                 uris.forEachIndexed { idx, uri ->
                     val rawName = resolveUriDisplayName(context, uri) ?: "file_${idx + 1}"
                     val entryName = deduplicateEntryName(sanitizeZipBaseName(rawName), usedNames)
-                    val params = ZipParameters().apply {
-                        fileNameInZip = entryName
-                        compressionMethod = CompressionMethod.DEFLATE
-                        if (encrypted) {
-                            isEncryptFiles = true
-                            encryptionMethod = EncryptionMethod.AES
-                            aesKeyStrength = AesKeyStrength.KEY_STRENGTH_256
-                        }
-                    }
+                    val params = buildZipParameters(entryName, encrypted, compressionMode)
                     context.contentResolver.openInputStream(uri)?.use { input ->
                         stream.putNextEntry(params)
                         while (true) {
@@ -879,13 +1416,13 @@ object ZipUploader {
         runCatching {
             context.contentResolver.query(
                 uri,
-                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                arrayOf(OpenableColumns.DISPLAY_NAME),
                 null,
                 null,
                 null,
             )?.use { c ->
                 if (c.moveToFirst()) {
-                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                     if (idx >= 0) {
                         val name = c.getString(idx)
                         if (!name.isNullOrBlank()) return name
@@ -894,6 +1431,27 @@ object ZipUploader {
             }
         }
         return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+    }
+
+    private fun resolveUriSize(context: Context, uri: Uri): Long {
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.SIZE),
+                null,
+                null,
+                null,
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && !c.isNull(idx)) {
+                        val size = c.getLong(idx)
+                        if (size >= 0L) return size
+                    }
+                }
+            }
+        }
+        return 0L
     }
 
     private fun deduplicateEntryName(baseName: String, used: MutableSet<String>): String {

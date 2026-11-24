@@ -89,11 +89,14 @@ data class AppPreferencesData(
     val backupMinBatteryPercent: Int = 15,
     val backupAutoOrganizeByDate: Boolean = false,
     val backupEncryptedFolderUris: Set<String> = emptySet(),
+    val backupEncryptAll: Boolean = false,
+    val backupUseCustomPassphrase: Boolean = false,
     val backupScheduleHour: Int = 2,
     val backupScheduleMinute: Int = 0,
     val backupSyncIndexRestored: Boolean = false,
 ) {
-    fun isFolderEncrypted(folderUri: String): Boolean = folderUri in backupEncryptedFolderUris
+    fun isFolderEncrypted(folderUri: String): Boolean =
+        backupEncryptAll || (folderUri in backupEncryptedFolderUris)
 
     fun recentSearches(): List<String> =
         recentSearchQueries.split('\n').map { it.trim() }.filter { it.isNotEmpty() }.take(10)
@@ -219,6 +222,8 @@ class AppPreferences @Inject constructor(
         val BACKUP_MIN_BATTERY_PERCENT = intPreferencesKey("backup_min_battery_percent")
         val BACKUP_AUTO_ORGANIZE_BY_DATE = booleanPreferencesKey("backup_auto_organize_by_date")
         val BACKUP_ENCRYPTED_FOLDER_URIS = stringSetPreferencesKey("backup_encrypted_folder_uris")
+        val BACKUP_ENCRYPT_ALL = booleanPreferencesKey("backup_encrypt_all")
+        val BACKUP_USE_CUSTOM_PASSPHRASE = booleanPreferencesKey("backup_use_custom_passphrase")
         val BACKUP_SCHEDULE_HOUR = intPreferencesKey("backup_schedule_hour")
         val BACKUP_SCHEDULE_MINUTE = intPreferencesKey("backup_schedule_minute")
         val BACKUP_SYNC_INDEX_RESTORED = booleanPreferencesKey("backup_sync_index_restored")
@@ -299,6 +304,8 @@ class AppPreferences @Inject constructor(
             backupMinBatteryPercent = (get(Keys.BACKUP_MIN_BATTERY_PERCENT) ?: 15).coerceIn(5, 80),
             backupAutoOrganizeByDate = get(Keys.BACKUP_AUTO_ORGANIZE_BY_DATE) ?: false,
             backupEncryptedFolderUris = get(Keys.BACKUP_ENCRYPTED_FOLDER_URIS) ?: emptySet(),
+            backupEncryptAll = get(Keys.BACKUP_ENCRYPT_ALL) ?: false,
+            backupUseCustomPassphrase = get(Keys.BACKUP_USE_CUSTOM_PASSPHRASE) ?: false,
             backupScheduleHour = (get(Keys.BACKUP_SCHEDULE_HOUR) ?: 2).coerceIn(0, 23),
             backupScheduleMinute = (get(Keys.BACKUP_SCHEDULE_MINUTE) ?: 0).coerceIn(0, 59),
             backupSyncIndexRestored = get(Keys.BACKUP_SYNC_INDEX_RESTORED) ?: false,
@@ -348,6 +355,8 @@ class AppPreferences @Inject constructor(
         this[Keys.BACKUP_MIN_BATTERY_PERCENT] = d.backupMinBatteryPercent
         this[Keys.BACKUP_AUTO_ORGANIZE_BY_DATE] = d.backupAutoOrganizeByDate
         this[Keys.BACKUP_ENCRYPTED_FOLDER_URIS] = d.backupEncryptedFolderUris
+        this[Keys.BACKUP_ENCRYPT_ALL] = d.backupEncryptAll
+        this[Keys.BACKUP_USE_CUSTOM_PASSPHRASE] = d.backupUseCustomPassphrase
         this[Keys.BACKUP_SCHEDULE_HOUR] = d.backupScheduleHour
         this[Keys.BACKUP_SCHEDULE_MINUTE] = d.backupScheduleMinute
         this[Keys.BACKUP_SYNC_INDEX_RESTORED] = d.backupSyncIndexRestored

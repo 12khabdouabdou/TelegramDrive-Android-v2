@@ -1,0 +1,1342 @@
+package com.tgdrive.core.download
+
+import android.content.ContentValues
+import android.content.Context
+import android.media.ExifInterface
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
+import androidx.documentfile.provider.DocumentFile
+import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.Log
+import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.ZipEntryDao
+import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.db.entity.ZipEntryEntity
+import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.EncryptedFileFormat
+import com.tgdrive.core.security.WrongPassphraseException
+import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.telegram.UploadResult
+import com.tgdrive.core.zip.UploadedZipPartRecord
+import com.tgdrive.core.zip.ZipExcludeMatcher
+import com.tgdrive.core.zip.ZipUploader
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Unified, process-scoped upload & decryption manager shared across folders, home quick
+ * actions, Android Share intents, and the Transfers tab.
+ *
+ * Survives ViewModel navigation via app-scoped coroutines and [TransferKeepAliveWorker],
+ * handles bounded parallelism, pre-stage duplicate conflict checks, optional AES-256 file &
+ * ZIP encryption, oversized file auto-splitting, FLOOD_WAIT/transient retry, and `.tgenc`
+ * decryption back to cache or Downloads.
+ */
+@Singleton
+class UploadManager @Inject constructor(
+    @ApplicationContext private val ctx: Context,
+    private val telegramClient: TelegramClient,
+    private val fileCacheDao: FileCacheDao,
+    private val zipEntryDao: ZipEntryDao,
+    private val mediaThumbnailCache: MediaThumbnailCache,
+    private val uploadTracker: UploadTracker,
+    private val backupCrypto: BackupCrypto,
+    private val dispatchers: DispatchersProvider,
+) {
+    private sealed interface RetrySpec {
+        data class SingleFile(
+            val chatId: Long,
+            val file: UploadFileItem,
+            val options: NormalUploadOptions,
+            val virtualPath: String = "",
+            val lastModifiedMs: Long = 0L,
+        ) : RetrySpec
+
+        data class FolderZip(
+            val treeUri: Uri,
+            val request: ZipUploadRequest,
+        ) : RetrySpec
+
+        data class UrisZip(
+            val files: List<UploadFileItem>,
+            val request: ZipUploadRequest,
+        ) : RetrySpec
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
+    private val smallFileSemaphore = Semaphore(MAX_SMALL_PARALLEL)
+    private val heavyJobSemaphore = Semaphore(1)
+
+    private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val retrySpecs = ConcurrentHashMap<String, RetrySpec>()
+
+    val uploads: StateFlow<UploadQueueState> = uploadTracker.state
+
+    private val _completedChatEvents = MutableSharedFlow<Long>(extraBufferCapacity = 32)
+    val completedChatEvents: SharedFlow<Long> = _completedChatEvents.asSharedFlow()
+
+    init {
+        scope.launch { purgeStaleStaging() }
+    }
+
+    suspend fun resolveFileItems(uris: List<Uri>): List<UploadFileItem> = withContext(dispatchers.io) {
+        uris.mapIndexed { idx, uri ->
+            var name: String? = null
+            var size = 0L
+            runCatching {
+                ctx.contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null,
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (nameIdx >= 0) name = c.getString(nameIdx)
+                        if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                    }
+                }
+            }
+            if (size <= 0L && uri.scheme == "file") {
+                size = uri.path?.let { File(it).length() } ?: 0L
+            }
+            val fallbackName = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                ?: "file_${idx + 1}"
+            val safeName = sanitizeLeafName(name?.takeIf { it.isNotBlank() } ?: fallbackName)
+            val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: guessMimeType(safeName)
+            UploadFileItem(
+                uri = uri,
+                displayName = safeName,
+                mimeType = mime,
+                sizeBytes = size.coerceAtLeast(0L),
+            )
+        }
+    }
+
+    fun enqueueFiles(
+        chatId: Long,
+        files: List<UploadFileItem>,
+        options: NormalUploadOptions = NormalUploadOptions(),
+    ) {
+        if (files.isEmpty()) return
+        val preparedIds = files.mapIndexed { idx, f ->
+            val id = "ul_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
+            val shownName = if (options.encryption.enabled) "${sanitizeLeafName(f.displayName)}.tgenc" else sanitizeLeafName(f.displayName)
+            uploadTracker.start(
+                id = id,
+                fileName = shownName,
+                totalBytes = f.sizeBytes,
+                chatId = chatId,
+                status = UploadStatus.QUEUED,
+                isEncrypted = options.encryption.enabled,
+            )
+            id to f
+        }
+        scope.launch {
+            val resolvedChatId = resolveChatId(chatId)
+            if (resolvedChatId == 0L) {
+                preparedIds.forEach { (id, _) ->
+                    uploadTracker.markFailed(id, "Telegram session not ready", canRetry = false)
+                }
+                return@launch
+            }
+            val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+            val claimedNames = ConcurrentHashMap.newKeySet<String>()
+            existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+
+            val jobs = preparedIds.map { (id, file) ->
+                val spec = RetrySpec.SingleFile(resolvedChatId, file, options)
+                retrySpecs[id] = spec
+                val job = async {
+                    executeSingleFileTask(id, spec, claimedNames, existingRows)
+                }
+                activeJobs[id] = job
+                job
+            }
+            val results = jobs.awaitAll()
+            if (results.any { it }) {
+                _completedChatEvents.tryEmit(resolvedChatId)
+            }
+        }
+    }
+
+    fun enqueueFolderAsNormalFiles(
+        chatId: Long,
+        treeUri: Uri,
+        options: NormalUploadOptions = NormalUploadOptions(),
+    ) {
+        scope.launch {
+            val resolvedChatId = resolveChatId(chatId)
+            if (resolvedChatId == 0L) return@launch
+            val scanned = scanFolderForNormalUpload(treeUri)
+            if (scanned.isEmpty()) return@launch
+
+            val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+            val claimedNames = ConcurrentHashMap.newKeySet<String>()
+            existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+
+            val prepared = scanned.mapIndexed { idx, entry ->
+                val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
+                val shownName = if (options.encryption.enabled) {
+                    "${sanitizeLeafName(entry.item.displayName)}.tgenc"
+                } else {
+                    sanitizeLeafName(entry.item.displayName)
+                }
+                uploadTracker.start(
+                    id = id,
+                    fileName = shownName,
+                    totalBytes = entry.item.sizeBytes,
+                    chatId = resolvedChatId,
+                    status = UploadStatus.QUEUED,
+                    statusDetail = entry.virtualPath.takeIf { it.isNotBlank() },
+                    isEncrypted = options.encryption.enabled,
+                )
+                Triple(id, entry, shownName)
+            }
+
+            val jobs = prepared.map { (id, entry, _) ->
+                val spec = RetrySpec.SingleFile(
+                    chatId = resolvedChatId,
+                    file = entry.item,
+                    options = options,
+                    virtualPath = entry.virtualPath,
+                    lastModifiedMs = entry.lastModifiedMs,
+                )
+                retrySpecs[id] = spec
+                val job = async {
+                    executeSingleFileTask(id, spec, claimedNames, existingRows)
+                }
+                activeJobs[id] = job
+                job
+            }
+            val results = jobs.awaitAll()
+            if (results.any { it }) {
+                _completedChatEvents.tryEmit(resolvedChatId)
+            }
+        }
+    }
+
+    fun enqueueFolderAsZip(
+        treeUri: Uri,
+        request: ZipUploadRequest,
+    ): String {
+        val id = "zip_dir_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
+        val safeBase = ZipUploader.sanitizeZipBaseName(request.baseName).removeSuffix(".zip")
+        val spec = RetrySpec.FolderZip(treeUri, request.copy(baseName = safeBase))
+        retrySpecs[id] = spec
+        uploadTracker.start(
+            id = id,
+            fileName = "$safeBase.zip",
+            totalBytes = 0L,
+            chatId = request.chatId,
+            status = UploadStatus.PACKING,
+            statusDetail = if (request.encryption.enabled) "Preparing encrypted ZIP…" else "Scanning folder…",
+            isEncrypted = request.encryption.enabled,
+        )
+        val job = scope.launch {
+            executeZipTask(id, spec)
+        }
+        activeJobs[id] = job
+        return id
+    }
+
+    fun enqueueUrisAsZip(
+        files: List<UploadFileItem>,
+        request: ZipUploadRequest,
+    ): String {
+        val id = "zip_uris_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
+        val safeBase = ZipUploader.sanitizeZipBaseName(request.baseName).removeSuffix(".zip")
+        val spec = RetrySpec.UrisZip(files, request.copy(baseName = safeBase))
+        retrySpecs[id] = spec
+        uploadTracker.start(
+            id = id,
+            fileName = "$safeBase.zip",
+            totalBytes = files.sumOf { it.sizeBytes.coerceAtLeast(0L) },
+            chatId = request.chatId,
+            status = UploadStatus.PACKING,
+            statusDetail = if (request.encryption.enabled) "Packing & encrypting ${files.size} file(s)…" else "Packing ${files.size} file(s)…",
+            isEncrypted = request.encryption.enabled,
+        )
+        val job = scope.launch {
+            executeZipTask(id, spec)
+        }
+        activeJobs[id] = job
+        return id
+    }
+
+    fun cancel(uploadId: String) {
+        activeJobs.remove(uploadId)?.cancel()
+        uploadTracker.markCancelled(uploadId)
+    }
+
+    fun retry(uploadId: String) {
+        val spec = retrySpecs[uploadId] ?: return
+        if (activeJobs[uploadId]?.isActive == true) return
+        when (spec) {
+            is RetrySpec.SingleFile -> {
+                val shownName = if (spec.options.encryption.enabled) {
+                    "${sanitizeLeafName(spec.file.displayName)}.tgenc"
+                } else {
+                    sanitizeLeafName(spec.file.displayName)
+                }
+                uploadTracker.start(
+                    id = uploadId,
+                    fileName = shownName,
+                    totalBytes = spec.file.sizeBytes,
+                    chatId = spec.chatId,
+                    status = UploadStatus.QUEUED,
+                    isEncrypted = spec.options.encryption.enabled,
+                )
+                val job = scope.launch {
+                    val existingRows = runCatching { fileCacheDao.forChat(spec.chatId) }.getOrDefault(emptyList())
+                    val claimed = ConcurrentHashMap.newKeySet<String>().apply {
+                        existingRows.forEach { add(it.fileName.lowercase(Locale.US)) }
+                    }
+                    if (executeSingleFileTask(uploadId, spec, claimed, existingRows)) {
+                        _completedChatEvents.tryEmit(spec.chatId)
+                    }
+                }
+                activeJobs[uploadId] = job
+            }
+            is RetrySpec.FolderZip -> {
+                uploadTracker.start(
+                    id = uploadId,
+                    fileName = "${spec.request.baseName}.zip",
+                    totalBytes = 0L,
+                    chatId = spec.request.chatId,
+                    status = UploadStatus.PACKING,
+                    isEncrypted = spec.request.encryption.enabled,
+                )
+                val job = scope.launch { executeZipTask(uploadId, spec) }
+                activeJobs[uploadId] = job
+            }
+            is RetrySpec.UrisZip -> {
+                uploadTracker.start(
+                    id = uploadId,
+                    fileName = "${spec.request.baseName}.zip",
+                    totalBytes = spec.files.sumOf { it.sizeBytes.coerceAtLeast(0L) },
+                    chatId = spec.request.chatId,
+                    status = UploadStatus.PACKING,
+                    isEncrypted = spec.request.encryption.enabled,
+                )
+                val job = scope.launch { executeZipTask(uploadId, spec) }
+                activeJobs[uploadId] = job
+            }
+        }
+    }
+
+    fun retryAllFailed() {
+        val failedIds = uploads.value.items
+            .filter { it.status == UploadStatus.FAILED && it.canRetry }
+            .map { it.id }
+        failedIds.forEach { retry(it) }
+    }
+
+    fun detectEncryptedFormat(file: File): EncryptedFileFormat = backupCrypto.detectFormat(file)
+
+    suspend fun decryptLocalFile(
+        encryptedFile: File,
+        originalDisplayName: String,
+        passphrase: String? = null,
+        saveToDownloads: Boolean = false,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): DecryptOutcome = withContext(dispatchers.io) {
+        if (!encryptedFile.isFile) {
+            return@withContext DecryptOutcome.Failed("Encrypted file is not cached locally yet")
+        }
+        val cleanName = sanitizeLeafName(BackupCrypto.stripEncryptedExtension(originalDisplayName))
+        val outDir = File(ctx.cacheDir, "decrypted").apply { mkdirs() }
+        val tmpOut = File(outDir, ".tmp_${UUID.randomUUID()}_$cleanName")
+        val finalOut = File(outDir, cleanName)
+        return@withContext try {
+            backupCrypto.decryptFile(
+                inputFile = encryptedFile,
+                outputFile = tmpOut,
+                passphrase = passphrase,
+                onProgress = onProgress,
+            )
+            if (finalOut.exists()) finalOut.delete()
+            if (!tmpOut.renameTo(finalOut)) {
+                tmpOut.copyTo(finalOut, overwrite = true)
+                tmpOut.delete()
+            }
+            val mime = guessMimeType(cleanName)
+            var savedFile = finalOut
+            if (saveToDownloads) {
+                savedFile = writeDecryptedToDownloads(finalOut, cleanName, mime) ?: finalOut
+            }
+            DecryptOutcome.Success(
+                file = savedFile,
+                displayName = cleanName,
+                mimeType = mime,
+                savedToDownloads = saveToDownloads,
+            )
+        } catch (e: WrongPassphraseException) {
+            runCatching { tmpOut.delete() }
+            DecryptOutcome.WrongPassphrase(e.message ?: "Incorrect key or passphrase")
+        } catch (e: CancellationException) {
+            runCatching { tmpOut.delete() }
+            throw e
+        } catch (t: Throwable) {
+            runCatching { tmpOut.delete() }
+            Log.w("UploadManager: decryptLocalFile failed for '$originalDisplayName'", t)
+            DecryptOutcome.Failed(t.message ?: "Decryption failed")
+        }
+    }
+
+    private suspend fun executeSingleFileTask(
+        id: String,
+        spec: RetrySpec.SingleFile,
+        claimedNames: MutableSet<String>,
+        existingRowsSnapshot: List<FileCacheEntity>,
+    ): Boolean {
+        val chatId = spec.chatId
+        val item = spec.file
+        val options = spec.options
+        val maxLimit = runCatching { telegramClient.maxUploadSizeBytes() }
+            .getOrDefault(TelegramClient.MAX_FILE_SIZE_STANDARD)
+        val rawName = sanitizeLeafName(item.displayName)
+        val desiredName = if (options.encryption.enabled && !BackupCrypto.isEncryptedFileName(rawName)) {
+            "$rawName${BackupCrypto.ENCRYPTED_EXT}"
+        } else {
+            rawName
+        }
+        val effectiveMime = if (options.encryption.enabled) "application/octet-stream" else item.mimeType.ifBlank { guessMimeType(rawName) }
+
+        val existingMatch = existingRowsSnapshot.firstOrNull {
+            it.fileName.equals(desiredName, ignoreCase = true)
+        }
+        var targetName = desiredName
+        when (options.conflictStrategy) {
+            UploadConflictStrategy.SKIP -> {
+                if (existingMatch != null) {
+                    uploadTracker.completeUpload(id, detail = "Already exists — skipped")
+                    activeJobs.remove(id)
+                    return false
+                }
+                claimedNames.add(targetName.lowercase(Locale.US))
+            }
+            UploadConflictStrategy.KEEP_BOTH -> {
+                targetName = claimUniqueName(desiredName, claimedNames)
+                uploadTracker.updatePhase(id, UploadStatus.QUEUED, fileName = targetName)
+            }
+            UploadConflictStrategy.REPLACE -> {
+                claimedNames.add(targetName.lowercase(Locale.US))
+            }
+        }
+
+        val isHeavy = item.sizeBytes >= LARGE_FILE_THRESHOLD_BYTES ||
+            (item.sizeBytes > maxLimit && options.autoSplitOversized)
+        val semaphore = if (isHeavy) heavyJobSemaphore else smallFileSemaphore
+
+        return semaphore.withPermit {
+            val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
+            var stagedFile: File? = null
+            var encryptedFile: File? = null
+            try {
+                currentCoroutineContext().ensureActive()
+                val estNeeded = if (options.encryption.enabled) item.sizeBytes * 2L else item.sizeBytes
+                if (!hasEnoughDiskSpace(stagingDir, estNeeded)) {
+                    uploadTracker.markFailed(id, "Not enough free storage space to stage file", canRetry = false)
+                    return@withPermit false
+                }
+
+                uploadTracker.updatePhase(id, UploadStatus.PREPARING, detail = "Copying to staging…", fileName = targetName)
+                val tempRaw = File(stagingDir, "${UUID.randomUUID().toString().take(8)}_$rawName")
+                stagedFile = tempRaw
+                val stream = openUriStream(item.uri)
+                    ?: throw IllegalStateException("Cannot open selected file")
+                stream.use { input ->
+                    FileOutputStream(tempRaw).use { out ->
+                        copyWithCancel(input, out)
+                    }
+                }
+
+                val rawSize = tempRaw.length()
+                val captureDateMs = extractCaptureTimestampMs(tempRaw, item.mimeType, spec.lastModifiedMs)
+
+                // Handle single file exceeding Telegram account limit
+                if (rawSize > maxLimit) {
+                    if (!options.autoSplitOversized) {
+                        val limitGb = maxLimit / (1024L * 1024 * 1024)
+                        uploadTracker.markFailed(id, "File exceeds $limitGb GB limit", canRetry = false)
+                        return@withPermit false
+                    }
+                    return@withPermit uploadOversizedSingleFileSplit(
+                        id = id,
+                        chatId = chatId,
+                        sourceFile = tempRaw,
+                        displayName = rawName,
+                        maxPartBytes = (maxLimit * 92L / 100L),
+                        options = options,
+                        virtualPath = spec.virtualPath,
+                        captureDateMs = captureDateMs,
+                        stagingDir = stagingDir,
+                    )
+                }
+
+                var fileToUpload = tempRaw
+                var finalMime = effectiveMime
+                if (options.encryption.enabled) {
+                    uploadTracker.updatePhase(
+                        id = id,
+                        status = UploadStatus.ENCRYPTING,
+                        detail = if (options.encryption.useVaultKey) "Encrypting (Vault Key)…" else "Encrypting (AES-256)…",
+                        progress = 0f,
+                        isEncrypted = true,
+                    )
+                    val encOut = File(stagingDir, "${tempRaw.name}${BackupCrypto.ENCRYPTED_EXT}")
+                    encryptedFile = encOut
+                    val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
+                    backupCrypto.encryptFile(tempRaw, encOut, passphrase = customPass) { done, tot ->
+                        if (tot > 0L) {
+                            uploadTracker.updatePhase(
+                                id = id,
+                                status = UploadStatus.ENCRYPTING,
+                                progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
+                            )
+                        }
+                    }
+                    tempRaw.delete()
+                    fileToUpload = encOut
+                    finalMime = "application/octet-stream"
+                }
+
+                val uploadSize = fileToUpload.length()
+                uploadTracker.updatePhase(
+                    id = id,
+                    status = UploadStatus.UPLOADING,
+                    detail = null,
+                    progress = 0f,
+                    totalBytes = uploadSize,
+                    fileName = targetName,
+                    isEncrypted = options.encryption.enabled,
+                )
+
+                val uploadResult = uploadWithRetry(
+                    id = id,
+                    chatId = chatId,
+                    localPath = fileToUpload.absolutePath,
+                    fileName = targetName,
+                    mimeType = finalMime,
+                )
+
+                val thumbPath = if (options.encryption.enabled) {
+                    null
+                } else {
+                    runCatching {
+                        mediaThumbnailCache.generateFromLocalFile(
+                            chatId = chatId,
+                            messageId = uploadResult.messageId,
+                            localPath = fileToUpload.absolutePath,
+                            mimeType = finalMime,
+                            fileName = targetName,
+                        )
+                    }.getOrNull()
+                }
+
+                fileCacheDao.upsertAll(
+                    listOf(
+                        FileCacheEntity(
+                            messageId = uploadResult.messageId,
+                            chatId = chatId,
+                            fileName = targetName,
+                            fileSize = uploadSize,
+                            mimeType = finalMime,
+                            thumbnailPath = thumbPath,
+                            remoteId = uploadResult.remoteId,
+                            date = captureDateMs,
+                            lastAccessed = System.currentTimeMillis(),
+                            virtualPath = spec.virtualPath,
+                            isEncryptedVault = options.encryption.enabled,
+                        ),
+                    ),
+                )
+
+                if (options.conflictStrategy == UploadConflictStrategy.REPLACE && existingMatch != null) {
+                    runCatching { telegramClient.deleteMessage(chatId, existingMatch.messageId) }
+                    runCatching { fileCacheDao.deleteById(chatId, existingMatch.messageId) }
+                }
+
+                uploadTracker.completeUpload(id)
+                true
+            } catch (e: CancellationException) {
+                uploadTracker.markCancelled(id)
+                throw e
+            } catch (t: Throwable) {
+                Log.w("UploadManager: single file upload failed for '$targetName'", t)
+                uploadTracker.markFailed(id, t.message ?: "Upload failed", canRetry = true)
+                false
+            } finally {
+                activeJobs.remove(id)
+                runCatching { stagedFile?.delete() }
+                runCatching { encryptedFile?.delete() }
+            }
+        }
+    }
+
+    private suspend fun uploadOversizedSingleFileSplit(
+        id: String,
+        chatId: Long,
+        sourceFile: File,
+        displayName: String,
+        maxPartBytes: Long,
+        options: NormalUploadOptions,
+        virtualPath: String,
+        captureDateMs: Long,
+        stagingDir: File,
+    ): Boolean {
+        val password = resolveEncryptionPassphrase(options.encryption)
+        val isEncrypted = password != null
+        uploadTracker.updatePhase(
+            id = id,
+            status = UploadStatus.PACKING,
+            detail = "Splitting oversized file into volumes…",
+            isEncrypted = isEncrypted,
+        )
+        val splitWorkDir = File(stagingDir, "split_${id.take(16)}").apply { mkdirs() }
+        return try {
+            val uploadedParts = mutableListOf<UploadedZipPartRecord>()
+            ZipUploader.zipSingleFileSplit(
+                sourceFile = sourceFile,
+                displayName = displayName,
+                workDir = splitWorkDir,
+                maxPartBytes = maxPartBytes,
+                password = password,
+            ) { part ->
+                val partName = part.partFile.name
+                val partSize = part.partFile.length()
+                uploadTracker.updatePhase(
+                    id = id,
+                    status = UploadStatus.UPLOADING,
+                    detail = "Volume ${part.partIndex}",
+                    progress = 0f,
+                    totalBytes = partSize,
+                    fileName = partName,
+                    isEncrypted = isEncrypted,
+                )
+                val res = uploadWithRetry(
+                    id = id,
+                    chatId = chatId,
+                    localPath = part.partFile.absolutePath,
+                    fileName = partName,
+                    mimeType = "application/zip",
+                )
+                fileCacheDao.upsertAll(
+                    listOf(
+                        FileCacheEntity(
+                            messageId = res.messageId,
+                            chatId = chatId,
+                            fileName = partName,
+                            fileSize = partSize,
+                            mimeType = "application/zip",
+                            thumbnailPath = null,
+                            remoteId = res.remoteId,
+                            date = captureDateMs,
+                            lastAccessed = System.currentTimeMillis(),
+                            virtualPath = virtualPath,
+                            isEncryptedVault = isEncrypted,
+                        ),
+                    ),
+                )
+                if (part.entries.isNotEmpty()) {
+                    indexZipEntries(chatId, res.messageId, partName, part.entries, isEncrypted)
+                }
+                uploadedParts += UploadedZipPartRecord(
+                    fileName = partName,
+                    fileSizeBytes = partSize,
+                    partIndex = part.partIndex,
+                    isSplitVolume = part.isSplitVolume,
+                    messageId = res.messageId,
+                    entries = part.entries,
+                )
+            }
+            uploadTracker.completeUpload(id, detail = "Split into ${uploadedParts.size} volumes")
+            true
+        } finally {
+            runCatching { splitWorkDir.deleteRecursively() }
+        }
+    }
+
+    private suspend fun executeZipTask(
+        id: String,
+        spec: RetrySpec,
+    ) {
+        heavyJobSemaphore.withPermit {
+            val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
+            val zipWorkDir = File(stagingDir, "zip_${id.take(18)}").apply { mkdirs() }
+            var manifestFile: File? = null
+            try {
+                val request = when (spec) {
+                    is RetrySpec.FolderZip -> spec.request
+                    is RetrySpec.UrisZip -> spec.request
+                    else -> return@withPermit
+                }
+                val chatId = resolveChatId(request.chatId)
+                if (chatId == 0L) {
+                    uploadTracker.markFailed(id, "Telegram session not ready", canRetry = true)
+                    return@withPermit
+                }
+
+                val accountChunkCap = runCatching { telegramClient.safeZipChunkLimitBytes() }
+                    .getOrDefault(TelegramClient.SAFE_CHUNK_LIMIT_STANDARD)
+                val maxPartBytes = request.maxPartBytesOverride
+                    ?.takeIf { it > 0L }
+                    ?.coerceAtMost(accountChunkCap)
+                    ?: accountChunkCap
+
+                val password = resolveEncryptionPassphrase(request.encryption)
+                val isEncrypted = password != null
+                val excludeList = ZipExcludeMatcher.parse(request.excludePatterns)
+                val uploadedParts = mutableListOf<UploadedZipPartRecord>()
+
+                val summary = when (spec) {
+                    is RetrySpec.FolderZip -> {
+                        ZipUploader.zipFolderInParts(
+                            context = ctx,
+                            treeUri = spec.treeUri,
+                            workDir = zipWorkDir,
+                            baseZipName = request.baseName,
+                            maxPartBytes = maxPartBytes,
+                            password = password,
+                            compressionMode = request.compressionMode,
+                            excludePathMatcher = if (excludeList.isEmpty()) {
+                                null
+                            } else {
+                                { relPath, name -> ZipExcludeMatcher.matchesPath(relPath, name, excludeList) }
+                            },
+                            onZipProgress = { p ->
+                                val pct = if (p.totalBytes > 0L) {
+                                    (p.bytesPacked.toFloat() / p.totalBytes.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    0f
+                                }
+                                uploadTracker.updatePhase(
+                                    id = id,
+                                    status = UploadStatus.PACKING,
+                                    detail = "Packing ${p.filesPacked}/${p.totalFiles} · ${p.currentFileName}",
+                                    progress = pct,
+                                )
+                            },
+                        ) { part ->
+                            handleReadyZipPart(
+                                id = id,
+                                chatId = chatId,
+                                part = part,
+                                isEncrypted = isEncrypted,
+                                uploadedParts = uploadedParts,
+                            )
+                        }
+                    }
+                    is RetrySpec.UrisZip -> {
+                        val customNames = spec.files.associate { it.uri to it.displayName }
+                        ZipUploader.zipUrisInParts(
+                            context = ctx,
+                            uris = spec.files.map { it.uri },
+                            workDir = zipWorkDir,
+                            baseZipName = request.baseName,
+                            customNames = customNames,
+                            maxPartBytes = maxPartBytes,
+                            password = password,
+                            compressionMode = request.compressionMode,
+                            onZipProgress = { p ->
+                                val pct = if (p.totalBytes > 0L) {
+                                    (p.bytesPacked.toFloat() / p.totalBytes.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    0f
+                                }
+                                uploadTracker.updatePhase(
+                                    id = id,
+                                    status = UploadStatus.PACKING,
+                                    detail = "Packing ${p.filesPacked}/${p.totalFiles} · ${p.currentFileName}",
+                                    progress = pct,
+                                )
+                            },
+                        ) { part ->
+                            handleReadyZipPart(
+                                id = id,
+                                chatId = chatId,
+                                part = part,
+                                isEncrypted = isEncrypted,
+                                uploadedParts = uploadedParts,
+                            )
+                        }
+                    }
+                    else -> error("Invalid ZIP retry spec")
+                }
+
+                if (summary.totalFilesProcessed == 0 || uploadedParts.isEmpty()) {
+                    uploadTracker.markFailed(id, "No eligible files found to archive", canRetry = false)
+                    return@withPermit
+                }
+
+                if (uploadedParts.size > 1) {
+                    val mFile = ZipUploader.writeManifestJsonFile(
+                        outputDir = zipWorkDir,
+                        baseName = request.baseName,
+                        folderName = request.baseName,
+                        encrypted = isEncrypted,
+                        parts = uploadedParts,
+                    )
+                    manifestFile = mFile
+                    val mLen = mFile.length()
+                    uploadTracker.updatePhase(
+                        id = id,
+                        status = UploadStatus.UPLOADING,
+                        detail = "Uploading manifest (${uploadedParts.size} parts)…",
+                        totalBytes = mLen,
+                        fileName = mFile.name,
+                    )
+                    val mRes = uploadWithRetry(
+                        id = id,
+                        chatId = chatId,
+                        localPath = mFile.absolutePath,
+                        fileName = mFile.name,
+                        mimeType = "application/json",
+                    )
+                    fileCacheDao.upsertAll(
+                        listOf(
+                            FileCacheEntity(
+                                messageId = mRes.messageId,
+                                chatId = chatId,
+                                fileName = mFile.name,
+                                fileSize = mLen,
+                                mimeType = "application/json",
+                                thumbnailPath = null,
+                                remoteId = mRes.remoteId,
+                                date = System.currentTimeMillis(),
+                                lastAccessed = System.currentTimeMillis(),
+                            ),
+                        ),
+                    )
+                }
+
+                val summaryLabel = if (uploadedParts.size > 1) {
+                    "${request.baseName} (${uploadedParts.size} parts)"
+                } else {
+                    uploadedParts.first().fileName
+                }
+                uploadTracker.updatePhase(id, UploadStatus.DONE, fileName = summaryLabel)
+                uploadTracker.completeUpload(
+                    id = id,
+                    detail = "${summary.totalFilesProcessed} files archived",
+                )
+                _completedChatEvents.tryEmit(chatId)
+            } catch (e: CancellationException) {
+                uploadTracker.markCancelled(id)
+                throw e
+            } catch (t: Throwable) {
+                Log.w("UploadManager: ZIP upload failed", t)
+                uploadTracker.markFailed(id, t.message ?: "ZIP upload failed", canRetry = true)
+            } finally {
+                activeJobs.remove(id)
+                runCatching { manifestFile?.delete() }
+                runCatching { zipWorkDir.deleteRecursively() }
+            }
+        }
+    }
+
+    private suspend fun handleReadyZipPart(
+        id: String,
+        chatId: Long,
+        part: com.tgdrive.core.zip.ZipPartOutput,
+        isEncrypted: Boolean,
+        uploadedParts: MutableList<UploadedZipPartRecord>,
+    ) {
+        val partName = part.partFile.name
+        val partLen = part.partFile.length()
+        uploadTracker.updatePhase(
+            id = id,
+            status = UploadStatus.UPLOADING,
+            detail = "Uploading part ${part.partIndex}",
+            progress = 0f,
+            totalBytes = partLen,
+            fileName = partName,
+            isEncrypted = isEncrypted,
+        )
+        val result = uploadWithRetry(
+            id = id,
+            chatId = chatId,
+            localPath = part.partFile.absolutePath,
+            fileName = partName,
+            mimeType = "application/zip",
+        )
+        val partThumb = if (isEncrypted) {
+            null
+        } else {
+            runCatching {
+                mediaThumbnailCache.generateFromLocalFile(
+                    chatId = chatId,
+                    messageId = result.messageId,
+                    localPath = part.partFile.absolutePath,
+                    mimeType = "application/zip",
+                    fileName = partName,
+                )
+            }.getOrNull()
+        }
+        fileCacheDao.upsertAll(
+            listOf(
+                FileCacheEntity(
+                    messageId = result.messageId,
+                    chatId = chatId,
+                    fileName = partName,
+                    fileSize = partLen,
+                    mimeType = "application/zip",
+                    thumbnailPath = partThumb,
+                    remoteId = result.remoteId,
+                    date = System.currentTimeMillis(),
+                    lastAccessed = System.currentTimeMillis(),
+                    isEncryptedVault = isEncrypted,
+                ),
+            ),
+        )
+        if (part.entries.isNotEmpty()) {
+            indexZipEntries(chatId, result.messageId, partName, part.entries, isEncrypted)
+        }
+        uploadedParts += UploadedZipPartRecord(
+            fileName = partName,
+            fileSizeBytes = partLen,
+            partIndex = part.partIndex,
+            isSplitVolume = part.isSplitVolume,
+            messageId = result.messageId,
+            entries = part.entries,
+        )
+    }
+
+    private suspend fun indexZipEntries(
+        chatId: Long,
+        messageId: Long,
+        zipFileName: String,
+        entryPaths: List<String>,
+        encrypted: Boolean,
+    ) {
+        runCatching {
+            val now = System.currentTimeMillis()
+            val rows = entryPaths.mapNotNull { raw ->
+                val clean = raw.trimEnd('/')
+                if (clean.isEmpty()) return@mapNotNull null
+                ZipEntryEntity(
+                    chatId = chatId,
+                    zipMessageId = messageId,
+                    zipFileName = zipFileName,
+                    entryPath = raw,
+                    entryName = clean.substringAfterLast('/'),
+                    entrySize = 0L,
+                    isEncrypted = encrypted,
+                    indexedAt = now,
+                )
+            }
+            if (rows.isNotEmpty()) {
+                zipEntryDao.deleteForZip(chatId, messageId)
+                rows.chunked(250).forEach { zipEntryDao.upsertAll(it) }
+            }
+        }
+    }
+
+    private suspend fun uploadWithRetry(
+        id: String,
+        chatId: Long,
+        localPath: String,
+        fileName: String,
+        mimeType: String,
+    ): UploadResult {
+        var lastErr: Throwable? = null
+        for (attempt in 1..MAX_UPLOAD_ATTEMPTS) {
+            currentCoroutineContext().ensureActive()
+            try {
+                return telegramClient.uploadFile(chatId, localPath, fileName, mimeType) { sent, total ->
+                    uploadTracker.updateProgress(id, sent, total)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                lastErr = t
+                if (attempt >= MAX_UPLOAD_ATTEMPTS) break
+                val floodSec = parseFloodWaitSeconds(t.message)
+                if (floodSec != null) {
+                    val waitMs = ((floodSec + 1L) * 1000L).coerceAtMost(120_000L)
+                    uploadTracker.updatePhase(
+                        id = id,
+                        status = UploadStatus.QUEUED,
+                        detail = "Rate limited — waiting ${floodSec + 1}s",
+                    )
+                    delay(waitMs)
+                } else if (isTransientError(t)) {
+                    val backoffMs = attempt * 1_500L
+                    uploadTracker.updatePhase(
+                        id = id,
+                        status = UploadStatus.QUEUED,
+                        detail = "Retrying ($attempt/$MAX_UPLOAD_ATTEMPTS)…",
+                    )
+                    delay(backoffMs)
+                } else {
+                    break
+                }
+                uploadTracker.updatePhase(id = id, status = UploadStatus.UPLOADING, detail = null)
+            }
+        }
+        throw lastErr ?: IllegalStateException("Upload failed for $fileName")
+    }
+
+    private fun resolveEncryptionPassphrase(spec: UploadEncryptionSpec): String? {
+        if (!spec.enabled) return null
+        return if (spec.useVaultKey) {
+            backupCrypto.zipVaultPassword()
+        } else {
+            spec.customPassphrase?.takeIf { it.isNotBlank() } ?: backupCrypto.zipVaultPassword()
+        }
+    }
+
+    private suspend fun resolveChatId(chatId: Long): Long =
+        if (chatId != 0L) chatId else runCatching { telegramClient.myUserId() }.getOrDefault(0L)
+
+    private fun openUriStream(uri: Uri): InputStream? {
+        if (uri.scheme == "file") {
+            val path = uri.path ?: return null
+            val f = File(path)
+            return if (f.isFile) FileInputStream(f) else null
+        }
+        return ctx.contentResolver.openInputStream(uri)
+    }
+
+    private suspend fun copyWithCancel(input: InputStream, output: FileOutputStream) {
+        val buf = ByteArray(COPY_BUFFER_BYTES)
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val n = input.read(buf)
+            if (n < 0) break
+            if (n > 0) output.write(buf, 0, n)
+        }
+        output.flush()
+    }
+
+    private fun hasEnoughDiskSpace(dir: File, requiredBytes: Long): Boolean {
+        if (requiredBytes <= 0L) return true
+        val available = try {
+            StatFs(dir.absolutePath).availableBytes
+        } catch (_: Throwable) {
+            dir.usableSpace
+        }
+        return available >= requiredBytes + FREE_SPACE_SAFETY_BYTES
+    }
+
+    private fun claimUniqueName(desiredName: String, claimedNames: MutableSet<String>): String {
+        if (claimedNames.add(desiredName.lowercase(Locale.US))) return desiredName
+        val isEnc = BackupCrypto.isEncryptedFileName(desiredName)
+        val inner = if (isEnc) BackupCrypto.stripEncryptedExtension(desiredName) else desiredName
+        val dot = inner.lastIndexOf('.')
+        val stem = if (dot > 0) inner.substring(0, dot) else inner
+        val ext = if (dot > 0) inner.substring(dot) else ""
+        var index = 1
+        while (true) {
+            val candidateInner = "$stem ($index)$ext"
+            val candidate = if (isEnc) "$candidateInner${BackupCrypto.ENCRYPTED_EXT}" else candidateInner
+            if (claimedNames.add(candidate.lowercase(Locale.US))) return candidate
+            index++
+        }
+    }
+
+    private data class ScannedNormalEntry(
+        val item: UploadFileItem,
+        val virtualPath: String,
+        val lastModifiedMs: Long,
+    )
+
+    private suspend fun scanFolderForNormalUpload(treeUri: Uri): List<ScannedNormalEntry> {
+        val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        val rootName = runCatching { DocumentFile.fromTreeUri(ctx, treeUri)?.name }.getOrNull()
+            ?: rootDocId?.substringAfterLast(':')?.substringAfterLast('/')
+            ?: "Folder"
+        if (!rootDocId.isNullOrBlank()) {
+            val cursorOut = runCatching {
+                scanNormalViaCursor(treeUri, rootDocId, rootName)
+            }.getOrNull()
+            if (cursorOut != null) return cursorOut
+        }
+        val root = DocumentFile.fromTreeUri(ctx, treeUri) ?: return emptyList()
+        val out = mutableListOf<ScannedNormalEntry>()
+        suspend fun walk(dir: DocumentFile, relPath: String) {
+            dir.listFiles().sortedBy { it.name.orEmpty().lowercase(Locale.US) }.forEach { child ->
+                currentCoroutineContext().ensureActive()
+                val name = child.name ?: return@forEach
+                if (child.isDirectory) {
+                    val nextRel = if (relPath.isEmpty()) name else "$relPath/$name"
+                    walk(child, nextRel)
+                } else if (child.isFile) {
+                    val safeName = sanitizeLeafName(name)
+                    out.add(
+                        ScannedNormalEntry(
+                            item = UploadFileItem(
+                                uri = child.uri,
+                                displayName = safeName,
+                                mimeType = child.type ?: guessMimeType(safeName),
+                                sizeBytes = child.length().coerceAtLeast(0L),
+                            ),
+                            virtualPath = relPath,
+                            lastModifiedMs = child.lastModified().coerceAtLeast(0L),
+                        ),
+                    )
+                }
+            }
+        }
+        walk(root, sanitizeLeafName(rootName))
+        return out
+    }
+
+    private suspend fun scanNormalViaCursor(
+        treeUri: Uri,
+        rootDocId: String,
+        rootName: String,
+    ): List<ScannedNormalEntry>? {
+        data class Node(val docId: String, val relPath: String)
+        data class Row(val docId: String, val name: String, val mime: String, val size: Long, val lastMod: Long)
+
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+        val out = mutableListOf<ScannedNormalEntry>()
+        val stack = ArrayDeque<Node>()
+        stack.add(Node(rootDocId, sanitizeLeafName(rootName)))
+        var dirsVisited = 0
+
+        while (stack.isNotEmpty()) {
+            currentCoroutineContext().ensureActive()
+            val node = stack.removeFirst()
+            dirsVisited++
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, node.docId)
+            val rows = mutableListOf<Row>()
+            val cursor = runCatching {
+                ctx.contentResolver.query(childrenUri, projection, null, null, null)
+            }.getOrNull() ?: run {
+                if (dirsVisited == 1) return null
+                continue
+            }
+            cursor.use { c ->
+                val idIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                if (idIdx < 0 || nameIdx < 0) return@use
+                while (c.moveToNext()) {
+                    val dId = c.getString(idIdx) ?: continue
+                    val dName = c.getString(nameIdx) ?: continue
+                    val mime = if (mimeIdx >= 0) c.getString(mimeIdx).orEmpty() else ""
+                    val size = if (sizeIdx >= 0 && !c.isNull(sizeIdx)) c.getLong(sizeIdx).coerceAtLeast(0L) else 0L
+                    val lastMod = if (modIdx >= 0 && !c.isNull(modIdx)) c.getLong(modIdx).coerceAtLeast(0L) else 0L
+                    rows.add(Row(dId, dName, mime, size, lastMod))
+                }
+            }
+            rows.sortBy { it.name.lowercase(Locale.US) }
+            val childDirs = mutableListOf<Node>()
+            for (r in rows) {
+                if (r.mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    val nextRel = if (node.relPath.isEmpty()) r.name else "${node.relPath}/${r.name}"
+                    childDirs.add(Node(r.docId, nextRel))
+                } else {
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, r.docId)
+                    val safeName = sanitizeLeafName(r.name)
+                    out.add(
+                        ScannedNormalEntry(
+                            item = UploadFileItem(
+                                uri = docUri,
+                                displayName = safeName,
+                                mimeType = r.mime.takeIf { it.isNotBlank() } ?: guessMimeType(safeName),
+                                sizeBytes = r.size,
+                            ),
+                            virtualPath = node.relPath,
+                            lastModifiedMs = r.lastMod,
+                        ),
+                    )
+                }
+            }
+            for (idx in childDirs.indices.reversed()) {
+                stack.addFirst(childDirs[idx])
+            }
+        }
+        return out
+    }
+
+    private fun extractCaptureTimestampMs(
+        file: File,
+        mimeType: String,
+        fallbackModifiedMs: Long,
+    ): Long {
+        if (mimeType.startsWith("image/", ignoreCase = true) && file.isFile) {
+            val exifMs = runCatching {
+                val exif = ExifInterface(file)
+                val raw = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                    ?: return@runCatching null
+                val fmt = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).apply {
+                    timeZone = TimeZone.getDefault()
+                }
+                fmt.parse(raw)?.time
+            }.getOrNull()
+            if (exifMs != null && exifMs > 946_684_800_000L) {
+                return exifMs
+            }
+        }
+        if (fallbackModifiedMs > 946_684_800_000L) return fallbackModifiedMs
+        val mod = file.lastModified()
+        return if (mod > 946_684_800_000L) mod else System.currentTimeMillis()
+    }
+
+    private fun writeDecryptedToDownloads(source: File, fileName: String, mimeType: String): File? {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = ctx.contentResolver
+                val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
+                try {
+                    resolver.openOutputStream(itemUri)?.use { out ->
+                        FileInputStream(source).use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
+                    }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(itemUri, values, null, null)
+                } catch (t: Throwable) {
+                    runCatching { resolver.delete(itemUri, null, null) }
+                    throw t
+                }
+                source
+            } else {
+                @Suppress("DEPRECATION")
+                val dlDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "TelegramDrive",
+                ).apply { mkdirs() }
+                val dest = File(dlDir, fileName)
+                source.copyTo(dest, overwrite = true)
+                dest
+            }
+        }.getOrNull()
+    }
+
+    private fun purgeStaleStaging() {
+        val cutoff = System.currentTimeMillis() - STALE_STAGING_MS
+        listOf(STAGING_DIR_NAME, "share_staging").forEach { dirName ->
+            val dir = File(ctx.cacheDir, dirName)
+            if (dir.isDirectory) {
+                dir.listFiles()?.forEach { child ->
+                    if (child.lastModified() < cutoff) {
+                        runCatching { child.deleteRecursively() }
+                    }
+                }
+            }
+        }
+    }
+
+    companion object {
+        private const val STAGING_DIR_NAME = "upload_staging"
+        private const val STALE_STAGING_MS = 12L * 60 * 60 * 1000
+        private const val MAX_SMALL_PARALLEL = 3
+        private const val LARGE_FILE_THRESHOLD_BYTES = 100L * 1024 * 1024
+        private const val MAX_UPLOAD_ATTEMPTS = 3
+        private const val COPY_BUFFER_BYTES = 64 * 1024
+        private const val FREE_SPACE_SAFETY_BYTES = 64L * 1024 * 1024
+        private val FLOOD_WAIT_REGEX = Regex("""FLOOD_WAIT_(\d+)""", RegexOption.IGNORE_CASE)
+
+        fun parseFloodWaitSeconds(message: String?): Long? {
+            if (message.isNullOrBlank()) return null
+            return FLOOD_WAIT_REGEX.find(message)?.groupValues?.getOrNull(1)?.toLongOrNull()
+        }
+
+        private fun isTransientError(t: Throwable): Boolean {
+            if (t is java.io.IOException) return true
+            val msg = t.message.orEmpty().lowercase(Locale.US)
+            return "timeout" in msg ||
+                "stalled" in msg ||
+                "connection" in msg ||
+                "network" in msg ||
+                "reset" in msg ||
+                "502" in msg ||
+                "503" in msg ||
+                "500" in msg
+        }
+
+        fun sanitizeLeafName(raw: String): String =
+            raw.substringAfterLast('/')
+                .substringAfterLast('\\')
+                .replace('\u0000', '_')
+                .trim()
+                .ifBlank { "file_${System.currentTimeMillis()}" }
+
+        fun guessMimeType(fileName: String): String {
+            val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+            if (ext.isNotEmpty()) {
+                runCatching {
+                    MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext)
+                }.getOrNull()?.let { if (it.isNotBlank()) return it }
+            }
+            return when (ext) {
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                "gif" -> "image/gif"
+                "heic", "heif" -> "image/heic"
+                "mp4" -> "video/mp4"
+                "mkv" -> "video/x-matroska"
+                "mov" -> "video/quicktime"
+                "webm" -> "video/webm"
+                "mp3" -> "audio/mpeg"
+                "m4a" -> "audio/mp4"
+                "wav" -> "audio/wav"
+                "flac" -> "audio/flac"
+                "ogg", "opus" -> "audio/ogg"
+                "pdf" -> "application/pdf"
+                "zip" -> "application/zip"
+                "txt", "log", "md" -> "text/plain"
+                "json" -> "application/json"
+                else -> "application/octet-stream"
+            }
+        }
+    }
+}

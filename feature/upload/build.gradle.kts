@@ -22,6 +22,9 @@ dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:telegram"))
     implementation(project(":core:db"))
+    implementation(project(":core:zip"))
+    implementation(project(":core:download"))
+    implementation(project(":core:security"))
     implementation(project(":designsystem"))
 
     implementation(libs.documentfile)

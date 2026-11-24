@@ -151,4 +151,17 @@
     <string name="free_up_verify_sha_desc">Recheck SHA-256 hash so locally edited files are never deleted</string>
     <string name="free_up_verified_cloud">Verified on Telegram</string>
     <string name="free_up_space_skipped_modified">Skipped %1$d file(s) modified after backup</string>
+    <string name="backup_encrypt_all_title">Encrypt all backups (AES-256)</string>
+    <string name="backup_encrypt_all_desc">Encrypt every backed-up file (.tgenc) and ZIP archive before uploading</string>
+    <string name="backup_key_mode_title">Encryption key</string>
+    <string name="backup_key_mode_vault">Device Vault Key (1-tap decrypt on this device)</string>
+    <string name="backup_key_mode_passphrase">Custom recovery passphrase active (cross-device)</string>
+    <string name="backup_passphrase_dialog_title">Backup recovery passphrase</string>
+    <string name="backup_passphrase_dialog_desc">Set a custom passphrase to decrypt backups on any device, or reset to automatic Device Vault Key.</string>
+    <string name="backup_passphrase_label">Recovery passphrase</string>
+    <string name="backup_passphrase_confirm">Confirm passphrase</string>
+    <string name="backup_use_vault_key">Use Vault Key</string>
+    <string name="backup_passphrase_error_empty">Passphrase cannot be empty</string>
+    <string name="backup_passphrase_error_short">Use at least 4 characters</string>
+    <string name="backup_passphrase_error_mismatch">Passphrases do not match</string>
 </resources>

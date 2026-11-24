@@ -43,11 +43,18 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             val activeDl = dlState.items.filter {
                 it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
             }
-            val activeUl = ulState.items.filter { it.status == UploadStatus.UPLOADING }
+            val activeUl = ulState.items.filter { it.status.isActive }
             val activeCount = activeDl.size + activeUl.size
             if (activeCount > 0) {
-                val label = activeUl.firstOrNull()?.let {
-                    "Uploading ${it.fileName} (${(it.progress * 100f).toInt().coerceIn(0, 100)}%)"
+                val label = activeUl.firstOrNull()?.let { ul ->
+                    val verb = when (ul.status) {
+                        UploadStatus.PACKING -> "Packing"
+                        UploadStatus.ENCRYPTING -> "Encrypting"
+                        UploadStatus.PREPARING -> "Preparing"
+                        UploadStatus.QUEUED -> "Queued"
+                        else -> "Uploading"
+                    }
+                    "$verb ${ul.fileName} (${(ul.progress * 100f).toInt().coerceIn(0, 100)}%)"
                 } ?: activeDl.firstOrNull()?.let {
                     "Downloading ${it.fileName} (${(it.progress * 100f).toInt().coerceIn(0, 100)}%)"
                 } ?: "$activeCount transfer(s) active"

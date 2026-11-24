@@ -10,11 +10,13 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -32,8 +35,10 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -41,6 +46,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileMove
@@ -49,17 +55,22 @@ import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.VideoFile
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -76,6 +87,7 @@ import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -98,13 +110,18 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.documentfile.provider.DocumentFile
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
@@ -118,9 +135,18 @@ import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileSort
 import com.tgdrive.core.datastore.FileViewMode
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.NormalUploadOptions
+import com.tgdrive.core.download.UploadConflictStrategy
+import com.tgdrive.core.download.UploadEncryptionSpec
+import com.tgdrive.core.download.UploadItem
+import com.tgdrive.core.download.UploadStatus
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
+import com.tgdrive.feature.upload.DecryptFileDialog
+import com.tgdrive.feature.upload.FileUploadReviewDialog
+import com.tgdrive.feature.upload.ZipUploadOptionsDialog
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import java.io.File
@@ -146,20 +172,25 @@ fun FolderScreen(
 
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbarEvent by vm.snackbarEvent.collectAsStateWithLifecycle()
+    val decryptedOpenEvent by vm.decryptedOpenEvent.collectAsStateWithLifecycle()
     val isSavedMessages by vm.isSavedMessages.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
     val snackbarHostState = remember { SnackbarHostState() }
     val undoLabel = stringResource(R.string.trash_undo)
+    val noAppMsg = stringResource(R.string.browser_no_app_error)
 
     val selectionMode = state.selectedIds.isNotEmpty()
     var searchOpen by remember { mutableStateOf(false) }
     var detailsItem by remember { mutableStateOf<FileCacheEntity?>(null) }
-    var showZipDialog by remember { mutableStateOf(false) }
     var showUploadMenu by remember { mutableStateOf(false) }
     var showSortMenu by remember { mutableStateOf(false) }
     var showMovePicker by remember { mutableStateOf(false) }
     var moveFromDetails by remember { mutableStateOf(false) }
+    var pendingNormalFolder by remember { mutableStateOf<Pair<Uri, String>?>(null) }
+    var zipExcludesDraft by remember { mutableStateOf("") }
+    var zipPartCapDraft by remember { mutableStateOf<Long?>(null) }
+    var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(snackbarEvent?.id) {
         val ev = snackbarEvent ?: return@LaunchedEffect
@@ -172,6 +203,27 @@ fun FolderScreen(
             vm.undoLastTrash()
         }
         vm.clearSnackbar()
+    }
+
+    LaunchedEffect(decryptedOpenEvent?.id) {
+        val ev = decryptedOpenEvent ?: return@LaunchedEffect
+        vm.clearDecryptedOpenEvent()
+        val file = ev.outcome.file
+        if (ev.outcome.mimeType.startsWith("image/", ignoreCase = true)) {
+            decryptedImageViewerPath = file.absolutePath
+        } else {
+            try {
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, ev.outcome.mimeType)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(intent)
+            } catch (t: Throwable) {
+                Log.w("FolderScreen: failed opening decrypted file", t)
+                vm.showSnackbar(noAppMsg)
+            }
+        }
     }
 
     BackHandler(enabled = selectionMode || searchOpen) {
@@ -197,11 +249,11 @@ fun FolderScreen(
                         )
                     } catch (_: Throwable) {}
                 }
-                vm.uploadFromUris(uris)
+                vm.prepareFileUploadReview(uris)
             }
         }
 
-    val pickFolderLauncher =
+    val pickNormalFolderLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocumentTree(),
         ) { uri ->
@@ -212,11 +264,29 @@ fun FolderScreen(
                         Intent.FLAG_GRANT_READ_URI_PERMISSION,
                     )
                 } catch (_: Throwable) {}
+                val folderName = runCatching { DocumentFile.fromTreeUri(context, uri)?.name }.getOrNull()
+                    ?: Uri.decode(uri.toString()).substringAfterLast(':').substringAfterLast('/').ifBlank { "Folder" }
+                pendingNormalFolder = uri to folderName
             }
-            vm.onZipFolderPicked(uri)
         }
 
-    val noAppMsg = stringResource(R.string.browser_no_app_error)
+    val pickZipFolderLauncher =
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocumentTree(),
+        ) { uri ->
+            if (uri != null) {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                } catch (_: Throwable) {}
+                val folderName = runCatching { DocumentFile.fromTreeUri(context, uri)?.name }.getOrNull()
+                zipExcludesDraft = ""
+                zipPartCapDraft = null
+                vm.onZipFolderPicked(uri, folderName)
+            }
+        }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -405,10 +475,18 @@ fun FolderScreen(
                             leadingIcon = { Icon(Icons.Filled.InsertDriveFile, contentDescription = null) },
                         )
                         DropdownMenuItem(
+                            text = { Text(stringResource(R.string.browser_upload_folder)) },
+                            onClick = {
+                                showUploadMenu = false
+                                pickNormalFolderLauncher.launch(null)
+                            },
+                            leadingIcon = { Icon(Icons.Filled.CreateNewFolder, contentDescription = null) },
+                        )
+                        DropdownMenuItem(
                             text = { Text(stringResource(R.string.browser_upload_zip)) },
                             onClick = {
                                 showUploadMenu = false
-                                showZipDialog = true
+                                pickZipFolderLauncher.launch(null)
                             },
                             leadingIcon = { Icon(Icons.Filled.FolderZip, contentDescription = null) },
                         )
@@ -424,7 +502,12 @@ fun FolderScreen(
                 .background(MaterialTheme.colorScheme.background),
         ) {
             if (state.uploads.isNotEmpty()) {
-                UploadsStrip(uploads = state.uploads, onClear = vm::clearFinishedUploads)
+                UploadsStrip(
+                    uploads = state.uploads,
+                    onCancel = vm::cancelUpload,
+                    onRetry = vm::retryUpload,
+                    onClear = vm::clearFinishedUploads,
+                )
             }
 
             state.error?.let { err ->
@@ -573,21 +656,70 @@ fun FolderScreen(
         }
     }
 
-    if (showZipDialog) {
-        com.tgdrive.feature.upload.ZipUploadOptionsDialog(
-            onDismiss = {
-                showZipDialog = false
-                vm.clearPendingZipOptions()
-            },
-            onConfirm = { zipName, password ->
-                showZipDialog = false
-                vm.setPendingZipOptions(zipName, password)
-                pickFolderLauncher.launch(null)
+    if (state.pendingReviewFiles.isNotEmpty()) {
+        FileUploadReviewDialog(
+            initialFiles = state.pendingReviewFiles,
+            onDismiss = vm::dismissFileUploadReview,
+            onConfirm = vm::confirmFileReview,
+        )
+    }
+
+    pendingNormalFolder?.let { (folderUri, folderName) ->
+        FolderNormalUploadDialog(
+            folderName = folderName,
+            onDismiss = { pendingNormalFolder = null },
+            onConfirm = { options ->
+                pendingNormalFolder = null
+                vm.uploadFolderAsNormal(folderUri, options)
             },
         )
     }
 
+    state.pendingZipTreeUri?.let { treeUri ->
+        ZipUploadOptionsDialog(
+            initialName = state.pendingZipFolderName,
+            summary = state.zipPreviewSummary,
+            summaryLoading = state.zipPreviewLoading,
+            onExcludePatternsChanged = { pat ->
+                zipExcludesDraft = pat
+                vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)
+            },
+            onMaxPartSizeChanged = { cap ->
+                zipPartCapDraft = cap
+                vm.inspectZipFolder(treeUri, zipExcludesDraft, cap)
+            },
+            onDismiss = vm::dismissZipDialog,
+            onConfirm = vm::confirmZipFolderUpload,
+        )
+    }
+
+    state.decryptDialog?.let { dlg ->
+        DecryptFileDialog(
+            fileName = dlg.item.fileName,
+            detectedFormat = dlg.format,
+            hasSavedBackupPassphrase = state.hasSavedBackupPassphrase,
+            inProgress = dlg.downloading || dlg.decrypting,
+            progressMessage = if (dlg.downloading) {
+                stringResource(R.string.browser_downloading_file, dlg.item.fileName)
+            } else {
+                null
+            },
+            errorMessage = dlg.error,
+            onDecryptAndOpen = { pwd -> vm.decryptTarget(pwd, saveToDownloads = false) },
+            onDecryptAndSave = { pwd -> vm.decryptTarget(pwd, saveToDownloads = true) },
+            onDismiss = vm::dismissDecryptDialog,
+        )
+    }
+
+    decryptedImageViewerPath?.let { path ->
+        com.tgdrive.feature.player.ImageViewer(
+            imagePaths = listOf(path),
+            onDismiss = { decryptedImageViewerPath = null },
+        )
+    }
+
     detailsItem?.let { item ->
+        val isEncryptedTgenc = BackupCrypto.isEncryptedFileName(item.fileName)
         FileDetailsSheet(
             item = item,
             isDownloaded = vm.getLocalPath(item.messageId) != null,
@@ -604,6 +736,7 @@ fun FolderScreen(
             onToggleStar = { vm.toggleStar(item.messageId) },
             onTogglePinOffline = { vm.togglePinOffline(item) },
             onShareLink = if (isSavedMessages) null else ({ vm.shareLink(item) }),
+            onDecrypt = if (isEncryptedTgenc) ({ vm.startDecryptFlow(item) }) else null,
             onDismiss = { detailsItem = null },
         )
     }
@@ -630,13 +763,15 @@ fun FolderScreen(
 
 @Composable
 private fun UploadsStrip(
-    uploads: List<UploadProgress>,
+    uploads: List<UploadItem>,
+    onCancel: (String) -> Unit,
+    onRetry: (String) -> Unit,
     onClear: () -> Unit,
 ) {
     val ordered = remember(uploads) {
-        uploads.sortedBy { if (it.status == UploadStatus.UPLOADING) 0 else 1 }
+        uploads.sortedBy { if (it.status.isActive) 0 else 1 }
     }
-    val hasFinished = uploads.any { it.status != UploadStatus.UPLOADING }
+    val hasFinished = uploads.any { !it.status.isActive }
 
     Column(
         modifier = Modifier
@@ -646,9 +781,10 @@ private fun UploadsStrip(
     ) {
         ordered.take(3).forEach { u ->
             val tint = when (u.status) {
-                UploadStatus.UPLOADING -> MaterialTheme.colorScheme.secondary
                 UploadStatus.DONE -> MaterialTheme.colorScheme.tertiary
                 UploadStatus.FAILED -> MaterialTheme.colorScheme.error
+                UploadStatus.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
+                else -> MaterialTheme.colorScheme.secondary
             }
             Row(
                 modifier = Modifier
@@ -658,13 +794,21 @@ private fun UploadsStrip(
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (u.status == UploadStatus.UPLOADING) {
-                    CircularProgressIndicator(
-                        progress = { u.progress.coerceIn(0f, 1f) },
-                        modifier = Modifier.size(20.dp),
-                        color = tint,
-                        strokeWidth = 2.dp,
-                    )
+                if (u.status.isActive) {
+                    if (u.status == UploadStatus.QUEUED) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = tint,
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        CircularProgressIndicator(
+                            progress = { u.progress.coerceIn(0f, 1f) },
+                            modifier = Modifier.size(20.dp),
+                            color = tint,
+                            strokeWidth = 2.dp,
+                        )
+                    }
                 } else {
                     Box(
                         modifier = Modifier
@@ -677,6 +821,7 @@ private fun UploadsStrip(
                             when (u.status) {
                                 UploadStatus.DONE -> Icons.Filled.CheckCircle
                                 UploadStatus.FAILED -> Icons.Filled.Warning
+                                UploadStatus.CANCELLED -> Icons.Filled.Close
                                 else -> Icons.Filled.Upload
                             },
                             contentDescription = null,
@@ -690,15 +835,34 @@ private fun UploadsStrip(
                         .weight(1f)
                         .padding(horizontal = 12.dp),
                 ) {
-                    Text(
-                        text = u.name,
-                        style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    u.errorMessage?.let { msg ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = u.fileName,
+                            style = TgTypography.Display.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (u.isEncrypted) {
+                            Icon(
+                                Icons.Filled.Lock,
+                                contentDescription = stringResource(R.string.browser_encrypted_badge),
+                                tint = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.size(12.dp),
+                            )
+                        }
+                    }
+                    val sub = u.errorMessage ?: u.statusDetail ?: if (u.speedBytesPerSec > 0L) {
+                        "${u.speedBytesPerSec.toHumanSize()}/s"
+                    } else {
+                        null
+                    }
+                    sub?.let { msg ->
                         Text(
                             text = msg,
                             style = TgTypography.Caption,
@@ -714,14 +878,38 @@ private fun UploadsStrip(
                 }
                 Text(
                     text = when (u.status) {
+                        UploadStatus.QUEUED -> stringResource(R.string.browser_upload_queued)
+                        UploadStatus.PREPARING -> stringResource(R.string.browser_upload_preparing)
+                        UploadStatus.PACKING -> stringResource(R.string.browser_upload_packing)
+                        UploadStatus.ENCRYPTING -> stringResource(R.string.browser_upload_encrypting)
                         UploadStatus.UPLOADING -> "${(u.progress * 100).toInt()}%"
                         UploadStatus.DONE -> stringResource(R.string.browser_upload_done)
                         UploadStatus.FAILED -> stringResource(R.string.browser_upload_failed)
+                        UploadStatus.CANCELLED -> stringResource(R.string.browser_upload_cancelled)
                     },
                     style = TgTypography.Mono,
                     color = tint,
                     fontWeight = FontWeight.Bold,
                 )
+                if (u.status.isActive && u.canCancel) {
+                    IconButton(onClick = { onCancel(u.id) }, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.browser_upload_cancel),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                } else if ((u.status == UploadStatus.FAILED || u.status == UploadStatus.CANCELLED) && u.canRetry) {
+                    IconButton(onClick = { onRetry(u.id) }, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Filled.Refresh,
+                            contentDescription = stringResource(R.string.browser_upload_retry),
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
             }
         }
         if (hasFinished) {
@@ -732,6 +920,175 @@ private fun UploadsStrip(
             }
         }
     }
+}
+
+@Composable
+private fun FolderNormalUploadDialog(
+    folderName: String,
+    onDismiss: () -> Unit,
+    onConfirm: (NormalUploadOptions) -> Unit,
+) {
+    var conflict by remember { mutableStateOf(UploadConflictStrategy.KEEP_BOTH) }
+    var encrypt by remember { mutableStateOf(false) }
+    var useVaultKey by remember { mutableStateOf(true) }
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var showPwd by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        title = {
+            Text(
+                stringResource(R.string.browser_folder_upload_title),
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Bold,
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    stringResource(R.string.browser_folder_upload_desc, folderName),
+                    style = TgTypography.Display.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = conflict == UploadConflictStrategy.KEEP_BOTH,
+                        onClick = { conflict = UploadConflictStrategy.KEEP_BOTH },
+                        label = { Text("Keep both") },
+                    )
+                    FilterChip(
+                        selected = conflict == UploadConflictStrategy.SKIP,
+                        onClick = { conflict = UploadConflictStrategy.SKIP },
+                        label = { Text("Skip duplicates") },
+                    )
+                    FilterChip(
+                        selected = conflict == UploadConflictStrategy.REPLACE,
+                        onClick = { conflict = UploadConflictStrategy.REPLACE },
+                        label = { Text("Replace") },
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .toggleable(value = encrypt, role = Role.Switch, onValueChange = {
+                            encrypt = it
+                            error = null
+                        })
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        stringResource(R.string.browser_folder_encrypt_label),
+                        style = TgTypography.Display.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(checked = encrypt, onCheckedChange = null)
+                }
+                if (encrypt) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = useVaultKey,
+                            onClick = {
+                                useVaultKey = true
+                                error = null
+                            },
+                            label = { Text("Device Vault Key") },
+                        )
+                        FilterChip(
+                            selected = !useVaultKey,
+                            onClick = {
+                                useVaultKey = false
+                                error = null
+                            },
+                            label = { Text("Custom password") },
+                        )
+                    }
+                    if (!useVaultKey) {
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = {
+                                password = it
+                                error = null
+                            },
+                            label = { Text("Password") },
+                            singleLine = true,
+                            visualTransformation = if (showPwd) {
+                                VisualTransformation.None
+                            } else {
+                                PasswordVisualTransformation()
+                            },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            trailingIcon = {
+                                IconButton(onClick = { showPwd = !showPwd }) {
+                                    Icon(
+                                        if (showPwd) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                        contentDescription = null,
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = confirm,
+                            onValueChange = {
+                                confirm = it
+                                error = null
+                            },
+                            label = { Text("Confirm password") },
+                            singleLine = true,
+                            visualTransformation = if (showPwd) {
+                                VisualTransformation.None
+                            } else {
+                                PasswordVisualTransformation()
+                            },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                error?.let {
+                    Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    encrypt && !useVaultKey && password.length < 4 -> error = "Use at least 4 characters"
+                    encrypt && !useVaultKey && password != confirm -> error = "Passwords don't match"
+                    else -> onConfirm(
+                        NormalUploadOptions(
+                            conflictStrategy = conflict,
+                            encryption = UploadEncryptionSpec(
+                                enabled = encrypt,
+                                useVaultKey = useVaultKey,
+                                customPassphrase = if (encrypt && !useVaultKey) password else null,
+                            ),
+                        ),
+                    )
+                }
+            }) {
+                Text(stringResource(R.string.browser_action_upload), fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.browser_cancel)) }
+        },
+    )
 }
 
 private fun other(mode: FileViewMode) = if (mode == FileViewMode.GRID) FileViewMode.LIST else FileViewMode.GRID
@@ -905,6 +1262,23 @@ private fun FileGridCell(
                             contentDescription = stringResource(R.string.details_pin_offline),
                             tint = MaterialTheme.colorScheme.tertiary,
                             modifier = Modifier.size(14.dp),
+                        )
+                    }
+                } else if (item.isEncryptedVault || BackupCrypto.isEncryptedFileName(item.fileName)) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(6.dp)
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.Lock,
+                            contentDescription = stringResource(R.string.browser_encrypted_badge),
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(13.dp),
                         )
                     }
                 }
@@ -1133,6 +1507,16 @@ private fun FileListRow(
                     .padding(horizontal = 6.dp, vertical = 2.dp),
             )
         }
+        if (item.isEncryptedVault || BackupCrypto.isEncryptedFileName(item.fileName)) {
+            Icon(
+                Icons.Filled.Lock,
+                contentDescription = stringResource(R.string.browser_encrypted_badge),
+                tint = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier
+                    .padding(end = 4.dp)
+                    .size(16.dp),
+            )
+        }
         if (item.isPinnedOffline) {
             Icon(
                 Icons.Filled.OfflinePin,
@@ -1202,6 +1586,9 @@ private fun handleFileTap(
     vm.markAccessed(messageId)
     val bucket = classifyFile(item.mimeType, item.fileName)
     when {
+        BackupCrypto.isEncryptedFileName(item.fileName) -> {
+            vm.startDecryptFlow(item)
+        }
         bucket == FileBucket.ARCHIVES && item.fileName.lowercase().endsWith(".zip") -> {
             if (localPath == null) vm.downloadFile(item)
             onOpenZip(messageId)

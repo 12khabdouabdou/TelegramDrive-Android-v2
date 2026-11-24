@@ -36,6 +36,7 @@ dependencies {
     implementation(project(":core:download"))
     implementation(project(":core:zip"))
     implementation(project(":core:audio"))
+    implementation(project(":core:security"))
     implementation(project(":designsystem"))
     implementation(project(":feature:upload"))
     implementation(project(":feature:player"))
@@ -60,6 +61,7 @@ dependencies {
 
     implementation(libs.coil.compose)
     implementation(libs.coil.video)
+    implementation(libs.documentfile)
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)

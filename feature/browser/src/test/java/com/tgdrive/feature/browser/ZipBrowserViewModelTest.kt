@@ -7,6 +7,8 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.index.ZipIndexService
+import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipEntryInfo
 import io.mockk.mockk
@@ -33,6 +35,8 @@ class ZipBrowserViewModelTest {
     private val zipUploader: TestZipUploader = TestZipUploader()
     private val zipIndexService: ZipIndexService = mockk(relaxed = true)
     private val offlinePinStore: OfflinePinStore = mockk(relaxed = true)
+    private val keystoreHelper: KeystoreHelper = mockk(relaxed = true)
+    private val backupCrypto: BackupCrypto = BackupCrypto(keystoreHelper)
     private val cacheDir: File = createTempDir(prefix = "ziptest")
 
     private lateinit var dispatchers: DispatchersProvider
@@ -52,6 +56,14 @@ class ZipBrowserViewModelTest {
         // would otherwise leak setEntries / setExtractFailure across tests).
         zipUploader.reset()
         io.mockk.every { appContext.cacheDir } returns cacheDir
+        val store = mutableMapOf<String, String>()
+        io.mockk.every { keystoreHelper.getString(any(), any()) } answers {
+            store[firstArg()] ?: secondArg()
+        }
+        io.mockk.every { keystoreHelper.putString(any(), any()) } answers {
+            store[firstArg()] = secondArg()
+            true
+        }
     }
 
     @AfterEach
@@ -237,6 +249,35 @@ class ZipBrowserViewModelTest {
             assertThat(s.loading).isFalse()
         }
 
+    @Test
+    fun `unlockWithVaultKey unlocks vault-encrypted entry automatically`() =
+        runTest {
+            val vaultPwd = backupCrypto.zipVaultPassword()
+            zipUploader.setRequiredPassword(vaultPwd)
+            zipUploader.setEntries(
+                listOf(
+                    ZipEntryInfo(
+                        "vault.jpg",
+                        isDirectory = false,
+                        compressedSize = 10,
+                        uncompressedSize = 20,
+                        isEncrypted = true,
+                    ),
+                ),
+            )
+            val vm = newViewModel()
+            vm.load("/tmp/vault.zip")
+            advanceUntilIdle()
+
+            vm.unlockWithVaultKey("vault.jpg")
+            advanceUntilIdle()
+
+            val s = vm.state.value
+            assertThat(s.unlockedPassword).isEqualTo(vaultPwd)
+            assertThat(s.extractedPath).isNotNull()
+            assertThat(s.error).isNull()
+        }
+
     private fun newViewModel(): ZipBrowserViewModel =
         ZipBrowserViewModel(
             telegramClient = telegramClient,
@@ -247,6 +288,8 @@ class ZipBrowserViewModelTest {
             appContext = appContext,
             zipLister = zipUploader,
             zipExtractor = zipUploader,
+            zipAllExtractor = zipUploader,
             offlinePinStore = offlinePinStore,
+            backupCrypto = backupCrypto,
         )
 }

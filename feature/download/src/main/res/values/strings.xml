@@ -11,13 +11,21 @@
     <string name="transfers_empty_hint">Files you download or save will appear here</string>
     <string name="transfers_status_queued">Queued</string>
     <string name="transfers_status_downloading">Downloading…</string>
+    <string name="transfers_status_preparing">Preparing…</string>
+    <string name="transfers_status_packing">Packing ZIP…</string>
+    <string name="transfers_status_encrypting">Encrypting…</string>
     <string name="transfers_status_uploading">Uploading…</string>
     <string name="transfers_status_done">Completed</string>
     <string name="transfers_upload_done">Uploaded</string>
     <string name="transfers_status_failed">Failed</string>
     <string name="transfers_status_cancelled">Cancelled</string>
     <string name="transfers_cancel">Cancel download</string>
+    <string name="transfers_cancel_upload">Cancel upload</string>
     <string name="transfers_dismiss">Dismiss</string>
     <string name="transfers_retry">Retry</string>
+    <string name="transfers_retry_failed">Retry failed</string>
+    <string name="transfers_decrypt">Decrypt</string>
+    <string name="transfers_encrypted">Encrypted</string>
+    <string name="transfers_decrypted_saved">Saved to Downloads</string>
     <string name="transfers_open_failed">No app found to open this file</string>
 </resources>

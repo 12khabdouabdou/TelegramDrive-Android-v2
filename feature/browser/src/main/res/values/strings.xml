@@ -252,4 +252,23 @@
     <string name="category_title_archives">All Archives</string>
     <string name="category_empty_title">No files in this category</string>
     <string name="category_empty_desc">Upload or sync files across your folders to see them gathered here.</string>
+    <string name="browser_upload_folder">Upload folder (keep files)</string>
+    <string name="browser_details_decrypt">Decrypt file</string>
+    <string name="browser_encrypted_badge">Encrypted</string>
+    <string name="browser_upload_preparing">Preparing…</string>
+    <string name="browser_upload_packing">Packing…</string>
+    <string name="browser_upload_encrypting">Encrypting…</string>
+    <string name="browser_upload_queued">Queued</string>
+    <string name="browser_upload_cancelled">Cancelled</string>
+    <string name="browser_upload_cancel">Cancel</string>
+    <string name="browser_upload_retry">Retry</string>
+    <string name="browser_folder_upload_title">Upload folder files</string>
+    <string name="browser_folder_upload_desc">Upload all files from \"%1$s\" keeping subfolder structure.</string>
+    <string name="browser_folder_encrypt_label">Encrypt uploaded files (.tgenc)</string>
+    <string name="zip_browser_unlock_vault">Unlock with Vault Key</string>
+    <string name="zip_browser_use_saved_passphrase">Use Backup Passphrase</string>
+    <string name="zip_browser_extract_all">Extract all</string>
+    <string name="zip_browser_extracting_all">Extracting archive…</string>
+    <string name="zip_browser_extracted_all_done">Extracted %1$d file(s) to Downloads</string>
+    <string name="home_quick_upload_zip_desc_direct">Pick a device folder to archive &amp; upload</string>
 </resources>

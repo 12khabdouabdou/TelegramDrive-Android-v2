@@ -9,13 +9,16 @@ import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
-import com.tgdrive.core.db.entity.FileCacheEntity
-import com.tgdrive.core.download.MediaThumbnailCache
-import com.tgdrive.core.download.UploadTracker
+import com.tgdrive.core.download.NormalUploadOptions
+import com.tgdrive.core.download.UploadConflictStrategy
+import com.tgdrive.core.download.UploadEncryptionSpec
+import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.AuthorizationState
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.zip.ZipCompressionMode
 import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
@@ -24,7 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.util.UUID
 import javax.inject.Inject
 
 /**
@@ -85,8 +87,7 @@ class RootViewModel @Inject constructor(
     private val cloudSyncManager: CloudSyncManager,
     private val fileCacheDao: FileCacheDao,
     private val folderDao: FolderDao,
-    private val mediaThumbnailCache: MediaThumbnailCache,
-    private val uploadTracker: UploadTracker,
+    private val uploadManager: UploadManager,
     private val dispatchers: DispatchersProvider,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -334,6 +335,9 @@ class RootViewModel @Inject constructor(
         packAsZip: Boolean = false,
         zipName: String? = null,
         zipPassword: String? = null,
+        encryptFiles: Boolean = false,
+        useVaultKey: Boolean = true,
+        compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
     ) {
         val uris = _state.value.pendingShareUris
         if (uris.isEmpty()) return
@@ -345,100 +349,45 @@ class RootViewModel @Inject constructor(
                     _state.update { it.copy(shareUploadInProgress = false, shareUploadMessage = "Not logged in") }
                     return@launch
                 }
+                val parsedUris = uris.map { android.net.Uri.parse(it) }
+                val fileItems = uploadManager.resolveFileItems(parsedUris)
+                val encSpec = UploadEncryptionSpec(
+                    enabled = encryptFiles,
+                    useVaultKey = useVaultKey,
+                    customPassphrase = if (encryptFiles && !useVaultKey) zipPassword else null,
+                )
                 if (packAsZip) {
                     val base = ZipUploader.sanitizeZipBaseName(
                         zipName?.takeIf { it.isNotBlank() } ?: "shared_${System.currentTimeMillis()}",
                     ).removeSuffix(".zip")
-                    val finalZipName = "$base.zip"
-                    val stagingDir = java.io.File(appContext.cacheDir, "share_staging").apply { mkdirs() }
-                    val zipFile = java.io.File(stagingDir, finalZipName)
-                    val trackerKey = "share_zip_${UUID.randomUUID()}"
-                    try {
-                        val parsedUris = uris.map { android.net.Uri.parse(it) }
-                        val entries = ZipUploader.zipUrisToFile(
-                            context = appContext,
-                            uris = parsedUris,
-                            outputFile = zipFile,
-                            password = zipPassword?.takeIf { it.isNotBlank() },
-                        )
-                        val zipLen = zipFile.length()
-                        uploadTracker.beginUpload(trackerKey, chatId, finalZipName, zipLen)
-                        val result = telegramClient.uploadFile(
+                    uploadManager.enqueueUrisAsZip(
+                        files = fileItems,
+                        request = ZipUploadRequest(
                             chatId = chatId,
-                            localPath = zipFile.absolutePath,
-                            fileName = finalZipName,
-                            mimeType = "application/zip",
-                        ) { sent, total ->
-                            uploadTracker.updateProgress(trackerKey, sent, total)
-                        }
-                        val thumb = if (zipPassword.isNullOrBlank()) {
-                            mediaThumbnailCache.generateFromLocalFile(
-                                chatId = chatId,
-                                messageId = result.messageId,
-                                localPath = zipFile.absolutePath,
-                                mimeType = "application/zip",
-                                fileName = finalZipName,
-                            )
-                        } else {
-                            null
-                        }
-                        fileCacheDao.upsertAll(
-                            listOf(
-                                FileCacheEntity(
-                                    messageId = result.messageId,
-                                    chatId = chatId,
-                                    fileName = finalZipName,
-                                    fileSize = zipLen,
-                                    mimeType = "application/zip",
-                                    thumbnailPath = thumb,
-                                    remoteId = result.remoteId,
-                                    date = System.currentTimeMillis(),
-                                    lastAccessed = System.currentTimeMillis(),
-                                ),
-                            ),
-                        )
-                        uploadTracker.completeUpload(trackerKey)
-                        _state.update {
-                            it.copy(
-                                pendingShareUris = emptyList(),
-                                shareUploadInProgress = false,
-                                shareUploadMessage = "Uploaded $finalZipName (${entries.size} files)",
-                            )
-                        }
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        uploadTracker.failUpload(trackerKey, "Cancelled")
-                        throw e
-                    } catch (t: Throwable) {
-                        uploadTracker.failUpload(trackerKey, t.message ?: "ZIP upload failed")
-                        throw t
-                    } finally {
-                        zipFile.delete()
-                    }
-                    return@launch
+                            baseName = base,
+                            compressionMode = compressionMode,
+                            encryption = encSpec,
+                        ),
+                    )
+                } else {
+                    uploadManager.enqueueFiles(
+                        chatId = chatId,
+                        files = fileItems,
+                        options = NormalUploadOptions(
+                            conflictStrategy = UploadConflictStrategy.KEEP_BOTH,
+                            encryption = encSpec,
+                            autoSplitOversized = true,
+                        ),
+                    )
                 }
-
-                var done = 0
-                var failed = 0
-                for (uriStr in uris) {
-                    try {
-                        uploadSharedUri(uriStr, chatId)
-                        done++
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (t: Throwable) {
-                        Log.w("Share upload failed for $uriStr", t)
-                        failed++
-                    }
-                }
-                val msg = if (failed == 0) "Uploaded $done file(s)" else "Uploaded $done, failed $failed"
                 _state.update {
                     it.copy(
                         pendingShareUris = emptyList(),
                         shareUploadInProgress = false,
-                        shareUploadMessage = msg,
+                        shareUploadMessage = null,
                     )
                 }
-            } catch (e: kotlinx.coroutines.CancellationException) {
+            } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Log.w("confirmShareUpload failed", t)
@@ -458,79 +407,6 @@ class RootViewModel @Inject constructor(
 
     fun clearShareMessage() {
         _state.update { it.copy(shareUploadMessage = null) }
-    }
-
-    private suspend fun uploadSharedUri(uriStr: String, chatId: Long) {
-        val uri = android.net.Uri.parse(uriStr)
-        val name = resolveDisplayName(uri) ?: "shared_${System.currentTimeMillis()}"
-        val mime = appContext.contentResolver.getType(uri) ?: "application/octet-stream"
-        val stagingDir = java.io.File(appContext.cacheDir, "share_staging").apply { mkdirs() }
-        val staging = java.io.File.createTempFile("share_", "_$name", stagingDir)
-        val trackerKey = "share_${UUID.randomUUID()}"
-        try {
-            appContext.contentResolver.openInputStream(uri)?.use { input ->
-                staging.outputStream().use { output -> input.copyTo(output) }
-            } ?: throw IllegalStateException("Cannot open URI stream")
-            val size = staging.length()
-            uploadTracker.beginUpload(trackerKey, chatId, name, size)
-            val res = telegramClient.uploadFile(
-                chatId = chatId,
-                localPath = staging.absolutePath,
-                fileName = name,
-                mimeType = mime,
-            ) { sent, total ->
-                uploadTracker.updateProgress(trackerKey, sent, total)
-            }
-            val thumb = mediaThumbnailCache.generateFromLocalFile(
-                chatId = chatId,
-                messageId = res.messageId,
-                localPath = staging.absolutePath,
-                mimeType = mime,
-                fileName = name,
-            )
-            fileCacheDao.upsertAll(
-                listOf(
-                    FileCacheEntity(
-                        messageId = res.messageId,
-                        chatId = chatId,
-                        fileName = name,
-                        fileSize = size,
-                        mimeType = mime,
-                        thumbnailPath = thumb,
-                        remoteId = res.remoteId,
-                        date = System.currentTimeMillis(),
-                        lastAccessed = System.currentTimeMillis(),
-                    ),
-                ),
-            )
-            uploadTracker.completeUpload(trackerKey)
-        } catch (t: Throwable) {
-            uploadTracker.failUpload(trackerKey, t.message ?: "Upload failed")
-            throw t
-        } finally {
-            staging.delete()
-        }
-    }
-
-    private fun resolveDisplayName(uri: android.net.Uri): String? {
-        runCatching {
-            appContext.contentResolver.query(
-                uri,
-                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
-                null,
-                null,
-                null,
-            )?.use { c ->
-                if (c.moveToFirst()) {
-                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    if (idx >= 0) {
-                        val value = c.getString(idx)
-                        if (!value.isNullOrBlank()) return value
-                    }
-                }
-            }
-        }
-        return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
     }
 
     companion object {

@@ -28,3 +28,14 @@ fun interface ZipExtractor {
         password: String?,
     ): String?
 }
+
+/**
+ * Extracts all entries from a ZIP archive into [outputDir].
+ */
+fun interface ZipAllExtractor {
+    fun extractAll(
+        zipPath: String,
+        outputDir: File,
+        password: String?,
+    ): List<File>
+}

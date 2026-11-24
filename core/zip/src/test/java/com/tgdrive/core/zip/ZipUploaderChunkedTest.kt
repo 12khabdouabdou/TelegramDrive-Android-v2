@@ -2,7 +2,10 @@ package com.tgdrive.core.zip
 
 import com.google.common.truth.Truth.assertThat
 import kotlinx.coroutines.test.runTest
+import net.lingala.zip4j.ZipFile
+import net.lingala.zip4j.model.enums.CompressionMethod
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -186,5 +189,115 @@ class ZipUploaderChunkedTest {
             part.partFile.copyTo(builtZip, overwrite = true)
         }
         assertThat(ZipUploader.readFirstImageEntryBytes(builtZip.absolutePath)).isNull()
+    }
+
+    @Test
+    fun `smart compression uses STORE for media and DEFLATE for text while STORE stores all`(@TempDir tmp: File) = runTest {
+        assertThat(ZipUploader.resolveCompressionMethod("photo.JPG", ZipCompressionMode.SMART))
+            .isEqualTo(CompressionMethod.STORE)
+        assertThat(ZipUploader.resolveCompressionMethod("movie.mp4", ZipCompressionMode.SMART))
+            .isEqualTo(CompressionMethod.STORE)
+        assertThat(ZipUploader.resolveCompressionMethod("notes.txt", ZipCompressionMode.SMART))
+            .isEqualTo(CompressionMethod.DEFLATE)
+        assertThat(ZipUploader.resolveCompressionMethod("notes.txt", ZipCompressionMode.STORE))
+            .isEqualTo(CompressionMethod.STORE)
+        assertThat(ZipUploader.resolveCompressionMethod("photo.jpg", ZipCompressionMode.DEFLATE))
+            .isEqualTo(CompressionMethod.DEFLATE)
+
+        val entries = listOf(
+            ZipSourceEntry("pic.jpg", 4096L) { ByteArrayInputStream(randomBytes(4096, 5L)) },
+            ZipSourceEntry("log.txt", 4096L) { ByteArrayInputStream("hello ".repeat(600).toByteArray()) },
+        )
+        lateinit var builtZip: File
+        ZipUploader.zipSourcesInParts(
+            entries = entries,
+            workDir = File(tmp, "work"),
+            baseZipName = "Smart",
+            maxPartBytes = 512 * 1024L,
+            checkFreeSpace = false,
+            compressionMode = ZipCompressionMode.SMART,
+            enablePipeline = false,
+        ) { part ->
+            builtZip = File(tmp, part.partFile.name)
+            part.partFile.copyTo(builtZip, overwrite = true)
+        }
+
+        val headers = ZipFile(builtZip).use { it.fileHeaders.associateBy { h -> h.fileName } }
+        assertThat(headers["pic.jpg"]?.compressionMethod).isEqualTo(CompressionMethod.STORE)
+        assertThat(headers["log.txt"]?.compressionMethod).isEqualTo(CompressionMethod.DEFLATE)
+    }
+
+    @Test
+    fun `pipelined packing emits progress and cleans temp files if consumer fails`(@TempDir tmp: File) = runTest {
+        val workDir = File(tmp, "work_pipe")
+        val progressEvents = mutableListOf<ZipProgress>()
+        val entries = (1..4).map { idx ->
+            val data = randomBytes(70 * 1024, idx.toLong())
+            ZipSourceEntry("file_$idx.bin", data.size.toLong()) { ByteArrayInputStream(data) }
+        }
+
+        var count = 0
+        ZipUploader.zipSourcesInParts(
+            entries = entries,
+            workDir = workDir,
+            baseZipName = "PipeOk",
+            maxPartBytes = 130 * 1024L,
+            checkFreeSpace = false,
+            enablePipeline = true,
+            onZipProgress = { progressEvents.add(it) },
+        ) { _ ->
+            count++
+        }
+        assertThat(count).isGreaterThan(1)
+        assertThat(progressEvents).isNotEmpty()
+        assertThat(workDir.listFiles().orEmpty().filter { it.isFile }).isEmpty()
+
+        val workFailDir = File(tmp, "work_fail")
+        assertThrows<IllegalStateException> {
+            var seen = 0
+            ZipUploader.zipSourcesInParts(
+                entries = entries,
+                workDir = workFailDir,
+                baseZipName = "PipeFail",
+                maxPartBytes = 130 * 1024L,
+                checkFreeSpace = false,
+                enablePipeline = true,
+            ) {
+                seen++
+                if (seen == 1) throw IllegalStateException("simulated upload failure")
+            }
+        }
+        assertThat(workFailDir.listFiles().orEmpty().filter { it.isFile }).isEmpty()
+    }
+
+    @Test
+    fun `zipSingleFileSplit merges and extracts back identically with encryption`(@TempDir tmp: File) = runTest {
+        val source = File(tmp, "large.bin")
+        val payload = randomBytes(210 * 1024, 77L)
+        source.writeBytes(payload)
+
+        val stored = mutableListOf<File>()
+        val splitSaveDir = File(tmp, "saved_splits").apply { mkdirs() }
+        val summary = ZipUploader.zipSingleFileSplit(
+            sourceFile = source,
+            displayName = "large.bin",
+            workDir = File(tmp, "split_work"),
+            maxPartBytes = 90 * 1024L,
+            password = "split-password",
+        ) { part ->
+            val saved = File(splitSaveDir, part.partFile.name)
+            part.partFile.copyTo(saved, overwrite = true)
+            stored.add(saved)
+        }
+
+        assertThat(summary.hadSplitVolumes).isTrue()
+        assertThat(stored.size).isAtLeast(2)
+        val merged = File(tmp, "merged_split.zip")
+        val ok = ZipUploader.mergeSplitZip(stored.last { it.extension == "zip" }, merged, password = "split-password")
+        assertThat(ok).isTrue()
+
+        val extracted = ZipUploader.extractAll(merged.absolutePath, File(tmp, "out"), password = "split-password")
+        assertThat(extracted).hasSize(1)
+        assertThat(extracted.first().readBytes()).isEqualTo(payload)
     }
 }

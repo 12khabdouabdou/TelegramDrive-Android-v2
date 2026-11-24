@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PictureAsPdf
@@ -70,6 +71,7 @@ fun FileDetailsSheet(
     isPinnedOffline: Boolean = item.isPinnedOffline,
     onTogglePinOffline: (() -> Unit)? = null,
     onShareLink: (() -> Unit)? = null,
+    onDecrypt: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -162,6 +164,17 @@ fun FileDetailsSheet(
             }
 
             Spacer(Modifier.height(8.dp))
+
+            if (onDecrypt != null) {
+                ActionRow(
+                    icon = Icons.Filled.LockOpen,
+                    label = stringResource(R.string.browser_details_decrypt),
+                    tint = MaterialTheme.colorScheme.primary,
+                ) {
+                    onDecrypt()
+                    onDismiss()
+                }
+            }
 
             ActionRow(
                 icon = Icons.Filled.Download,

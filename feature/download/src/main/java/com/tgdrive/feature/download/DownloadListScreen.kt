@@ -35,6 +35,8 @@ import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
@@ -68,15 +70,20 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.toHumanSize
+import com.tgdrive.core.download.DecryptOutcome
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.UploadItem
+import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.UploadStatus
 import com.tgdrive.core.download.UploadTracker
+import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.EncryptedFileFormat
 import com.tgdrive.designsystem.components.EmptyState
 import com.tgdrive.designsystem.components.GlassPanel
 import com.tgdrive.designsystem.theme.TgTypography
+import com.tgdrive.feature.upload.DecryptFileDialog
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.launch
 import java.io.File
@@ -86,7 +93,28 @@ import javax.inject.Inject
 class DownloadListViewModel @Inject constructor(
     val downloadManager: DownloadManager,
     val uploadTracker: UploadTracker,
-) : ViewModel()
+    val uploadManager: UploadManager,
+    private val backupCrypto: BackupCrypto,
+) : ViewModel() {
+
+    val hasSavedBackupPassphrase: Boolean
+        get() = backupCrypto.hasCustomBackupPassphrase()
+
+    fun detectEncryptedFormat(file: File): EncryptedFileFormat =
+        uploadManager.detectEncryptedFormat(file)
+
+    suspend fun decryptLocalFile(
+        encryptedFile: File,
+        originalDisplayName: String,
+        passphrase: String?,
+        saveToDownloads: Boolean,
+    ): DecryptOutcome = uploadManager.decryptLocalFile(
+        encryptedFile = encryptedFile,
+        originalDisplayName = originalDisplayName,
+        passphrase = passphrase,
+        saveToDownloads = saveToDownloads,
+    )
+}
 
 private sealed interface TransferRowUi {
     val stableKey: String
@@ -120,15 +148,15 @@ private sealed interface TransferRowUi {
         override val progress: Float = item.progress
         override val speedBytesPerSec: Long = item.speedBytesPerSec
         override val etaSeconds: Long? = item.etaSeconds
-        override val isActive: Boolean = item.status == UploadStatus.UPLOADING
+        override val isActive: Boolean = item.status.isActive
         override val isFailed: Boolean = item.status == UploadStatus.FAILED
     }
 }
 
 /**
  * Unified Transfers screen displaying active and completed uploads + downloads
- * with directional indicators, live transfer speed/ETA, cancel, retry, clear-completed,
- * and tap-to-open via FileProvider.
+ * with phase status, live transfer speed/ETA, cancel, retry, clear-completed,
+ * `.tgenc` decryption, and tap-to-open via FileProvider.
  */
 @Composable
 fun DownloadListScreen(
@@ -143,18 +171,50 @@ fun DownloadListScreen(
     val scope = rememberCoroutineScope()
     var showCompleted by remember { mutableStateOf(false) }
 
+    var decryptTarget by remember { mutableStateOf<DownloadItem?>(null) }
+    var decryptInProgress by remember { mutableStateOf(false) }
+    var decryptError by remember { mutableStateOf<String?>(null) }
+
     val allRows = remember(uploadState.items, downloadState.items) {
         uploadState.items.map { TransferRowUi.Upload(it) } +
             downloadState.items.map { TransferRowUi.Download(it) }
     }
     val active = remember(allRows) { allRows.filter { it.isActive } }
     val completed = remember(allRows) { allRows.filter { !it.isActive } }
+    val hasRetryableFailedUploads = remember(completed) {
+        completed.any { it is TransferRowUi.Upload && it.isFailed && it.item.canRetry }
+    }
     val list = if (showCompleted) completed else active
     val openFailedMsg = stringResource(R.string.transfers_open_failed)
+    val savedDecryptedMsg = stringResource(R.string.transfers_decrypted_saved)
     val bottomNavPad = if (showBack) {
         WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     } else {
         0.dp
+    }
+
+    fun openLocalFile(file: File, mimeType: String?) {
+        if (!file.exists()) {
+            scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+            val resolvedMime = mimeType ?: MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, resolvedMime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(intent)
+        } catch (t: Throwable) {
+            Log.w("DownloadListScreen: open failed for ${file.name}", t)
+            scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
+        }
     }
 
     Scaffold(
@@ -197,6 +257,15 @@ fun DownloadListScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f).padding(start = if (showBack) 8.dp else 4.dp),
                 )
+                if (hasRetryableFailedUploads) {
+                    TextButton(onClick = { vm.uploadManager.retryAllFailed() }) {
+                        Text(
+                            text = stringResource(R.string.transfers_retry_failed),
+                            color = MaterialTheme.colorScheme.tertiary,
+                            maxLines = 1,
+                        )
+                    }
+                }
                 if (completed.isNotEmpty()) {
                     TextButton(
                         onClick = {
@@ -269,32 +338,28 @@ fun DownloadListScreen(
                                             scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
                                             return@DownloadTransferRow
                                         }
-                                        try {
-                                            val uri = FileProvider.getUriForFile(
-                                                context,
-                                                "${context.packageName}.fileprovider",
-                                                file,
-                                            )
-                                            val ext = file.extension.lowercase()
-                                            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-                                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                setDataAndType(uri, mime)
-                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                            }
-                                            context.startActivity(intent)
-                                        } catch (t: Throwable) {
-                                            Log.w("DownloadListScreen: open failed for ${file.name}", t)
-                                            scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
+                                        if (BackupCrypto.isEncryptedFileName(item.fileName)) {
+                                            decryptError = null
+                                            decryptTarget = item
+                                        } else {
+                                            openLocalFile(file, null)
                                         }
+                                    },
+                                    onDecrypt = {
+                                        decryptError = null
+                                        decryptTarget = item
                                     },
                                     onCancel = { vm.downloadManager.cancel(item.chatId, item.id) },
                                     onRetry = { vm.downloadManager.enqueue(item) },
                                 )
                             }
                             is TransferRowUi.Upload -> {
+                                val item = row.item
                                 UploadTransferRow(
-                                    item = row.item,
-                                    onDismiss = { vm.uploadTracker.dismiss(row.item.id) },
+                                    item = item,
+                                    onCancel = { vm.uploadManager.cancel(item.id) },
+                                    onRetry = { vm.uploadManager.retry(item.id) },
+                                    onDismiss = { vm.uploadTracker.dismiss(item.id) },
                                 )
                             }
                         }
@@ -302,6 +367,75 @@ fun DownloadListScreen(
                 }
             }
         }
+    }
+
+    decryptTarget?.let { target ->
+        val localPath = target.localPath
+        val localFile = localPath?.let(::File)
+        val detectedFmt = localFile?.let { vm.detectEncryptedFormat(it) }
+        DecryptFileDialog(
+            fileName = target.fileName,
+            detectedFormat = detectedFmt,
+            hasSavedBackupPassphrase = vm.hasSavedBackupPassphrase,
+            inProgress = decryptInProgress,
+            errorMessage = decryptError,
+            onDecryptAndOpen = { passphrase ->
+                if (localFile == null || !localFile.isFile) {
+                    decryptError = openFailedMsg
+                    return@DecryptFileDialog
+                }
+                scope.launch {
+                    decryptInProgress = true
+                    decryptError = null
+                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, false)) {
+                        is DecryptOutcome.Success -> {
+                            decryptInProgress = false
+                            decryptTarget = null
+                            openLocalFile(outcome.file, outcome.mimeType)
+                        }
+                        is DecryptOutcome.WrongPassphrase -> {
+                            decryptInProgress = false
+                            decryptError = outcome.message
+                        }
+                        is DecryptOutcome.Failed -> {
+                            decryptInProgress = false
+                            decryptError = outcome.message
+                        }
+                    }
+                }
+            },
+            onDecryptAndSave = { passphrase ->
+                if (localFile == null || !localFile.isFile) {
+                    decryptError = openFailedMsg
+                    return@DecryptFileDialog
+                }
+                scope.launch {
+                    decryptInProgress = true
+                    decryptError = null
+                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, true)) {
+                        is DecryptOutcome.Success -> {
+                            decryptInProgress = false
+                            decryptTarget = null
+                            snackbarHostState.showSnackbar("$savedDecryptedMsg: ${outcome.displayName}")
+                        }
+                        is DecryptOutcome.WrongPassphrase -> {
+                            decryptInProgress = false
+                            decryptError = outcome.message
+                        }
+                        is DecryptOutcome.Failed -> {
+                            decryptInProgress = false
+                            decryptError = outcome.message
+                        }
+                    }
+                }
+            },
+            onDismiss = {
+                if (!decryptInProgress) {
+                    decryptTarget = null
+                    decryptError = null
+                }
+            },
+        )
     }
 }
 
@@ -346,10 +480,12 @@ private fun TabButton(
 private fun DownloadTransferRow(
     item: DownloadItem,
     onOpen: () -> Unit,
+    onDecrypt: () -> Unit,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
 ) {
     val canOpen = item.status == DownloadStatus.DONE && !item.localPath.isNullOrBlank()
+    val isEncrypted = BackupCrypto.isEncryptedFileName(item.fileName)
     val iconTint = when (item.status) {
         DownloadStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
         DownloadStatus.QUEUED -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -400,13 +536,24 @@ private fun DownloadTransferRow(
                         .weight(1f)
                         .padding(horizontal = 12.dp),
                 ) {
-                    Text(
-                        text = item.fileName,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = item.fileName,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (isEncrypted) {
+                            Icon(
+                                Icons.Filled.Lock,
+                                contentDescription = stringResource(R.string.transfers_encrypted),
+                                tint = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                    }
                     val meta = buildString {
                         append(statusText)
                         if (item.totalBytes > 0L) {
@@ -446,7 +593,17 @@ private fun DownloadTransferRow(
                             )
                         }
                     }
-                    DownloadStatus.DONE -> Unit
+                    DownloadStatus.DONE -> {
+                        if (isEncrypted && canOpen) {
+                            IconButton(onClick = onDecrypt) {
+                                Icon(
+                                    Icons.Filled.LockOpen,
+                                    contentDescription = stringResource(R.string.transfers_decrypt),
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -466,23 +623,47 @@ private fun DownloadTransferRow(
 @Composable
 private fun UploadTransferRow(
     item: UploadItem,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val iconTint = when (item.status) {
-        UploadStatus.UPLOADING -> MaterialTheme.colorScheme.primary
+        UploadStatus.QUEUED,
+        UploadStatus.PREPARING,
+        UploadStatus.PACKING,
+        UploadStatus.ENCRYPTING,
+        UploadStatus.UPLOADING,
+        -> MaterialTheme.colorScheme.primary
         UploadStatus.DONE -> MaterialTheme.colorScheme.secondary
         UploadStatus.FAILED -> MaterialTheme.colorScheme.error
+        UploadStatus.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     val statusIcon = when (item.status) {
-        UploadStatus.UPLOADING -> Icons.Filled.CloudUpload
+        UploadStatus.QUEUED -> Icons.Filled.Schedule
+        UploadStatus.PREPARING,
+        UploadStatus.PACKING,
+        UploadStatus.UPLOADING,
+        -> Icons.Filled.CloudUpload
+        UploadStatus.ENCRYPTING -> Icons.Filled.Lock
         UploadStatus.DONE -> Icons.Filled.CloudDone
         UploadStatus.FAILED -> Icons.Filled.ErrorOutline
+        UploadStatus.CANCELLED -> Icons.Filled.Cancel
     }
-    val statusText = when (item.status) {
+    val defaultStatusText = when (item.status) {
+        UploadStatus.QUEUED -> stringResource(R.string.transfers_status_queued)
+        UploadStatus.PREPARING -> stringResource(R.string.transfers_status_preparing)
+        UploadStatus.PACKING -> stringResource(R.string.transfers_status_packing)
+        UploadStatus.ENCRYPTING -> stringResource(R.string.transfers_status_encrypting)
         UploadStatus.UPLOADING -> stringResource(R.string.transfers_status_uploading)
         UploadStatus.DONE -> stringResource(R.string.transfers_upload_done)
         UploadStatus.FAILED -> item.errorMessage?.takeIf { it.isNotBlank() }
             ?: stringResource(R.string.transfers_status_failed)
+        UploadStatus.CANCELLED -> stringResource(R.string.transfers_status_cancelled)
+    }
+    val statusText = when {
+        item.status == UploadStatus.FAILED -> item.errorMessage?.takeIf { it.isNotBlank() } ?: defaultStatusText
+        !item.statusDetail.isNullOrBlank() -> item.statusDetail!!
+        else -> defaultStatusText
     }
 
     GlassPanel(modifier = Modifier.fillMaxWidth()) {
@@ -508,13 +689,24 @@ private fun UploadTransferRow(
                         .weight(1f)
                         .padding(horizontal = 12.dp),
                 ) {
-                    Text(
-                        text = item.fileName,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = item.fileName,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (item.isEncrypted) {
+                            Icon(
+                                Icons.Filled.Lock,
+                                contentDescription = stringResource(R.string.transfers_encrypted),
+                                tint = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                    }
                     val meta = buildString {
                         append(statusText)
                         if (item.totalBytes > 0L) {
@@ -535,7 +727,24 @@ private fun UploadTransferRow(
                     )
                 }
 
-                if (item.status != UploadStatus.UPLOADING) {
+                if (item.status.isActive && item.canCancel) {
+                    IconButton(onClick = onCancel) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.transfers_cancel_upload),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    if ((item.status == UploadStatus.FAILED || item.status == UploadStatus.CANCELLED) && item.canRetry) {
+                        IconButton(onClick = onRetry) {
+                            Icon(
+                                Icons.Filled.Refresh,
+                                contentDescription = stringResource(R.string.transfers_retry),
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
                     IconButton(onClick = onDismiss) {
                         Icon(
                             Icons.Filled.Close,
@@ -546,7 +755,7 @@ private fun UploadTransferRow(
                 }
             }
 
-            if (item.status == UploadStatus.UPLOADING) {
+            if (item.status.isActive && item.status != UploadStatus.QUEUED) {
                 TransferProgressBar(
                     progress = item.progress,
                     transferredBytes = item.uploadedBytes,
