@@ -102,6 +102,7 @@ fun RootNavHost(
                     rootVm = rootVm,
                     mainNav = mainNav,
                     onOpenVideo = { chatId, msgId -> nav.navigate("video/$msgId?chatId=$chatId") },
+                    onOpenLocalVideo = { path -> nav.navigate("local_video?path=${Uri.encode(path)}") },
                     onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
                     onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
@@ -147,6 +148,26 @@ fun RootNavHost(
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
                 val chatId = entry.arguments?.getLong("chatId") ?: 0L
                 VideoPlayerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
+            }
+
+            composable(
+                "local_video?path={path}",
+                arguments = listOf(
+                    navArgument("path") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                ),
+            ) { entry ->
+                val path = Uri.decode(entry.arguments?.getString("path").orEmpty())
+                if (path.isNotBlank()) {
+                    VideoPlayerScreen(
+                        messageId = 0L,
+                        chatId = 0L,
+                        initialLocalPath = path,
+                        onBack = { nav.popBackStack() },
+                    )
+                }
             }
 
             composable(
@@ -218,7 +239,11 @@ fun RootNavHost(
             }
 
             composable("downloads") {
-                DownloadListScreen(showBack = true, onBack = { nav.popBackStack() })
+                DownloadListScreen(
+                    showBack = true,
+                    onBack = { nav.popBackStack() },
+                    onOpenLocalVideo = { path -> nav.navigate("local_video?path=${Uri.encode(path)}") },
+                )
             }
 
             composable("settings") {

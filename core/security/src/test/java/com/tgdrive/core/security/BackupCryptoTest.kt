@@ -1,5 +1,6 @@
 package com.tgdrive.core.security
 
+import android.content.ContextWrapper
 import com.google.common.truth.Truth.assertThat
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -8,6 +9,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.CancellationException
 import javax.crypto.AEADBadTagException
 
 class BackupCryptoTest {
@@ -147,5 +149,53 @@ class BackupCryptoTest {
         assertThat(BackupCrypto.stripEncryptedExtension(".tgenc")).isEqualTo("decrypted_file")
         assertThat(BackupCrypto.stripEncryptedExtension("plain.txt")).isEqualTo("plain.txt")
         assertThat(tmp.exists()).isTrue()
+    }
+
+    private fun inMemoryKeystore(): KeystoreHelper {
+        val map = mutableMapOf<String, String>()
+        val ctx = object : ContextWrapper(null) {}
+        return object : KeystoreHelper(ctx) {
+            override fun getString(key: String, default: String?): String? = map[key] ?: default
+            override fun putString(key: String, value: String): Boolean {
+                map[key] = value
+                return true
+            }
+            override fun remove(key: String): Boolean {
+                map.remove(key)
+                return true
+            }
+        }
+    }
+
+    @Test
+    fun `exportVaultKeyBase64 and importVaultKeyBase64 restore TGE1 decryption across instances`(@TempDir tmp: File) {
+        val crypto1 = BackupCrypto(inMemoryKeystore())
+        val crypto2 = BackupCrypto(inMemoryKeystore())
+        val plain = File(tmp, "video.mp4").apply { writeBytes("fake-mp4-header-and-frames".repeat(64).toByteArray()) }
+        val enc = File(tmp, "video.mp4.tgenc")
+        crypto1.encryptFile(plain, enc)
+
+        val exported = crypto1.exportVaultKeyBase64()
+        assertThat(crypto2.importVaultKeyBase64("not-base64!")).isFalse()
+        assertThat(crypto2.importVaultKeyBase64(java.util.Base64.getEncoder().encodeToString(ByteArray(8)))).isFalse()
+        assertThat(crypto2.importVaultKeyBase64(exported)).isTrue()
+        assertThat(crypto2.vaultKeyFingerprint()).isEqualTo(crypto1.vaultKeyFingerprint())
+
+        val dec = File(tmp, "restored.mp4")
+        crypto2.decryptFile(enc, dec)
+        assertThat(dec.readBytes()).isEqualTo(plain.readBytes())
+    }
+
+    @Test
+    fun `cancelCheck aborts encryptFile mid-stream and deletes partial output`(@TempDir tmp: File) {
+        val crypto = BackupCrypto(inMemoryKeystore())
+        val plain = File(tmp, "big.bin").apply { writeBytes(ByteArray(256 * 1024) { it.toByte() }) }
+        val out = File(tmp, "big.bin.tgenc")
+
+        var checks = 0
+        assertThrows<CancellationException> {
+            crypto.encryptFile(plain, out, cancelCheck = { checks++ >= 1 })
+        }
+        assertThat(out.exists()).isFalse()
     }
 }

@@ -37,7 +37,10 @@ import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -148,7 +151,7 @@ private sealed interface TransferRowUi {
         override val progress: Float = item.progress
         override val speedBytesPerSec: Long = item.speedBytesPerSec
         override val etaSeconds: Long? = item.etaSeconds
-        override val isActive: Boolean = item.status.isActive
+        override val isActive: Boolean = item.status.isInQueue
         override val isFailed: Boolean = item.status == UploadStatus.FAILED
     }
 }
@@ -162,6 +165,7 @@ private sealed interface TransferRowUi {
 fun DownloadListScreen(
     showBack: Boolean = false,
     onBack: () -> Unit = {},
+    onOpenLocalVideo: ((String) -> Unit)? = null,
     vm: DownloadListViewModel = hiltViewModel(),
 ) {
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
@@ -184,6 +188,12 @@ fun DownloadListScreen(
     val hasRetryableFailedUploads = remember(completed) {
         completed.any { it is TransferRowUi.Upload && it.isFailed && it.item.canRetry }
     }
+    val hasRunningUploads = remember(active) {
+        active.any { it is TransferRowUi.Upload && it.item.status.isActive }
+    }
+    val hasPausedUploads = remember(active) {
+        active.any { it is TransferRowUi.Upload && it.item.status == UploadStatus.PAUSED }
+    }
     val list = if (showCompleted) completed else active
     val openFailedMsg = stringResource(R.string.transfers_open_failed)
     val savedDecryptedMsg = stringResource(R.string.transfers_decrypted_saved)
@@ -198,17 +208,25 @@ fun DownloadListScreen(
             scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
             return
         }
+        val ext = file.extension.lowercase()
+        val resolvedMime = mimeType?.takeIf { it.isNotBlank() }
+            ?: runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }.getOrNull()
+            ?: "*/*"
+        val isVideo = resolvedMime.startsWith("video/", ignoreCase = true) ||
+            ext in setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
+        if (isVideo && onOpenLocalVideo != null) {
+            onOpenLocalVideo(file.absolutePath)
+            return
+        }
         try {
             val uri = FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
                 file,
             )
-            val resolvedMime = mimeType ?: MimeTypeMap.getSingleton()
-                .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, resolvedMime)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
         } catch (t: Throwable) {
@@ -257,6 +275,29 @@ fun DownloadListScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f).padding(start = if (showBack) 8.dp else 4.dp),
                 )
+                if (hasRunningUploads) {
+                    TextButton(onClick = { vm.uploadManager.pauseAll() }) {
+                        Text(stringResource(R.string.transfers_pause_all), maxLines = 1)
+                    }
+                    TextButton(onClick = { vm.uploadManager.cancelAll() }) {
+                        Text(
+                            text = stringResource(R.string.transfers_stop_all),
+                            color = MaterialTheme.colorScheme.error,
+                            maxLines = 1,
+                        )
+                    }
+                } else if (hasPausedUploads) {
+                    TextButton(onClick = { vm.uploadManager.resumeAll() }) {
+                        Text(stringResource(R.string.transfers_resume_all), maxLines = 1)
+                    }
+                    TextButton(onClick = { vm.uploadManager.cancelAll() }) {
+                        Text(
+                            text = stringResource(R.string.transfers_stop_all),
+                            color = MaterialTheme.colorScheme.error,
+                            maxLines = 1,
+                        )
+                    }
+                }
                 if (hasRetryableFailedUploads) {
                     TextButton(onClick = { vm.uploadManager.retryAllFailed() }) {
                         Text(
@@ -357,6 +398,8 @@ fun DownloadListScreen(
                                 val item = row.item
                                 UploadTransferRow(
                                     item = item,
+                                    onPause = { vm.uploadManager.pause(item.id) },
+                                    onResume = { vm.uploadManager.resume(item.id) },
                                     onCancel = { vm.uploadManager.cancel(item.id) },
                                     onRetry = { vm.uploadManager.retry(item.id) },
                                     onDismiss = { vm.uploadTracker.dismiss(item.id) },
@@ -623,6 +666,8 @@ private fun DownloadTransferRow(
 @Composable
 private fun UploadTransferRow(
     item: UploadItem,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
     onDismiss: () -> Unit,
@@ -634,6 +679,7 @@ private fun UploadTransferRow(
         UploadStatus.ENCRYPTING,
         UploadStatus.UPLOADING,
         -> MaterialTheme.colorScheme.primary
+        UploadStatus.PAUSED -> MaterialTheme.colorScheme.tertiary
         UploadStatus.DONE -> MaterialTheme.colorScheme.secondary
         UploadStatus.FAILED -> MaterialTheme.colorScheme.error
         UploadStatus.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -644,6 +690,7 @@ private fun UploadTransferRow(
         UploadStatus.PACKING,
         UploadStatus.UPLOADING,
         -> Icons.Filled.CloudUpload
+        UploadStatus.PAUSED -> Icons.Filled.Pause
         UploadStatus.ENCRYPTING -> Icons.Filled.Lock
         UploadStatus.DONE -> Icons.Filled.CloudDone
         UploadStatus.FAILED -> Icons.Filled.ErrorOutline
@@ -655,6 +702,7 @@ private fun UploadTransferRow(
         UploadStatus.PACKING -> stringResource(R.string.transfers_status_packing)
         UploadStatus.ENCRYPTING -> stringResource(R.string.transfers_status_encrypting)
         UploadStatus.UPLOADING -> stringResource(R.string.transfers_status_uploading)
+        UploadStatus.PAUSED -> stringResource(R.string.transfers_status_paused)
         UploadStatus.DONE -> stringResource(R.string.transfers_upload_done)
         UploadStatus.FAILED -> item.errorMessage?.takeIf { it.isNotBlank() }
             ?: stringResource(R.string.transfers_status_failed)
@@ -727,12 +775,34 @@ private fun UploadTransferRow(
                     )
                 }
 
-                if (item.status.isActive && item.canCancel) {
+                if (item.status.isActive) {
+                    IconButton(onClick = onPause) {
+                        Icon(
+                            Icons.Filled.Pause,
+                            contentDescription = stringResource(R.string.transfers_pause_upload),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     IconButton(onClick = onCancel) {
                         Icon(
-                            Icons.Filled.Close,
+                            Icons.Filled.Stop,
                             contentDescription = stringResource(R.string.transfers_cancel_upload),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                } else if (item.status == UploadStatus.PAUSED) {
+                    IconButton(onClick = onResume) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = stringResource(R.string.transfers_resume_upload),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    IconButton(onClick = onCancel) {
+                        Icon(
+                            Icons.Filled.Stop,
+                            contentDescription = stringResource(R.string.transfers_cancel_upload),
+                            tint = MaterialTheme.colorScheme.error,
                         )
                     }
                 } else {

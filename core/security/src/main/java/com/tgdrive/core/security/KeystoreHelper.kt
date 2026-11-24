@@ -26,7 +26,7 @@ data class ApiCredentials(
  * counter, and separates [regenerateTdlibSessionKey] from full [clear].
  */
 @Singleton
-class KeystoreHelper @Inject constructor(
+open class KeystoreHelper @Inject constructor(
     @ApplicationContext private val ctx: Context,
 ) {
 
@@ -142,13 +142,13 @@ class KeystoreHelper @Inject constructor(
         }
     }
 
-    fun getString(key: String, default: String? = null): String? =
+    open fun getString(key: String, default: String? = null): String? =
         safeRead { it.getString(key, default) } ?: default
 
-    fun putString(key: String, value: String): Boolean =
+    open fun putString(key: String, value: String): Boolean =
         safeWrite { it.putString(key, value) }
 
-    fun remove(key: String): Boolean =
+    open fun remove(key: String): Boolean =
         safeWrite { it.remove(key) }
 
     fun getApiCreds(): ApiCredentials? =

@@ -259,6 +259,10 @@
     <string name="browser_upload_packing">Packing…</string>
     <string name="browser_upload_encrypting">Encrypting…</string>
     <string name="browser_upload_queued">Queued</string>
+    <string name="browser_upload_paused">Paused</string>
+    <string name="browser_upload_pause">Pause</string>
+    <string name="browser_upload_resume">Resume</string>
+    <string name="browser_upload_stop">Stop</string>
     <string name="browser_upload_cancelled">Cancelled</string>
     <string name="browser_upload_cancel">Cancel</string>
     <string name="browser_upload_retry">Retry</string>

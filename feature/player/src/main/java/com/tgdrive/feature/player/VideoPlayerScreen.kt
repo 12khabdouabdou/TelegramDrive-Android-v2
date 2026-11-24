@@ -404,6 +404,7 @@ fun VideoPlayerScreen(
     messageId: Long,
     onBack: () -> Unit,
     chatId: Long = 0L,
+    initialLocalPath: String? = null,
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
     val ctx = LocalContext.current
@@ -419,15 +420,17 @@ fun VideoPlayerScreen(
     val pipSupported = remember(ctx) { vm.pipController.isPipSupported(ctx) }
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
-    var cachedEntry by remember(chatId, messageId) { mutableStateOf<FileCacheEntity?>(null) }
-    var localPath by remember(chatId, messageId) { mutableStateOf<String?>(vm.getLocalPath(messageId, chatId)) }
-    var playbackError by remember(chatId, messageId) { mutableStateOf<String?>(null) }
-    var playerInitError by remember(chatId, messageId) { mutableStateOf<String?>(null) }
-    var useProgressiveStream by remember(chatId, messageId) { mutableStateOf(false) }
-    var isStreamingBuffering by remember(chatId, messageId) { mutableStateOf(false) }
-    var streamFileId by remember(chatId, messageId) { mutableIntStateOf(0) }
-    var fellBackToDownload by remember(chatId, messageId) { mutableStateOf(false) }
-    var initialCloudSeekApplied by remember(chatId, messageId) { mutableStateOf(false) }
+    var cachedEntry by remember(chatId, messageId, initialLocalPath) { mutableStateOf<FileCacheEntity?>(null) }
+    var localPath by remember(chatId, messageId, initialLocalPath) {
+        mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))
+    }
+    var playbackError by remember(chatId, messageId, initialLocalPath) { mutableStateOf<String?>(null) }
+    var playerInitError by remember(chatId, messageId, initialLocalPath) { mutableStateOf<String?>(null) }
+    var useProgressiveStream by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
+    var isStreamingBuffering by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
+    var streamFileId by remember(chatId, messageId, initialLocalPath) { mutableIntStateOf(0) }
+    var fellBackToDownload by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
+    var initialCloudSeekApplied by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
 
     val downloadItem = downloadState.items.find {
         it.id == messageId && (chatId == 0L || it.chatId == 0L || it.chatId == chatId)
@@ -498,8 +501,8 @@ fun VideoPlayerScreen(
         }
     }
 
-    LaunchedEffect(chatId, messageId) {
-        cachedEntry = vm.getCachedEntry(chatId, messageId)
+    LaunchedEffect(chatId, messageId, initialLocalPath) {
+        cachedEntry = if (initialLocalPath.isNullOrBlank()) vm.getCachedEntry(chatId, messageId) else null
     }
 
     LaunchedEffect(cachedEntry?.playbackPositionMs, exo) {
@@ -517,7 +520,13 @@ fun VideoPlayerScreen(
         }
     }
 
-    LaunchedEffect(chatId, messageId, downloadState.items, cachedEntry) {
+    LaunchedEffect(chatId, messageId, initialLocalPath, downloadState.items, cachedEntry) {
+        if (!initialLocalPath.isNullOrBlank()) {
+            localPath = initialLocalPath
+            useProgressiveStream = false
+            isStreamingBuffering = false
+            return@LaunchedEffect
+        }
         val path = vm.getLocalPath(messageId, chatId)
         if (path != null && path != localPath) {
             localPath = path
@@ -600,7 +609,7 @@ fun VideoPlayerScreen(
 
     LaunchedEffect(exo, hasActiveVideo, chatId, messageId) {
         val player = exo ?: return@LaunchedEffect
-        if (!hasActiveVideo || chatId == 0L) return@LaunchedEffect
+        if (!hasActiveVideo || chatId == 0L || messageId == 0L) return@LaunchedEffect
         while (true) {
             delay(15_000L)
             if (player.isPlaying) {
@@ -625,7 +634,7 @@ fun VideoPlayerScreen(
                     val pos = exo.currentPosition.coerceAtLeast(0L)
                     val dur = exo.duration.coerceAtLeast(0L)
                     savedPositionMs = pos
-                    vm.savePlaybackPosition(chatId, messageId, pos, dur)
+                    if (chatId != 0L && messageId != 0L) vm.savePlaybackPosition(chatId, messageId, pos, dur)
                     val inPipNow = activity != null && vm.pipController.isInPip(activity)
                     if (!inPipNow) exo.pause()
                 }
@@ -664,7 +673,7 @@ fun VideoPlayerScreen(
                     val pos = it.currentPosition.coerceAtLeast(0L)
                     val dur = it.duration.coerceAtLeast(0L)
                     savedPositionMs = pos
-                    vm.savePlaybackPosition(chatId, messageId, pos, dur)
+                    if (chatId != 0L && messageId != 0L) vm.savePlaybackPosition(chatId, messageId, pos, dur)
                     it.removeListener(listener)
                     it.release()
                 }

@@ -102,7 +102,10 @@ class UploadManager @Inject constructor(
     private val heavyJobSemaphore = Semaphore(1)
 
     private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val batchJobs = ConcurrentHashMap<String, Job>()
     private val retrySpecs = ConcurrentHashMap<String, RetrySpec>()
+    private val pausedIds = ConcurrentHashMap.newKeySet<String>()
+    private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
 
     val uploads: StateFlow<UploadQueueState> = uploadTracker.state
 
@@ -157,8 +160,12 @@ class UploadManager @Inject constructor(
         options: NormalUploadOptions = NormalUploadOptions(),
     ) {
         if (files.isEmpty()) return
+        val batchId = "batch_${UUID.randomUUID()}"
         val preparedIds = files.mapIndexed { idx, f ->
             val id = "ul_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
+            pausedIds.remove(id)
+            cancelledIds.remove(id)
+            retrySpecs[id] = RetrySpec.SingleFile(chatId, f, options)
             val shownName = if (options.encryption.enabled) "${sanitizeLeafName(f.displayName)}.tgenc" else sanitizeLeafName(f.displayName)
             uploadTracker.start(
                 id = id,
@@ -170,32 +177,40 @@ class UploadManager @Inject constructor(
             )
             id to f
         }
-        scope.launch {
-            val resolvedChatId = resolveChatId(chatId)
-            if (resolvedChatId == 0L) {
-                preparedIds.forEach { (id, _) ->
-                    uploadTracker.markFailed(id, "Telegram session not ready", canRetry = false)
+        val batchJob = scope.launch {
+            try {
+                val resolvedChatId = resolveChatId(chatId)
+                if (resolvedChatId == 0L) {
+                    preparedIds.forEach { (id, _) ->
+                        if (id !in cancelledIds && id !in pausedIds) {
+                            uploadTracker.markFailed(id, "Telegram session not ready", canRetry = false)
+                        }
+                    }
+                    return@launch
                 }
-                return@launch
-            }
-            val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
-            val claimedNames = ConcurrentHashMap.newKeySet<String>()
-            existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+                val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+                val claimedNames = ConcurrentHashMap.newKeySet<String>()
+                existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
 
-            val jobs = preparedIds.map { (id, file) ->
-                val spec = RetrySpec.SingleFile(resolvedChatId, file, options)
-                retrySpecs[id] = spec
-                val job = async {
-                    executeSingleFileTask(id, spec, claimedNames, existingRows)
+                val jobs = preparedIds.mapNotNull { (id, file) ->
+                    val spec = RetrySpec.SingleFile(resolvedChatId, file, options)
+                    retrySpecs[id] = spec
+                    if (id in cancelledIds || id in pausedIds) return@mapNotNull null
+                    val job = async {
+                        executeSingleFileTask(id, spec, claimedNames, existingRows)
+                    }
+                    activeJobs[id] = job
+                    job
                 }
-                activeJobs[id] = job
-                job
-            }
-            val results = jobs.awaitAll()
-            if (results.any { it }) {
-                _completedChatEvents.tryEmit(resolvedChatId)
+                val results = jobs.awaitAll()
+                if (results.any { it }) {
+                    _completedChatEvents.tryEmit(resolvedChatId)
+                }
+            } finally {
+                batchJobs.remove(batchId)
             }
         }
+        batchJobs[batchId] = batchJob
     }
 
     fun enqueueFolderAsNormalFiles(
@@ -203,55 +218,64 @@ class UploadManager @Inject constructor(
         treeUri: Uri,
         options: NormalUploadOptions = NormalUploadOptions(),
     ) {
-        scope.launch {
-            val resolvedChatId = resolveChatId(chatId)
-            if (resolvedChatId == 0L) return@launch
-            val scanned = scanFolderForNormalUpload(treeUri)
-            if (scanned.isEmpty()) return@launch
+        val batchId = "dir_batch_${UUID.randomUUID()}"
+        val batchJob = scope.launch {
+            try {
+                val resolvedChatId = resolveChatId(chatId)
+                if (resolvedChatId == 0L) return@launch
+                val scanned = scanFolderForNormalUpload(treeUri)
+                if (scanned.isEmpty()) return@launch
 
-            val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
-            val claimedNames = ConcurrentHashMap.newKeySet<String>()
-            existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+                val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+                val claimedNames = ConcurrentHashMap.newKeySet<String>()
+                existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
 
-            val prepared = scanned.mapIndexed { idx, entry ->
-                val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
-                val shownName = if (options.encryption.enabled) {
-                    "${sanitizeLeafName(entry.item.displayName)}.tgenc"
-                } else {
-                    sanitizeLeafName(entry.item.displayName)
+                val prepared = scanned.mapIndexed { idx, entry ->
+                    val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
+                    pausedIds.remove(id)
+                    cancelledIds.remove(id)
+                    val spec = RetrySpec.SingleFile(
+                        chatId = resolvedChatId,
+                        file = entry.item,
+                        options = options,
+                        virtualPath = entry.virtualPath,
+                        lastModifiedMs = entry.lastModifiedMs,
+                    )
+                    retrySpecs[id] = spec
+                    val shownName = if (options.encryption.enabled) {
+                        "${sanitizeLeafName(entry.item.displayName)}.tgenc"
+                    } else {
+                        sanitizeLeafName(entry.item.displayName)
+                    }
+                    uploadTracker.start(
+                        id = id,
+                        fileName = shownName,
+                        totalBytes = entry.item.sizeBytes,
+                        chatId = resolvedChatId,
+                        status = UploadStatus.QUEUED,
+                        statusDetail = entry.virtualPath.takeIf { it.isNotBlank() },
+                        isEncrypted = options.encryption.enabled,
+                    )
+                    id to spec
                 }
-                uploadTracker.start(
-                    id = id,
-                    fileName = shownName,
-                    totalBytes = entry.item.sizeBytes,
-                    chatId = resolvedChatId,
-                    status = UploadStatus.QUEUED,
-                    statusDetail = entry.virtualPath.takeIf { it.isNotBlank() },
-                    isEncrypted = options.encryption.enabled,
-                )
-                Triple(id, entry, shownName)
-            }
 
-            val jobs = prepared.map { (id, entry, _) ->
-                val spec = RetrySpec.SingleFile(
-                    chatId = resolvedChatId,
-                    file = entry.item,
-                    options = options,
-                    virtualPath = entry.virtualPath,
-                    lastModifiedMs = entry.lastModifiedMs,
-                )
-                retrySpecs[id] = spec
-                val job = async {
-                    executeSingleFileTask(id, spec, claimedNames, existingRows)
+                val jobs = prepared.mapNotNull { (id, spec) ->
+                    if (id in cancelledIds || id in pausedIds) return@mapNotNull null
+                    val job = async {
+                        executeSingleFileTask(id, spec, claimedNames, existingRows)
+                    }
+                    activeJobs[id] = job
+                    job
                 }
-                activeJobs[id] = job
-                job
-            }
-            val results = jobs.awaitAll()
-            if (results.any { it }) {
-                _completedChatEvents.tryEmit(resolvedChatId)
+                val results = jobs.awaitAll()
+                if (results.any { it }) {
+                    _completedChatEvents.tryEmit(resolvedChatId)
+                }
+            } finally {
+                batchJobs.remove(batchId)
             }
         }
+        batchJobs[batchId] = batchJob
     }
 
     fun enqueueFolderAsZip(
@@ -260,6 +284,8 @@ class UploadManager @Inject constructor(
     ): String {
         val id = "zip_dir_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
         val safeBase = ZipUploader.sanitizeZipBaseName(request.baseName).removeSuffix(".zip")
+        pausedIds.remove(id)
+        cancelledIds.remove(id)
         val spec = RetrySpec.FolderZip(treeUri, request.copy(baseName = safeBase))
         retrySpecs[id] = spec
         uploadTracker.start(
@@ -284,6 +310,8 @@ class UploadManager @Inject constructor(
     ): String {
         val id = "zip_uris_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
         val safeBase = ZipUploader.sanitizeZipBaseName(request.baseName).removeSuffix(".zip")
+        pausedIds.remove(id)
+        cancelledIds.remove(id)
         val spec = RetrySpec.UrisZip(files, request.copy(baseName = safeBase))
         retrySpecs[id] = spec
         uploadTracker.start(
@@ -302,14 +330,45 @@ class UploadManager @Inject constructor(
         return id
     }
 
+    fun pause(uploadId: String) {
+        cancelledIds.remove(uploadId)
+        pausedIds.add(uploadId)
+        activeJobs.remove(uploadId)?.cancel()
+        uploadTracker.markPaused(uploadId)
+    }
+
+    fun resume(uploadId: String) {
+        pausedIds.remove(uploadId)
+        cancelledIds.remove(uploadId)
+        retry(uploadId)
+    }
+
     fun cancel(uploadId: String) {
+        pausedIds.remove(uploadId)
+        cancelledIds.add(uploadId)
         activeJobs.remove(uploadId)?.cancel()
         uploadTracker.markCancelled(uploadId)
+    }
+
+    fun pauseAll() {
+        uploads.value.items.filter { it.status.isActive }.forEach { pause(it.id) }
+    }
+
+    fun resumeAll() {
+        uploads.value.items.filter { it.status == UploadStatus.PAUSED }.forEach { resume(it.id) }
+    }
+
+    fun cancelAll() {
+        batchJobs.values.toList().forEach { it.cancel() }
+        batchJobs.clear()
+        uploads.value.items.filter { it.status.isInQueue }.forEach { cancel(it.id) }
     }
 
     fun retry(uploadId: String) {
         val spec = retrySpecs[uploadId] ?: return
         if (activeJobs[uploadId]?.isActive == true) return
+        pausedIds.remove(uploadId)
+        cancelledIds.remove(uploadId)
         when (spec) {
             is RetrySpec.SingleFile -> {
                 val shownName = if (spec.options.encryption.enabled) {
@@ -323,15 +382,23 @@ class UploadManager @Inject constructor(
                     totalBytes = spec.file.sizeBytes,
                     chatId = spec.chatId,
                     status = UploadStatus.QUEUED,
+                    statusDetail = spec.virtualPath.takeIf { it.isNotBlank() },
                     isEncrypted = spec.options.encryption.enabled,
                 )
                 val job = scope.launch {
-                    val existingRows = runCatching { fileCacheDao.forChat(spec.chatId) }.getOrDefault(emptyList())
+                    val targetChat = resolveChatId(spec.chatId)
+                    if (targetChat == 0L) {
+                        uploadTracker.markFailed(uploadId, "Telegram session not ready", canRetry = true)
+                        return@launch
+                    }
+                    val resolvedSpec = spec.copy(chatId = targetChat)
+                    retrySpecs[uploadId] = resolvedSpec
+                    val existingRows = runCatching { fileCacheDao.forChat(targetChat) }.getOrDefault(emptyList())
                     val claimed = ConcurrentHashMap.newKeySet<String>().apply {
                         existingRows.forEach { add(it.fileName.lowercase(Locale.US)) }
                     }
-                    if (executeSingleFileTask(uploadId, spec, claimed, existingRows)) {
-                        _completedChatEvents.tryEmit(spec.chatId)
+                    if (executeSingleFileTask(uploadId, resolvedSpec, claimed, existingRows)) {
+                        _completedChatEvents.tryEmit(targetChat)
                     }
                 }
                 activeJobs[uploadId] = job
@@ -428,6 +495,14 @@ class UploadManager @Inject constructor(
         claimedNames: MutableSet<String>,
         existingRowsSnapshot: List<FileCacheEntity>,
     ): Boolean {
+        if (id in cancelledIds) {
+            uploadTracker.markCancelled(id)
+            return false
+        }
+        if (id in pausedIds) {
+            uploadTracker.markPaused(id)
+            return false
+        }
         val chatId = spec.chatId
         val item = spec.file
         val options = spec.options
@@ -468,6 +543,14 @@ class UploadManager @Inject constructor(
         val semaphore = if (isHeavy) heavyJobSemaphore else smallFileSemaphore
 
         return semaphore.withPermit {
+            if (id in cancelledIds) {
+                uploadTracker.markCancelled(id)
+                return@withPermit false
+            }
+            if (id in pausedIds) {
+                uploadTracker.markPaused(id)
+                return@withPermit false
+            }
             val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
             var stagedFile: File? = null
             var encryptedFile: File? = null
@@ -526,15 +609,21 @@ class UploadManager @Inject constructor(
                     val encOut = File(stagingDir, "${tempRaw.name}${BackupCrypto.ENCRYPTED_EXT}")
                     encryptedFile = encOut
                     val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
-                    backupCrypto.encryptFile(tempRaw, encOut, passphrase = customPass) { done, tot ->
-                        if (tot > 0L) {
-                            uploadTracker.updatePhase(
-                                id = id,
-                                status = UploadStatus.ENCRYPTING,
-                                progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
-                            )
-                        }
-                    }
+                    backupCrypto.encryptFile(
+                        inputFile = tempRaw,
+                        outputFile = encOut,
+                        passphrase = customPass,
+                        onProgress = { done, tot ->
+                            if (tot > 0L) {
+                                uploadTracker.updatePhase(
+                                    id = id,
+                                    status = UploadStatus.ENCRYPTING,
+                                    progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
+                                )
+                            }
+                        },
+                        cancelCheck = { id in cancelledIds || id in pausedIds },
+                    )
                     tempRaw.delete()
                     fileToUpload = encOut
                     finalMime = "application/octet-stream"
@@ -599,7 +688,11 @@ class UploadManager @Inject constructor(
                 uploadTracker.completeUpload(id)
                 true
             } catch (e: CancellationException) {
-                uploadTracker.markCancelled(id)
+                if (id in pausedIds) {
+                    uploadTracker.markPaused(id)
+                } else {
+                    uploadTracker.markCancelled(id)
+                }
                 throw e
             } catch (t: Throwable) {
                 Log.w("UploadManager: single file upload failed for '$targetName'", t)
@@ -700,7 +793,23 @@ class UploadManager @Inject constructor(
         id: String,
         spec: RetrySpec,
     ) {
+        if (id in cancelledIds) {
+            uploadTracker.markCancelled(id)
+            return
+        }
+        if (id in pausedIds) {
+            uploadTracker.markPaused(id)
+            return
+        }
         heavyJobSemaphore.withPermit {
+            if (id in cancelledIds) {
+                uploadTracker.markCancelled(id)
+                return@withPermit
+            }
+            if (id in pausedIds) {
+                uploadTracker.markPaused(id)
+                return@withPermit
+            }
             val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
             val zipWorkDir = File(stagingDir, "zip_${id.take(18)}").apply { mkdirs() }
             var manifestFile: File? = null
@@ -861,7 +970,11 @@ class UploadManager @Inject constructor(
                 )
                 _completedChatEvents.tryEmit(chatId)
             } catch (e: CancellationException) {
-                uploadTracker.markCancelled(id)
+                if (id in pausedIds) {
+                    uploadTracker.markPaused(id)
+                } else {
+                    uploadTracker.markCancelled(id)
+                }
                 throw e
             } catch (t: Throwable) {
                 Log.w("UploadManager: ZIP upload failed", t)

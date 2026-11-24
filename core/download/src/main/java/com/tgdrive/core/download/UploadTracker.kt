@@ -85,6 +85,12 @@ class UploadTracker @Inject constructor(
                 items = cur.items.map { item ->
                     if (item.id != id) {
                         item
+                    } else if (
+                        item.status == UploadStatus.CANCELLED ||
+                        item.status == UploadStatus.PAUSED ||
+                        item.status == UploadStatus.DONE
+                    ) {
+                        item
                     } else {
                         item.copy(
                             status = status,
@@ -128,6 +134,12 @@ class UploadTracker @Inject constructor(
             cur.copy(
                 items = cur.items.map { item ->
                     if (item.id != id) {
+                        item
+                    } else if (
+                        item.status == UploadStatus.CANCELLED ||
+                        item.status == UploadStatus.PAUSED ||
+                        item.status == UploadStatus.DONE
+                    ) {
                         item
                     } else {
                         item.copy(
@@ -198,6 +210,29 @@ class UploadTracker @Inject constructor(
         }
     }
 
+    fun markPaused(id: String) {
+        samples.remove(id)
+        _state.update { cur ->
+            cur.copy(
+                items = cur.items.map { item ->
+                    if (item.id != id) {
+                        item
+                    } else {
+                        item.copy(
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            status = UploadStatus.PAUSED,
+                            statusDetail = "Paused",
+                            errorMessage = null,
+                            canCancel = true,
+                            canRetry = true,
+                        )
+                    }
+                },
+            )
+        }
+    }
+
     fun markCancelled(id: String) {
         samples.remove(id)
         _state.update { cur ->
@@ -228,7 +263,7 @@ class UploadTracker @Inject constructor(
 
     fun clearCompleted() {
         _state.update { cur ->
-            cur.copy(items = cur.items.filter { it.status.isActive })
+            cur.copy(items = cur.items.filter { it.status.isInQueue })
         }
     }
 }
@@ -257,6 +292,7 @@ enum class UploadStatus {
     PACKING,
     ENCRYPTING,
     UPLOADING,
+    PAUSED,
     DONE,
     FAILED,
     CANCELLED,
@@ -268,6 +304,9 @@ enum class UploadStatus {
             this == PACKING ||
             this == ENCRYPTING ||
             this == UPLOADING
+
+    val isInQueue: Boolean
+        get() = isActive || this == PAUSED
 }
 
 data class UploadQueueState(

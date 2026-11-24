@@ -1,6 +1,8 @@
 package com.tgdrive.core.download
 
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -68,6 +70,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
                             progress = progressPct,
                             max = 100,
                             indeterminate = progressPct == 0,
+                            hasActiveUploads = activeUl.isNotEmpty(),
                         ),
                     )
                 }
@@ -83,7 +86,24 @@ class TransferKeepAliveWorker @AssistedInject constructor(
         progress: Int,
         max: Int,
         indeterminate: Boolean,
+        hasActiveUploads: Boolean = false,
     ): ForegroundInfo {
+        val pausePi = PendingIntent.getBroadcast(
+            applicationContext,
+            REQ_PAUSE,
+            Intent(applicationContext, TransferActionReceiver::class.java).apply {
+                action = TransferActionReceiver.ACTION_PAUSE_ALL
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopPi = PendingIntent.getBroadcast(
+            applicationContext,
+            REQ_STOP,
+            Intent(applicationContext, TransferActionReceiver::class.java).apply {
+                action = TransferActionReceiver.ACTION_CANCEL_ALL
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         val notif = NotificationCompat.Builder(applicationContext, "download.progress")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("TelegramDrive Transfers")
@@ -92,6 +112,10 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             .setOnlyAlertOnce(true)
             .apply {
                 if (max > 0) setProgress(max, progress, indeterminate)
+                if (hasActiveUploads) {
+                    addAction(0, "Pause", pausePi)
+                }
+                addAction(0, "Stop", stopPi)
             }
             .build()
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -104,6 +128,8 @@ class TransferKeepAliveWorker @AssistedInject constructor(
     companion object {
         private const val UNIQUE_NAME = "tgdrive_transfer_keepalive"
         private const val NOTIF_ID = 50002
+        private const val REQ_PAUSE = 50011
+        private const val REQ_STOP = 50012
 
         fun ensureRunning(ctx: Context) {
             runCatching {

@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -684,6 +685,7 @@ class TdLibTelegramClient(
 
                 val progressJob = launch {
                     for (f in progressChannel) {
+                        if (!isActive) break
                         if (f.remote.isUploadingActive || f.remote.uploadedSize > 0L) {
                             val uploaded = f.remote.uploadedSize
                             if (uploaded > lastUploadedBytes.get()) {
@@ -714,12 +716,12 @@ class TdLibTelegramClient(
                     return@withContext UploadResult(serverId, remoteId)
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
                     } catch (_: Throwable) {}
                     throw e
                 } catch (t: Throwable) {
                     try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
                     } catch (_: Throwable) {}
                     throw t
                 } finally {
@@ -737,12 +739,12 @@ class TdLibTelegramClient(
                         return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
                     }
                     try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
                     } catch (_: Throwable) {}
                     throw TelegramException(-1, "Upload timed out for $fileName")
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), false)) { }
+                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
                     } catch (_: Throwable) {}
                     throw e
                 } finally {

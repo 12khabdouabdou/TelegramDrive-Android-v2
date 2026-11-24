@@ -873,8 +873,20 @@ class FolderViewModel
             _zipPreviewLoading.value = false
         }
 
+        fun pauseUpload(uploadId: String) {
+            uploadManager.pause(uploadId)
+        }
+
+        fun resumeUpload(uploadId: String) {
+            uploadManager.resume(uploadId)
+        }
+
         fun cancelUpload(uploadId: String) {
             uploadManager.cancel(uploadId)
+        }
+
+        fun cancelAllUploads() {
+            uploadManager.cancelAll()
         }
 
         fun retryUpload(uploadId: String) {

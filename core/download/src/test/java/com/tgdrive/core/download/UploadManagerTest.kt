@@ -19,6 +19,7 @@ import io.mockk.mockk
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -267,5 +268,86 @@ class UploadManagerTest {
 
         val retriedItem = tracker.state.value.items.first { it.id == failedItem.id }
         assertThat(retriedItem.status).isEqualTo(UploadStatus.DONE)
+    }
+
+    @Test
+    fun `pause stops active upload, ignores trailing progress, and resume completes`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "video.mp4").apply { writeBytes("video-stream-payload".toByteArray()) }
+        var allowFinish = false
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } coAnswers {
+                val progressCb = arg<(Long, Long) -> Unit>(4)
+                progressCb(500L, 1000L)
+                if (!allowFinish) {
+                    kotlinx.coroutines.delay(60_000L)
+                }
+                UploadResult(messageId = 201L, remoteId = "rem201")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(12L) } returns emptyList()
+        }
+        val (manager, tracker) = createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 12L,
+            files = listOf(UploadFileItem(fileUri(src), "video.mp4", "video/mp4", src.length())),
+        )
+        runCurrent()
+
+        val id = tracker.state.value.items.single().id
+        manager.pause(id)
+        runCurrent()
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.PAUSED)
+
+        // Trailing TDLib progress tick must never resurrect a paused item.
+        tracker.updateProgress(id, 900L, 1000L)
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.PAUSED)
+
+        allowFinish = true
+        manager.resume(id)
+        advanceUntilIdle()
+
+        val finalItem = tracker.state.value.items.single()
+        assertThat(finalItem.status).isEqualTo(UploadStatus.DONE)
+    }
+
+    @Test
+    fun `cancel stops active upload and ignores trailing progress updates`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "archive.zip").apply { writeBytes("zip-payload".toByteArray()) }
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } coAnswers {
+                val progressCb = arg<(Long, Long) -> Unit>(4)
+                progressCb(300L, 1000L)
+                kotlinx.coroutines.delay(60_000L)
+                UploadResult(messageId = 301L, remoteId = "rem301")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(15L) } returns emptyList()
+        }
+        val (manager, tracker) = createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 15L,
+            files = listOf(UploadFileItem(fileUri(src), "archive.zip", "application/zip", src.length())),
+        )
+        runCurrent()
+
+        val id = tracker.state.value.items.single().id
+        manager.cancel(id)
+        advanceUntilIdle()
+
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.CANCELLED)
+        tracker.updateProgress(id, 850L, 1000L)
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.CANCELLED)
     }
 }

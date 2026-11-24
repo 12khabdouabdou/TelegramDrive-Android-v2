@@ -1,5 +1,7 @@
 package com.tgdrive.feature.settings
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import androidx.fragment.app.FragmentActivity
@@ -25,13 +27,22 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,6 +60,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +71,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -74,6 +88,7 @@ import com.tgdrive.designsystem.editorial.EditorialHeader
 import com.tgdrive.designsystem.editorial.EditorialRadioRow
 import com.tgdrive.designsystem.editorial.SectionLabel
 import com.tgdrive.designsystem.theme.TgTypography
+import kotlinx.coroutines.launch
 
 /**
  * Settings screen — theme picker, debounced cache limit slider + Cache screen shortcut,
@@ -90,12 +105,17 @@ fun SettingsScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showApiDialog by remember { mutableStateOf(false) }
     var showLicensesDialog by remember { mutableStateOf(false) }
+    var showPassphraseDialog by remember { mutableStateOf(false) }
+    var exportedVaultKey by remember { mutableStateOf<String?>(null) }
+    var showImportVaultDialog by remember { mutableStateOf(false) }
+    var passvaultNotice by remember { mutableStateOf<String?>(null) }
     var bioAvail by remember { mutableStateOf(vm.biometricAvailability()) }
 
     DisposableEffect(lifecycleOwner) {
@@ -236,6 +256,213 @@ fun SettingsScreen(
             confirmButton = {
                 TextButton(onClick = { showLicensesDialog = false }) {
                     Text("OK")
+                }
+            },
+        )
+    }
+
+    if (showPassphraseDialog) {
+        var passInput by remember { mutableStateOf("") }
+        var confirmInput by remember { mutableStateOf("") }
+        var showPass by remember { mutableStateOf(false) }
+        var passErr by remember { mutableStateOf<String?>(null) }
+        val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
+        val mismatchErr = stringResource(R.string.settings_passvault_passphrase_mismatch)
+        val savedMsg = stringResource(R.string.settings_passvault_passphrase_saved)
+        val resetMsg = stringResource(R.string.settings_passvault_passphrase_reset)
+        AlertDialog(
+            onDismissRequest = { showPassphraseDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_passvault_passphrase_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_passvault_passphrase_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = passInput,
+                        onValueChange = { passInput = it; passErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_passphrase_label)) },
+                        singleLine = true,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPass = !showPass }) {
+                                Icon(
+                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = null,
+                                )
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = confirmInput,
+                        onValueChange = { confirmInput = it; passErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_passphrase_confirm)) },
+                        singleLine = true,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    passErr?.let {
+                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = passInput.trim()
+                        when {
+                            trimmed.length < 4 -> passErr = shortErr
+                            trimmed != confirmInput.trim() -> passErr = mismatchErr
+                            else -> {
+                                vm.saveBackupPassphrase(trimmed)
+                                passvaultNotice = savedMsg
+                                showPassphraseDialog = false
+                            }
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_api_save))
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (state.hasCustomPassphrase || state.backupUseCustomPassphrase) {
+                        TextButton(
+                            onClick = {
+                                vm.clearBackupPassphrase()
+                                passvaultNotice = resetMsg
+                                showPassphraseDialog = false
+                            },
+                        ) {
+                            Text(stringResource(R.string.settings_passvault_use_vault))
+                        }
+                    }
+                    TextButton(onClick = { showPassphraseDialog = false }) {
+                        Text(stringResource(R.string.settings_api_cancel))
+                    }
+                }
+            },
+        )
+    }
+
+    exportedVaultKey?.let { keyText ->
+        val copiedMsg = stringResource(R.string.settings_passvault_copied)
+        AlertDialog(
+            onDismissRequest = { exportedVaultKey = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_passvault_export_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_passvault_export_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                            .padding(12.dp),
+                    ) {
+                        Text(
+                            text = keyText,
+                            style = TgTypography.Mono,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cb?.setPrimaryClip(ClipData.newPlainText("TelegramDrive Vault Key", keyText))
+                        passvaultNotice = copiedMsg
+                        exportedVaultKey = null
+                    },
+                ) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.settings_passvault_copy_key))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { exportedVaultKey = null }) {
+                    Text(stringResource(R.string.settings_api_cancel))
+                }
+            },
+        )
+    }
+
+    if (showImportVaultDialog) {
+        var keyInput by remember { mutableStateOf("") }
+        var importErr by remember { mutableStateOf<String?>(null) }
+        val invalidMsg = stringResource(R.string.settings_passvault_restore_invalid)
+        AlertDialog(
+            onDismissRequest = { showImportVaultDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_passvault_restore_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_passvault_restore_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = keyInput,
+                        onValueChange = { keyInput = it; importErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_restore_label)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    importErr?.let {
+                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (vm.importVaultKey(keyInput)) {
+                            passvaultNotice = "Vault key restored"
+                            showImportVaultDialog = false
+                        } else {
+                            importErr = invalidMsg
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_api_save))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showImportVaultDialog = false }) {
+                    Text(stringResource(R.string.settings_api_cancel))
                 }
             },
         )
@@ -507,6 +734,155 @@ fun SettingsScreen(
                     style = TgTypography.Caption,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+
+        // PassVault & Encryption
+        EditorialSection(title = stringResource(R.string.settings_passvault)) {
+            val modeLabel = if (state.backupUseCustomPassphrase && state.hasCustomPassphrase) {
+                stringResource(R.string.settings_passvault_mode_passphrase, state.vaultKeyFingerprint)
+            } else {
+                stringResource(R.string.settings_passvault_mode_vault, state.vaultKeyFingerprint)
+            }
+            Text(
+                text = modeLabel,
+                style = TgTypography.Mono,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(bottom = 10.dp),
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .toggleable(
+                        value = state.backupEncryptAll,
+                        role = Role.Switch,
+                        onValueChange = vm::setBackupEncryptAll,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_passvault_encrypt_backup),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_passvault_encrypt_backup_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.backupEncryptAll, onCheckedChange = null)
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { showPassphraseDialog = true }
+                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.LockOpen,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_passvault_passphrase_row),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        text = if (state.hasCustomPassphrase) {
+                            stringResource(R.string.settings_passvault_passphrase_set)
+                        } else {
+                            stringResource(R.string.settings_passvault_passphrase_unset)
+                        },
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Icon(
+                    Icons.Filled.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            val verifyExportTitle = stringResource(R.string.settings_passvault_verify_export)
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        if (state.biometricEnabled && bioAvail == BiometricHelper.Availability.AVAILABLE) {
+                            val activity = context.findFragmentActivity()
+                            if (activity != null) {
+                                vm.authenticateForBiometricToggle(
+                                    activity = activity,
+                                    title = verifyExportTitle,
+                                    subtitle = confirmSubtitle,
+                                    onSuccess = { exportedVaultKey = vm.exportVaultKey() },
+                                    onError = { err -> passvaultNotice = err },
+                                )
+                            } else {
+                                exportedVaultKey = vm.exportVaultKey()
+                            }
+                        } else {
+                            exportedVaultKey = vm.exportVaultKey()
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Filled.VpnKey, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.settings_passvault_backup_key), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                OutlinedButton(
+                    onClick = { showImportVaultDialog = true },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Filled.Restore, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.settings_passvault_restore_key), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            val wipedMsgFmt = stringResource(R.string.settings_passvault_wiped_count)
+            TextButton(
+                onClick = {
+                    scope.launch {
+                        val removed = vm.clearDecryptedTempFiles()
+                        passvaultNotice = String.format(wipedMsgFmt, removed)
+                    }
+                },
+            ) {
+                Icon(Icons.Filled.CleaningServices, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(R.string.settings_passvault_wipe_decrypted))
+            }
+            passvaultNotice?.let { msg ->
+                Text(
+                    text = msg,
+                    style = TgTypography.Caption,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 4.dp),
                 )
             }
         }

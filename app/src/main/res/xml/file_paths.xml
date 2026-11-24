@@ -14,6 +14,7 @@
         ZIP entry (videos, PDFs, audio — none would open).
     -->
     <cache-path name="zip_extracts" path="zip_extracts/" />
+    <cache-path name="decrypted" path="decrypted/" />
 
     <!--
         TDLib's own download destination. TdLibTelegramClient.downloadFile()

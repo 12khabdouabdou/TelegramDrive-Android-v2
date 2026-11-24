@@ -11,8 +11,10 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
+import java.util.concurrent.CancellationException
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
@@ -66,6 +68,26 @@ class BackupCrypto @Inject constructor(
     /** Password string derived from [vaultKey] for AES-256 encrypted ZIP archives. */
     fun zipVaultPassword(): String = Base64.getEncoder().encodeToString(vaultKey())
 
+    /** Exports the active 256-bit Device Vault Key as Base64 for manual backup/restore. */
+    fun exportVaultKeyBase64(): String = Base64.getEncoder().encodeToString(vaultKey())
+
+    /** Short verification fingerprint (e.g. `A1B2-C3D4`) for displaying the active Vault Key. */
+    fun vaultKeyFingerprint(): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(vaultKey())
+        return "%02X%02X-%02X%02X".format(digest[0], digest[1], digest[2], digest[3])
+    }
+
+    /** Restores a previously exported 256-bit Base64 Vault Key; returns `false` if invalid. */
+    @Synchronized
+    fun importVaultKeyBase64(encoded: String): Boolean {
+        val clean = encoded.trim()
+        if (clean.isEmpty()) return false
+        val decoded = runCatching { Base64.getDecoder().decode(clean) }.getOrNull() ?: return false
+        if (decoded.size != KEY_BYTES) return false
+        keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(decoded))
+        return true
+    }
+
     fun getCustomBackupPassphrase(): String? =
         keystoreHelper.getString(KEY_BACKUP_PASSPHRASE_V1)?.takeIf { it.isNotBlank() }
 
@@ -108,6 +130,7 @@ class BackupCrypto @Inject constructor(
         outputFile: File,
         passphrase: String? = null,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
+        cancelCheck: (() -> Boolean)? = null,
     ) {
         val total = inputFile.length().coerceAtLeast(0L)
         outputFile.parentFile?.mkdirs()
@@ -121,6 +144,7 @@ class BackupCrypto @Inject constructor(
                             input = input,
                             output = output,
                             onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                            cancelCheck = cancelCheck,
                         )
                     } else {
                         val key = vaultKey()
@@ -129,6 +153,7 @@ class BackupCrypto @Inject constructor(
                             input = input,
                             output = output,
                             onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                            cancelCheck = cancelCheck,
                         )
                     }
                 }
@@ -155,6 +180,7 @@ class BackupCrypto @Inject constructor(
         outputFile: File,
         passphrase: String? = null,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
+        cancelCheck: (() -> Boolean)? = null,
     ) {
         val total = inputFile.length().coerceAtLeast(0L)
         outputFile.parentFile?.mkdirs()
@@ -170,6 +196,7 @@ class BackupCrypto @Inject constructor(
                                 input = input,
                                 output = output,
                                 onBytesProcessed = progressCb,
+                                cancelCheck = cancelCheck,
                             )
                         }
                         EncryptedFileFormat.PASSPHRASE_TGE2 -> {
@@ -180,6 +207,7 @@ class BackupCrypto @Inject constructor(
                                 input = input,
                                 output = output,
                                 onBytesProcessed = progressCb,
+                                cancelCheck = cancelCheck,
                             )
                         }
                         EncryptedFileFormat.UNKNOWN -> {
@@ -255,6 +283,7 @@ class BackupCrypto @Inject constructor(
             chunkSize: Int = DEFAULT_CHUNK_SIZE,
             iterations: Int = PBKDF2_ITERATIONS,
             onBytesProcessed: ((Long) -> Unit)? = null,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             val salt = ByteArray(SALT_BYTES).also { SecureRandom().nextBytes(it) }
             val derivedKey = deriveKeyFromPassphrase(passphrase, salt, iterations)
@@ -269,6 +298,7 @@ class BackupCrypto @Inject constructor(
                     dos = dos,
                     chunkSize = chunkSize,
                     onBytesProcessed = onBytesProcessed,
+                    cancelCheck = cancelCheck,
                 )
                 dos.flush()
             } finally {
@@ -281,6 +311,7 @@ class BackupCrypto @Inject constructor(
             input: InputStream,
             output: OutputStream,
             onBytesProcessed: ((Long) -> Unit)? = null,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             val dis = DataInputStream(input)
             val magic = ByteArray(MAGIC_V2.size)
@@ -298,6 +329,7 @@ class BackupCrypto @Inject constructor(
                     dis = dis,
                     output = output,
                     onBytesProcessed = onBytesProcessed,
+                    cancelCheck = cancelCheck,
                 )
             } finally {
                 derivedKey.fill(0)
@@ -310,6 +342,7 @@ class BackupCrypto @Inject constructor(
             output: OutputStream,
             chunkSize: Int = DEFAULT_CHUNK_SIZE,
             onBytesProcessed: ((Long) -> Unit)? = null,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             val dos = DataOutputStream(output)
             dos.write(MAGIC)
@@ -319,6 +352,7 @@ class BackupCrypto @Inject constructor(
                 dos = dos,
                 chunkSize = chunkSize,
                 onBytesProcessed = onBytesProcessed,
+                cancelCheck = cancelCheck,
             )
             dos.flush()
         }
@@ -328,6 +362,7 @@ class BackupCrypto @Inject constructor(
             input: InputStream,
             output: OutputStream,
             onBytesProcessed: ((Long) -> Unit)? = null,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             val dis = DataInputStream(input)
             val magic = ByteArray(MAGIC.size)
@@ -340,6 +375,7 @@ class BackupCrypto @Inject constructor(
                 dis = dis,
                 output = output,
                 onBytesProcessed = onBytesProcessed,
+                cancelCheck = cancelCheck,
             )
         }
 
@@ -349,6 +385,7 @@ class BackupCrypto @Inject constructor(
             dos: DataOutputStream,
             chunkSize: Int,
             onBytesProcessed: ((Long) -> Unit)?,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             require(keyBytes.size == KEY_BYTES) { "Expected $KEY_BYTES-byte AES-256 key" }
             require(chunkSize in 1024..(4 * 1024 * 1024)) { "Invalid chunkSize: $chunkSize" }
@@ -362,6 +399,7 @@ class BackupCrypto @Inject constructor(
             var chunkIdx = 0L
             var totalRead = 0L
             while (true) {
+                if (cancelCheck?.invoke() == true) throw CancellationException("Encryption cancelled")
                 val read = readFullyUpTo(input, plainBuf)
                 if (read <= 0) break
                 writeChunk(dos, keySpec, baseIv, chunkIdx, FLAG_DATA, plainBuf, read)
@@ -378,6 +416,7 @@ class BackupCrypto @Inject constructor(
             dis: DataInputStream,
             output: OutputStream,
             onBytesProcessed: ((Long) -> Unit)?,
+            cancelCheck: (() -> Boolean)? = null,
         ) {
             require(keyBytes.size == KEY_BYTES) { "Expected $KEY_BYTES-byte AES-256 key" }
             val baseIv = ByteArray(IV_BYTES)
@@ -392,6 +431,7 @@ class BackupCrypto @Inject constructor(
             var totalWritten = 0L
             var sawEof = false
             while (!sawEof) {
+                if (cancelCheck?.invoke() == true) throw CancellationException("Decryption cancelled")
                 val flag = dis.readByte()
                 val cipherLen = dis.readInt()
                 if (cipherLen < TAG_BYTES || cipherLen > chunkSize + TAG_BYTES) {

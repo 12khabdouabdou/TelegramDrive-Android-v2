@@ -59,7 +59,9 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OfflinePin
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
@@ -158,6 +160,7 @@ fun FolderScreen(
     title: String = "",
     initialFilter: FileFilter? = null,
     onOpenVideo: (Long, Long) -> Unit,
+    onOpenLocalVideo: (String) -> Unit = {},
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
@@ -209,19 +212,28 @@ fun FolderScreen(
         val ev = decryptedOpenEvent ?: return@LaunchedEffect
         vm.clearDecryptedOpenEvent()
         val file = ev.outcome.file
-        if (ev.outcome.mimeType.startsWith("image/", ignoreCase = true)) {
-            decryptedImageViewerPath = file.absolutePath
-        } else {
-            try {
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, ev.outcome.mimeType)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val ext = file.extension.lowercase()
+        val isVideo = ev.outcome.mimeType.startsWith("video/", ignoreCase = true) ||
+            ext in setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
+        when {
+            ev.outcome.mimeType.startsWith("image/", ignoreCase = true) -> {
+                decryptedImageViewerPath = file.absolutePath
+            }
+            isVideo -> {
+                onOpenLocalVideo(file.absolutePath)
+            }
+            else -> {
+                try {
+                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, ev.outcome.mimeType)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                } catch (t: Throwable) {
+                    Log.w("FolderScreen: failed opening decrypted file", t)
+                    vm.showSnackbar(noAppMsg)
                 }
-                context.startActivity(intent)
-            } catch (t: Throwable) {
-                Log.w("FolderScreen: failed opening decrypted file", t)
-                vm.showSnackbar(noAppMsg)
             }
         }
     }
@@ -504,6 +516,8 @@ fun FolderScreen(
             if (state.uploads.isNotEmpty()) {
                 UploadsStrip(
                     uploads = state.uploads,
+                    onPause = vm::pauseUpload,
+                    onResume = vm::resumeUpload,
                     onCancel = vm::cancelUpload,
                     onRetry = vm::retryUpload,
                     onClear = vm::clearFinishedUploads,
@@ -764,12 +778,14 @@ fun FolderScreen(
 @Composable
 private fun UploadsStrip(
     uploads: List<UploadItem>,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
     onCancel: (String) -> Unit,
     onRetry: (String) -> Unit,
     onClear: () -> Unit,
 ) {
     val ordered = remember(uploads) {
-        uploads.sortedBy { if (it.status.isActive) 0 else 1 }
+        uploads.sortedBy { if (it.status.isInQueue) 0 else 1 }
     }
     val hasFinished = uploads.any { !it.status.isActive }
 
@@ -883,6 +899,7 @@ private fun UploadsStrip(
                         UploadStatus.PACKING -> stringResource(R.string.browser_upload_packing)
                         UploadStatus.ENCRYPTING -> stringResource(R.string.browser_upload_encrypting)
                         UploadStatus.UPLOADING -> "${(u.progress * 100).toInt()}%"
+                        UploadStatus.PAUSED -> stringResource(R.string.browser_upload_paused)
                         UploadStatus.DONE -> stringResource(R.string.browser_upload_done)
                         UploadStatus.FAILED -> stringResource(R.string.browser_upload_failed)
                         UploadStatus.CANCELLED -> stringResource(R.string.browser_upload_cancelled)
@@ -891,12 +908,37 @@ private fun UploadsStrip(
                     color = tint,
                     fontWeight = FontWeight.Bold,
                 )
-                if (u.status.isActive && u.canCancel) {
+                if (u.status.isActive) {
+                    IconButton(onClick = { onPause(u.id) }, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Filled.Pause,
+                            contentDescription = stringResource(R.string.browser_upload_pause),
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                     IconButton(onClick = { onCancel(u.id) }, modifier = Modifier.size(28.dp)) {
                         Icon(
                             Icons.Filled.Close,
-                            contentDescription = stringResource(R.string.browser_upload_cancel),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            contentDescription = stringResource(R.string.browser_upload_stop),
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                } else if (u.status == UploadStatus.PAUSED) {
+                    IconButton(onClick = { onResume(u.id) }, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = stringResource(R.string.browser_upload_resume),
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                    IconButton(onClick = { onCancel(u.id) }, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.browser_upload_stop),
+                            tint = MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(16.dp),
                         )
                     }

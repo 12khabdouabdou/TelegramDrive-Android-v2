@@ -95,6 +95,7 @@ fun MainBottomNav(
     rootVm: RootViewModel,
     mainNav: NavHostController,
     onOpenVideo: (Long, Long) -> Unit,
+    onOpenLocalVideo: (String) -> Unit = {},
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
@@ -249,7 +250,11 @@ fun MainBottomNav(
                 )
             }
             composable(Tab.TRANSFERS.route) {
-                DownloadListScreen(showBack = false, onBack = { nav.popBackStack() })
+                DownloadListScreen(
+                    showBack = false,
+                    onBack = { nav.popBackStack() },
+                    onOpenLocalVideo = onOpenLocalVideo,
+                )
             }
             composable(Tab.FOLDERS.route) {
                 FoldersManagementScreen(
@@ -331,6 +336,7 @@ fun MainBottomNav(
                     title = title,
                     initialFilter = initialFilter,
                     onOpenVideo = onOpenVideo,
+                    onOpenLocalVideo = onOpenLocalVideo,
                     onOpenImage = onOpenImage,
                     onOpenPdf = onOpenPdf,
                     onOpenZip = onOpenZip,

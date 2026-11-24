@@ -131,6 +131,12 @@
             android:enabled="true"
             android:exported="false" />
 
+        <!-- Transfer action receiver (active upload/download notification controls) -->
+        <receiver
+            android:name="com.tgdrive.core.download.TransferActionReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
         <!-- DocumentsProvider — lets other apps browse TelegramDrive files
              via the system Storage Access Framework (SAF). -->
         <provider

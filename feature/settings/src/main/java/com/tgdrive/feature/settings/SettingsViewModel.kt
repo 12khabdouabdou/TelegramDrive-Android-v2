@@ -20,6 +20,7 @@ import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
@@ -49,12 +50,17 @@ data class SettingsUiState(
     val isEncryptionAvailable: Boolean = true,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
+    val backupEncryptAll: Boolean = false,
+    val backupUseCustomPassphrase: Boolean = false,
+    val hasCustomPassphrase: Boolean = false,
+    val vaultKeyFingerprint: String = "",
 )
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val preferences: AppPreferences,
     private val keystore: KeystoreHelper,
+    private val backupCrypto: BackupCrypto,
     private val biometricHelper: BiometricHelper,
     private val telegramClient: TelegramClient,
     private val downloadManager: DownloadManager,
@@ -73,15 +79,18 @@ class SettingsViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val _credsVersion = MutableStateFlow(0)
+    private val _vaultVersion = MutableStateFlow(0)
     private val _clearingCache = MutableStateFlow(false)
 
     val state: StateFlow<SettingsUiState> = combine(
         preferences.data,
         _credsVersion,
+        _vaultVersion,
         _clearingCache,
         cloudSyncManager.syncing,
-    ) { p, _, clearing, syncing ->
+    ) { p, _, _, clearing, syncing ->
         val creds = keystore.getApiCreds()
+        val fingerprint = runCatching { backupCrypto.vaultKeyFingerprint() }.getOrDefault("")
         SettingsUiState(
             themeMode = p.themeMode,
             cacheLimitBytes = p.cacheLimitBytes,
@@ -92,6 +101,10 @@ class SettingsViewModel @Inject constructor(
             isEncryptionAvailable = keystore.isEncryptionAvailable,
             cloudSyncing = syncing,
             lastCloudSyncMs = p.lastCloudSyncMs,
+            backupEncryptAll = p.backupEncryptAll,
+            backupUseCustomPassphrase = p.backupUseCustomPassphrase,
+            hasCustomPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+            vaultKeyFingerprint = fingerprint,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -134,6 +147,47 @@ class SettingsViewModel @Inject constructor(
     fun saveApiCreds(id: String, hash: String) {
         keystore.saveApiCreds(id, hash)
         _credsVersion.value += 1
+    }
+
+    fun setBackupEncryptAll(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(backupEncryptAll = enabled) }
+        }
+    }
+
+    fun saveBackupPassphrase(passphrase: String) {
+        val clean = passphrase.trim()
+        if (clean.length < 4) return
+        viewModelScope.launch(dispatchers.io) {
+            backupCrypto.setCustomBackupPassphrase(clean)
+            preferences.update { it.copy(backupUseCustomPassphrase = true) }
+            _vaultVersion.value += 1
+        }
+    }
+
+    fun clearBackupPassphrase() {
+        viewModelScope.launch(dispatchers.io) {
+            backupCrypto.setCustomBackupPassphrase(null)
+            preferences.update { it.copy(backupUseCustomPassphrase = false) }
+            _vaultVersion.value += 1
+        }
+    }
+
+    fun exportVaultKey(): String = backupCrypto.exportVaultKeyBase64()
+
+    fun importVaultKey(encoded: String): Boolean {
+        val ok = backupCrypto.importVaultKeyBase64(encoded)
+        if (ok) _vaultVersion.value += 1
+        return ok
+    }
+
+    suspend fun clearDecryptedTempFiles(): Int = withContext(dispatchers.io) {
+        val dir = File(appContext.cacheDir, "decrypted")
+        if (!dir.isDirectory) return@withContext 0
+        val children = dir.listFiles().orEmpty()
+        var removed = 0
+        children.forEach { child -> if (child.deleteRecursively()) removed++ }
+        removed
     }
 
     fun syncNow() {
@@ -209,6 +263,8 @@ class SettingsViewModel @Inject constructor(
                             backupStrictMode = false,
                             backupDeleteAfterUpload = false,
                             backupZipIncremental = false,
+                            backupEncryptAll = false,
+                            backupUseCustomPassphrase = false,
                             backupFolderTargetsJson = "{}",
                             recentSearchQueries = "",
                             lastCloudSyncMs = 0L,
@@ -219,7 +275,7 @@ class SettingsViewModel @Inject constructor(
                 }
 
                 // 5. Purge all local cache / staging directories.
-                for (dirName in listOf("backup_staging", "upload_staging", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs")) {
+                for (dirName in listOf("backup_staging", "upload_staging", "decrypted", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs")) {
                     try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
                 }
 
