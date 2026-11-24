@@ -60,6 +60,8 @@ data class HomeUiState(
     val recentFiles: List<FileCacheEntity> = emptyList(),
     val starredFiles: List<FileCacheEntity> = emptyList(),
     val trashCount: Int = 0,
+    val encryptedVaultCount: Int = 0,
+    val manualUploadWifiOnly: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
 )
@@ -73,6 +75,8 @@ private data class HomeDashboardStats(
     val recentFiles: List<FileCacheEntity> = emptyList(),
     val starredFiles: List<FileCacheEntity> = emptyList(),
     val trashCount: Int = 0,
+    val encryptedVaultCount: Int = 0,
+    val manualUploadWifiOnly: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
 )
@@ -116,8 +120,12 @@ class HomeViewModel
                 combine(_loading, _error, _savedChatId, _dashboard) { loading, error, savedId, dash ->
                     Triple(loading to error, savedId, dash)
                 },
-                combine(trashEntryDao.observeCount(), cloudSyncManager.syncing) { trash, syncing -> trash to syncing },
-            ) { (folders, prefs), (loadErr, savedId, dash), (trashCount, syncing) ->
+                combine(
+                    trashEntryDao.observeCount(),
+                    fileCacheDao.observeEncryptedVaultCount(),
+                    cloudSyncManager.syncing,
+                ) { trash, vaultCount, syncing -> Triple(trash, vaultCount, syncing) },
+            ) { (folders, prefs), (loadErr, savedId, dash), (trashCount, vaultCount, syncing) ->
                 HomeUiState(
                     folders = folders,
                     savedMessagesChatId = savedId,
@@ -132,6 +140,8 @@ class HomeViewModel
                     recentFiles = dash.recentFiles,
                     starredFiles = dash.starredFiles,
                     trashCount = trashCount,
+                    encryptedVaultCount = vaultCount,
+                    manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                     cloudSyncing = syncing,
                     lastCloudSyncMs = prefs.lastCloudSyncMs,
                 )
@@ -490,6 +500,7 @@ class HomeViewModel
                                 useVaultKey = action.options.useVaultKey,
                                 customPassphrase = action.options.password,
                             ),
+                            wifiOnly = action.options.wifiOnly,
                         ),
                     )
                     _snackbar.value = "Packing ${action.files.size} file(s) into ${action.options.name}.zip"
@@ -568,6 +579,7 @@ class HomeViewModel
                         useVaultKey = options.useVaultKey,
                         customPassphrase = options.password,
                     ),
+                    wifiOnly = options.wifiOnly,
                 ),
             )
             _snackbar.value = "Archiving ${options.name}.zip in background"

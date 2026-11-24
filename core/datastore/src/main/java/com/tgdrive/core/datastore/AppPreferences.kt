@@ -94,6 +94,8 @@ data class AppPreferencesData(
     val backupScheduleHour: Int = 2,
     val backupScheduleMinute: Int = 0,
     val backupSyncIndexRestored: Boolean = false,
+    val decryptedTempTtlMinutes: Int = 30,
+    val manualUploadWifiOnly: Boolean = false,
 ) {
     fun isFolderEncrypted(folderUri: String): Boolean =
         backupEncryptAll || (folderUri in backupEncryptedFolderUris)
@@ -227,6 +229,8 @@ class AppPreferences @Inject constructor(
         val BACKUP_SCHEDULE_HOUR = intPreferencesKey("backup_schedule_hour")
         val BACKUP_SCHEDULE_MINUTE = intPreferencesKey("backup_schedule_minute")
         val BACKUP_SYNC_INDEX_RESTORED = booleanPreferencesKey("backup_sync_index_restored")
+        val DECRYPTED_TEMP_TTL_MINUTES = intPreferencesKey("decrypted_temp_ttl_minutes")
+        val MANUAL_UPLOAD_WIFI_ONLY = booleanPreferencesKey("manual_upload_wifi_only")
     }
 
     /**
@@ -309,6 +313,8 @@ class AppPreferences @Inject constructor(
             backupScheduleHour = (get(Keys.BACKUP_SCHEDULE_HOUR) ?: 2).coerceIn(0, 23),
             backupScheduleMinute = (get(Keys.BACKUP_SCHEDULE_MINUTE) ?: 0).coerceIn(0, 59),
             backupSyncIndexRestored = get(Keys.BACKUP_SYNC_INDEX_RESTORED) ?: false,
+            decryptedTempTtlMinutes = get(Keys.DECRYPTED_TEMP_TTL_MINUTES) ?: 30,
+            manualUploadWifiOnly = get(Keys.MANUAL_UPLOAD_WIFI_ONLY) ?: false,
         )
     }
 
@@ -360,5 +366,7 @@ class AppPreferences @Inject constructor(
         this[Keys.BACKUP_SCHEDULE_HOUR] = d.backupScheduleHour
         this[Keys.BACKUP_SCHEDULE_MINUTE] = d.backupScheduleMinute
         this[Keys.BACKUP_SYNC_INDEX_RESTORED] = d.backupSyncIndexRestored
+        this[Keys.DECRYPTED_TEMP_TTL_MINUTES] = d.decryptedTempTtlMinutes
+        this[Keys.MANUAL_UPLOAD_WIFI_ONLY] = d.manualUploadWifiOnly
     }
 }

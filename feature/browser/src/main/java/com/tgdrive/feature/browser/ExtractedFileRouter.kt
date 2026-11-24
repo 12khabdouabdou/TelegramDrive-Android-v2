@@ -1,15 +1,39 @@
 package com.tgdrive.feature.browser
 
+import com.tgdrive.core.common.isTextPreviewable
+
 /**
- * Route for a file extracted from a ZIP archive.
+ * Route for a file extracted from a ZIP archive or decrypted locally.
  *
- * - [ImageView] → open in-app via [com.tgdrive.feature.player.ImageViewer]
- *   (better UX than external gallery: zoom + pan + swipe-to-dismiss)
- * - [External] → open via [android.content.Intent.ACTION_VIEW] + FileProvider
+ * - [ImageView] -> in-app zoomable image viewer
+ * - [VideoView] -> in-app Media3 ExoPlayer video player
+ * - [AudioPlay] -> in-app Media3 ExoPlayer persistent audio player bar
+ * - [PdfView] -> in-app PdfRenderer viewer
+ * - [TextView] -> in-app text/code/log viewer
+ * - [External] -> fallback via [android.content.Intent.ACTION_VIEW] + FileProvider
  */
 sealed interface ExtractedFileRoute {
     data class ImageView(
         val localPath: String,
+    ) : ExtractedFileRoute
+
+    data class VideoView(
+        val localPath: String,
+    ) : ExtractedFileRoute
+
+    data class AudioPlay(
+        val localPath: String,
+        val fileName: String,
+    ) : ExtractedFileRoute
+
+    data class PdfView(
+        val localPath: String,
+        val fileName: String,
+    ) : ExtractedFileRoute
+
+    data class TextView(
+        val localPath: String,
+        val fileName: String,
     ) : ExtractedFileRoute
 
     data class External(
@@ -19,15 +43,11 @@ sealed interface ExtractedFileRoute {
 }
 
 private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "heif", "avif")
+private val VIDEO_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
+private val AUDIO_EXTS = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff")
 
 /**
- * Decide how to open a file extracted from a ZIP.
- *
- * Images go through the in-app [com.tgdrive.feature.player.ImageViewer] so
- * the user stays inside TelegramDrive (zoom/pan/swipe-to-dismiss). All
- * other types (videos, PDFs, audio, docs) go through [android.content.Intent.ACTION_VIEW]
- * with the appropriate MIME type — external apps handle these well, and
- * building a separate in-app viewer for each would duplicate the OS's job.
+ * Decide how to open a file extracted from a ZIP or decrypted locally.
  *
  * Extension matching is case-insensitive.
  */
@@ -38,6 +58,10 @@ fun routeForExtractedFile(
     val ext = fileName.substringAfterLast('.', "").lowercase()
     return when {
         ext in IMAGE_EXTS -> ExtractedFileRoute.ImageView(localPath)
+        ext in VIDEO_EXTS -> ExtractedFileRoute.VideoView(localPath)
+        ext in AUDIO_EXTS -> ExtractedFileRoute.AudioPlay(localPath, fileName)
+        ext == "pdf" -> ExtractedFileRoute.PdfView(localPath, fileName)
+        isTextPreviewable(null, fileName) -> ExtractedFileRoute.TextView(localPath, fileName)
         else -> ExtractedFileRoute.External(localPath, guessMimeFromName(fileName))
     }
 }

@@ -127,6 +127,10 @@ fun ZipBrowserScreen(
     onBack: () -> Unit,
     chatId: Long = 0L,
     initialEntryPath: String = "",
+    onOpenLocalVideo: (String) -> Unit = {},
+    onOpenLocalPdf: (String, String) -> Unit = { _, _ -> },
+    onOpenLocalText: (String, String) -> Unit = { _, _ -> },
+    onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     vm: ZipBrowserViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -206,6 +210,10 @@ fun ZipBrowserScreen(
         val file = File(path)
         when (val route = routeForExtractedFile(file.name, path)) {
             is ExtractedFileRoute.ImageView -> imageViewerPath = route.localPath
+            is ExtractedFileRoute.VideoView -> onOpenLocalVideo(route.localPath)
+            is ExtractedFileRoute.AudioPlay -> onPlayLocalAudio(route.localPath, route.fileName)
+            is ExtractedFileRoute.PdfView -> onOpenLocalPdf(route.localPath, route.fileName)
+            is ExtractedFileRoute.TextView -> onOpenLocalText(route.localPath, route.fileName)
             is ExtractedFileRoute.External -> {
                 if (!openExternal(context, file, route.mimeType)) {
                     scope.launch { snackbarHostState.showSnackbar(noViewerMsg) }

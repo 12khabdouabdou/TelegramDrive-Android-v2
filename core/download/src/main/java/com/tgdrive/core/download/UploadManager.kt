@@ -14,9 +14,13 @@ import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.db.entity.PendingUploadEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.EncryptedFileFormat
@@ -24,12 +28,14 @@ import com.tgdrive.core.security.WrongPassphraseException
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.UploadResult
 import com.tgdrive.core.zip.UploadedZipPartRecord
+import com.tgdrive.core.zip.ZipCompressionMode
 import com.tgdrive.core.zip.ZipExcludeMatcher
 import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -41,10 +47,13 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -72,9 +81,12 @@ class UploadManager @Inject constructor(
     private val telegramClient: TelegramClient,
     private val fileCacheDao: FileCacheDao,
     private val zipEntryDao: ZipEntryDao,
+    private val pendingUploadDao: PendingUploadDao,
     private val mediaThumbnailCache: MediaThumbnailCache,
     private val uploadTracker: UploadTracker,
     private val backupCrypto: BackupCrypto,
+    private val appPreferences: AppPreferences,
+    private val networkMonitor: NetworkMonitor,
     private val dispatchers: DispatchersProvider,
 ) {
     private sealed interface RetrySpec {
@@ -106,6 +118,7 @@ class UploadManager @Inject constructor(
     private val retrySpecs = ConcurrentHashMap<String, RetrySpec>()
     private val pausedIds = ConcurrentHashMap.newKeySet<String>()
     private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
+    private val waitingForWifiIds = ConcurrentHashMap.newKeySet<String>()
 
     val uploads: StateFlow<UploadQueueState> = uploadTracker.state
 
@@ -114,6 +127,8 @@ class UploadManager @Inject constructor(
 
     init {
         scope.launch { purgeStaleStaging() }
+        scope.launch { restorePendingUploads() }
+        observeNetworkForWifiQueue()
     }
 
     suspend fun resolveFileItems(uris: List<Uri>): List<UploadFileItem> = withContext(dispatchers.io) {
@@ -195,6 +210,20 @@ class UploadManager @Inject constructor(
                 val jobs = preparedIds.mapNotNull { (id, file) ->
                     val spec = RetrySpec.SingleFile(resolvedChatId, file, options)
                     retrySpecs[id] = spec
+                    val shownName = if (options.encryption.enabled) {
+                        "${sanitizeLeafName(file.displayName)}.tgenc"
+                    } else {
+                        sanitizeLeafName(file.displayName)
+                    }
+                    if (id !in cancelledIds) {
+                        persistPendingSpec(
+                            id = id,
+                            spec = spec,
+                            displayName = shownName,
+                            totalBytes = file.sizeBytes,
+                            status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
+                        )
+                    }
                     if (id in cancelledIds || id in pausedIds) return@mapNotNull null
                     val job = async {
                         executeSingleFileTask(id, spec, claimedNames, existingRows)
@@ -260,6 +289,20 @@ class UploadManager @Inject constructor(
                 }
 
                 val jobs = prepared.mapNotNull { (id, spec) ->
+                    val shownName = if (options.encryption.enabled) {
+                        "${sanitizeLeafName(spec.file.displayName)}.tgenc"
+                    } else {
+                        sanitizeLeafName(spec.file.displayName)
+                    }
+                    if (id !in cancelledIds) {
+                        persistPendingSpec(
+                            id = id,
+                            spec = spec,
+                            displayName = shownName,
+                            totalBytes = spec.file.sizeBytes,
+                            status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
+                        )
+                    }
                     if (id in cancelledIds || id in pausedIds) return@mapNotNull null
                     val job = async {
                         executeSingleFileTask(id, spec, claimedNames, existingRows)
@@ -298,6 +341,15 @@ class UploadManager @Inject constructor(
             isEncrypted = request.encryption.enabled,
         )
         val job = scope.launch {
+            if (id !in cancelledIds) {
+                persistPendingSpec(
+                    id = id,
+                    spec = spec,
+                    displayName = "$safeBase.zip",
+                    totalBytes = 0L,
+                    status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.PACKING.name,
+                )
+            }
             executeZipTask(id, spec)
         }
         activeJobs[id] = job
@@ -314,16 +366,26 @@ class UploadManager @Inject constructor(
         cancelledIds.remove(id)
         val spec = RetrySpec.UrisZip(files, request.copy(baseName = safeBase))
         retrySpecs[id] = spec
+        val totalZipBytes = files.sumOf { it.sizeBytes.coerceAtLeast(0L) }
         uploadTracker.start(
             id = id,
             fileName = "$safeBase.zip",
-            totalBytes = files.sumOf { it.sizeBytes.coerceAtLeast(0L) },
+            totalBytes = totalZipBytes,
             chatId = request.chatId,
             status = UploadStatus.PACKING,
             statusDetail = if (request.encryption.enabled) "Packing & encrypting ${files.size} file(s)…" else "Packing ${files.size} file(s)…",
             isEncrypted = request.encryption.enabled,
         )
         val job = scope.launch {
+            if (id !in cancelledIds) {
+                persistPendingSpec(
+                    id = id,
+                    spec = spec,
+                    displayName = "$safeBase.zip",
+                    totalBytes = totalZipBytes,
+                    status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.PACKING.name,
+                )
+            }
             executeZipTask(id, spec)
         }
         activeJobs[id] = job
@@ -332,22 +394,27 @@ class UploadManager @Inject constructor(
 
     fun pause(uploadId: String) {
         cancelledIds.remove(uploadId)
+        waitingForWifiIds.remove(uploadId)
         pausedIds.add(uploadId)
         activeJobs.remove(uploadId)?.cancel()
         uploadTracker.markPaused(uploadId)
+        scope.launch { runCatching { pendingUploadDao.updateStatus(uploadId, UploadStatus.PAUSED.name) } }
     }
 
     fun resume(uploadId: String) {
+        waitingForWifiIds.remove(uploadId)
         pausedIds.remove(uploadId)
         cancelledIds.remove(uploadId)
         retry(uploadId)
     }
 
     fun cancel(uploadId: String) {
+        waitingForWifiIds.remove(uploadId)
         pausedIds.remove(uploadId)
         cancelledIds.add(uploadId)
         activeJobs.remove(uploadId)?.cancel()
         uploadTracker.markCancelled(uploadId)
+        scope.launch { runCatching { pendingUploadDao.deleteById(uploadId) } }
     }
 
     fun pauseAll() {
@@ -367,6 +434,7 @@ class UploadManager @Inject constructor(
     fun retry(uploadId: String) {
         val spec = retrySpecs[uploadId] ?: return
         if (activeJobs[uploadId]?.isActive == true) return
+        waitingForWifiIds.remove(uploadId)
         pausedIds.remove(uploadId)
         cancelledIds.remove(uploadId)
         when (spec) {
@@ -386,9 +454,11 @@ class UploadManager @Inject constructor(
                     isEncrypted = spec.options.encryption.enabled,
                 )
                 val job = scope.launch {
+                    runCatching { pendingUploadDao.updateStatus(uploadId, UploadStatus.QUEUED.name) }
                     val targetChat = resolveChatId(spec.chatId)
                     if (targetChat == 0L) {
                         uploadTracker.markFailed(uploadId, "Telegram session not ready", canRetry = true)
+                        runCatching { pendingUploadDao.updateStatus(uploadId, UploadStatus.FAILED.name) }
                         return@launch
                     }
                     val resolvedSpec = spec.copy(chatId = targetChat)
@@ -412,7 +482,10 @@ class UploadManager @Inject constructor(
                     status = UploadStatus.PACKING,
                     isEncrypted = spec.request.encryption.enabled,
                 )
-                val job = scope.launch { executeZipTask(uploadId, spec) }
+                val job = scope.launch {
+                    runCatching { pendingUploadDao.updateStatus(uploadId, UploadStatus.PACKING.name) }
+                    executeZipTask(uploadId, spec)
+                }
                 activeJobs[uploadId] = job
             }
             is RetrySpec.UrisZip -> {
@@ -424,7 +497,10 @@ class UploadManager @Inject constructor(
                     status = UploadStatus.PACKING,
                     isEncrypted = spec.request.encryption.enabled,
                 )
-                val job = scope.launch { executeZipTask(uploadId, spec) }
+                val job = scope.launch {
+                    runCatching { pendingUploadDao.updateStatus(uploadId, UploadStatus.PACKING.name) }
+                    executeZipTask(uploadId, spec)
+                }
                 activeJobs[uploadId] = job
             }
         }
@@ -497,10 +573,24 @@ class UploadManager @Inject constructor(
     ): Boolean {
         if (id in cancelledIds) {
             uploadTracker.markCancelled(id)
+            withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
             return false
         }
         if (id in pausedIds) {
-            uploadTracker.markPaused(id)
+            val isWifiWait = id in waitingForWifiIds
+            uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+            withContext(NonCancellable) {
+                runCatching {
+                    pendingUploadDao.updateStatus(
+                        id,
+                        if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                    )
+                }
+            }
+            return false
+        }
+        if (shouldDeferForWifi(spec.options.wifiOnly)) {
+            markWaitingForWifi(id)
             return false
         }
         val chatId = spec.chatId
@@ -524,6 +614,8 @@ class UploadManager @Inject constructor(
             UploadConflictStrategy.SKIP -> {
                 if (existingMatch != null) {
                     uploadTracker.completeUpload(id, detail = "Already exists — skipped")
+                    waitingForWifiIds.remove(id)
+                    withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                     activeJobs.remove(id)
                     return false
                 }
@@ -545,10 +637,24 @@ class UploadManager @Inject constructor(
         return semaphore.withPermit {
             if (id in cancelledIds) {
                 uploadTracker.markCancelled(id)
+                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 return@withPermit false
             }
             if (id in pausedIds) {
-                uploadTracker.markPaused(id)
+                val isWifiWait = id in waitingForWifiIds
+                uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                withContext(NonCancellable) {
+                    runCatching {
+                        pendingUploadDao.updateStatus(
+                            id,
+                            if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                        )
+                    }
+                }
+                return@withPermit false
+            }
+            if (shouldDeferForWifi(options.wifiOnly)) {
+                markWaitingForWifi(id)
                 return@withPermit false
             }
             val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
@@ -583,7 +689,7 @@ class UploadManager @Inject constructor(
                         uploadTracker.markFailed(id, "File exceeds $limitGb GB limit", canRetry = false)
                         return@withPermit false
                     }
-                    return@withPermit uploadOversizedSingleFileSplit(
+                    val splitOk = uploadOversizedSingleFileSplit(
                         id = id,
                         chatId = chatId,
                         sourceFile = tempRaw,
@@ -594,6 +700,23 @@ class UploadManager @Inject constructor(
                         captureDateMs = captureDateMs,
                         stagingDir = stagingDir,
                     )
+                    if (splitOk) {
+                        waitingForWifiIds.remove(id)
+                        withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
+                    }
+                    return@withPermit splitOk
+                }
+
+                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled && options.encryption.useVaultKey) {
+                    runCatching {
+                        mediaThumbnailCache.buildEncryptedThumbnailBytes(
+                            localPath = tempRaw.absolutePath,
+                            mimeType = item.mimeType.ifBlank { guessMimeType(rawName) },
+                            originalFileName = rawName,
+                        )
+                    }.getOrNull()
+                } else {
+                    null
                 }
 
                 var fileToUpload = tempRaw
@@ -649,7 +772,17 @@ class UploadManager @Inject constructor(
                 )
 
                 val thumbPath = if (options.encryption.enabled) {
-                    null
+                    if (encryptedThumbBytes != null) {
+                        runCatching {
+                            mediaThumbnailCache.saveEncryptedThumbnailBytes(
+                                chatId = chatId,
+                                messageId = uploadResult.messageId,
+                                encryptedBytes = encryptedThumbBytes,
+                            )
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
                 } else {
                     runCatching {
                         mediaThumbnailCache.generateFromLocalFile(
@@ -685,18 +818,35 @@ class UploadManager @Inject constructor(
                     runCatching { fileCacheDao.deleteById(chatId, existingMatch.messageId) }
                 }
 
+                waitingForWifiIds.remove(id)
                 uploadTracker.completeUpload(id)
+                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 true
             } catch (e: CancellationException) {
+                val isWifiWait = id in waitingForWifiIds
                 if (id in pausedIds) {
-                    uploadTracker.markPaused(id)
+                    uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                    withContext(NonCancellable) {
+                        runCatching {
+                            pendingUploadDao.updateStatus(
+                                id,
+                                if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                            )
+                        }
+                    }
                 } else {
+                    waitingForWifiIds.remove(id)
                     uploadTracker.markCancelled(id)
+                    withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 }
                 throw e
             } catch (t: Throwable) {
                 Log.w("UploadManager: single file upload failed for '$targetName'", t)
+                waitingForWifiIds.remove(id)
                 uploadTracker.markFailed(id, t.message ?: "Upload failed", canRetry = true)
+                withContext(NonCancellable) {
+                    runCatching { pendingUploadDao.updateStatus(id, UploadStatus.FAILED.name) }
+                }
                 false
             } finally {
                 activeJobs.remove(id)
@@ -793,32 +943,60 @@ class UploadManager @Inject constructor(
         id: String,
         spec: RetrySpec,
     ) {
+        val request = when (spec) {
+            is RetrySpec.FolderZip -> spec.request
+            is RetrySpec.UrisZip -> spec.request
+            else -> return
+        }
         if (id in cancelledIds) {
             uploadTracker.markCancelled(id)
+            withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
             return
         }
         if (id in pausedIds) {
-            uploadTracker.markPaused(id)
+            val isWifiWait = id in waitingForWifiIds
+            uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+            withContext(NonCancellable) {
+                runCatching {
+                    pendingUploadDao.updateStatus(
+                        id,
+                        if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                    )
+                }
+            }
+            return
+        }
+        if (shouldDeferForWifi(request.wifiOnly)) {
+            markWaitingForWifi(id)
             return
         }
         heavyJobSemaphore.withPermit {
             if (id in cancelledIds) {
                 uploadTracker.markCancelled(id)
+                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 return@withPermit
             }
             if (id in pausedIds) {
-                uploadTracker.markPaused(id)
+                val isWifiWait = id in waitingForWifiIds
+                uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                withContext(NonCancellable) {
+                    runCatching {
+                        pendingUploadDao.updateStatus(
+                            id,
+                            if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                        )
+                    }
+                }
+                return@withPermit
+            }
+            if (shouldDeferForWifi(request.wifiOnly)) {
+                markWaitingForWifi(id)
                 return@withPermit
             }
             val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
             val zipWorkDir = File(stagingDir, "zip_${id.take(18)}").apply { mkdirs() }
             var manifestFile: File? = null
             try {
-                val request = when (spec) {
-                    is RetrySpec.FolderZip -> spec.request
-                    is RetrySpec.UrisZip -> spec.request
-                    else -> return@withPermit
-                }
                 val chatId = resolveChatId(request.chatId)
                 if (chatId == 0L) {
                     uploadTracker.markFailed(id, "Telegram session not ready", canRetry = true)
@@ -963,22 +1141,39 @@ class UploadManager @Inject constructor(
                 } else {
                     uploadedParts.first().fileName
                 }
+                waitingForWifiIds.remove(id)
                 uploadTracker.updatePhase(id, UploadStatus.DONE, fileName = summaryLabel)
                 uploadTracker.completeUpload(
                     id = id,
                     detail = "${summary.totalFilesProcessed} files archived",
                 )
+                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 _completedChatEvents.tryEmit(chatId)
             } catch (e: CancellationException) {
+                val isWifiWait = id in waitingForWifiIds
                 if (id in pausedIds) {
-                    uploadTracker.markPaused(id)
+                    uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                    withContext(NonCancellable) {
+                        runCatching {
+                            pendingUploadDao.updateStatus(
+                                id,
+                                if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                            )
+                        }
+                    }
                 } else {
+                    waitingForWifiIds.remove(id)
                     uploadTracker.markCancelled(id)
+                    withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 }
                 throw e
             } catch (t: Throwable) {
                 Log.w("UploadManager: ZIP upload failed", t)
+                waitingForWifiIds.remove(id)
                 uploadTracker.markFailed(id, t.message ?: "ZIP upload failed", canRetry = true)
+                withContext(NonCancellable) {
+                    runCatching { pendingUploadDao.updateStatus(id, UploadStatus.FAILED.name) }
+                }
             } finally {
                 activeJobs.remove(id)
                 runCatching { manifestFile?.delete() }
@@ -1374,6 +1569,387 @@ class UploadManager @Inject constructor(
         }.getOrNull()
     }
 
+    private suspend fun shouldDeferForWifi(specWifiOnly: Boolean): Boolean {
+        val globalWifiOnly = runCatching { appPreferences.data.first().manualUploadWifiOnly }.getOrDefault(false)
+        if (!specWifiOnly && !globalWifiOnly) return false
+        return !networkMonitor.isCurrentlyUnmetered()
+    }
+
+    private suspend fun markWaitingForWifi(id: String) {
+        waitingForWifiIds.add(id)
+        pausedIds.add(id)
+        activeJobs.remove(id)
+        uploadTracker.markPaused(id, detail = "Waiting for Wi-Fi…")
+        withContext(NonCancellable) {
+            runCatching { pendingUploadDao.updateStatus(id, STATUS_WAITING_WIFI) }
+        }
+    }
+
+    private suspend fun deferForWifi(id: String) {
+        cancelledIds.remove(id)
+        waitingForWifiIds.add(id)
+        pausedIds.add(id)
+        activeJobs.remove(id)?.cancel()
+        uploadTracker.markPaused(id, detail = "Waiting for Wi-Fi…")
+        withContext(NonCancellable) {
+            runCatching { pendingUploadDao.updateStatus(id, STATUS_WAITING_WIFI) }
+        }
+    }
+
+    private fun observeNetworkForWifiQueue() {
+        scope.launch {
+            networkMonitor.isUnmetered.collect { unmetered ->
+                if (unmetered) {
+                    if (waitingForWifiIds.isNotEmpty()) {
+                        val toResume = waitingForWifiIds.toList()
+                        toResume.forEach { id ->
+                            waitingForWifiIds.remove(id)
+                            pausedIds.remove(id)
+                            retry(id)
+                        }
+                    }
+                } else {
+                    val globalWifiOnly = runCatching {
+                        appPreferences.data.first().manualUploadWifiOnly
+                    }.getOrDefault(false)
+                    uploads.value.items
+                        .filter { it.status.isActive }
+                        .forEach { item ->
+                            val specWifiOnly = when (val spec = retrySpecs[item.id]) {
+                                is RetrySpec.SingleFile -> spec.options.wifiOnly
+                                is RetrySpec.FolderZip -> spec.request.wifiOnly
+                                is RetrySpec.UrisZip -> spec.request.wifiOnly
+                                null -> false
+                            }
+                            if (specWifiOnly || globalWifiOnly) {
+                                deferForWifi(item.id)
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    private suspend fun restorePendingUploads() {
+        val rows = runCatching { pendingUploadDao.getAll() }.getOrDefault(emptyList())
+        if (rows.isEmpty()) return
+        for (row in rows) {
+            if (row.status == UploadStatus.DONE.name || row.status == UploadStatus.CANCELLED.name) {
+                runCatching { pendingUploadDao.deleteById(row.id) }
+                continue
+            }
+            if (retrySpecs.containsKey(row.id) || uploadTracker.state.value.items.any { it.id == row.id }) {
+                continue
+            }
+            val spec = deserializeSpec(row.kind, row.payloadJson) ?: continue
+            val isWifiWait = row.status == STATUS_WAITING_WIFI
+            val detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused after restart"
+            retrySpecs[row.id] = spec
+            pausedIds.add(row.id)
+            if (isWifiWait) {
+                waitingForWifiIds.add(row.id)
+            }
+            uploadTracker.start(
+                id = row.id,
+                fileName = row.displayName,
+                totalBytes = row.totalBytes,
+                chatId = row.chatId,
+                status = UploadStatus.PAUSED,
+                statusDetail = detail,
+                isEncrypted = row.isEncrypted,
+                canCancel = true,
+            )
+            uploadTracker.markPaused(row.id, detail = detail)
+        }
+        if (waitingForWifiIds.isNotEmpty() && networkMonitor.isCurrentlyUnmetered()) {
+            val toResume = waitingForWifiIds.toList()
+            toResume.forEach { id ->
+                waitingForWifiIds.remove(id)
+                pausedIds.remove(id)
+                retry(id)
+            }
+        }
+    }
+
+    private suspend fun persistPendingSpec(
+        id: String,
+        spec: RetrySpec,
+        displayName: String,
+        totalBytes: Long,
+        status: String,
+    ) {
+        val (kind, payload) = serializeSpec(spec) ?: return
+        val (chatId, isEncrypted) = when (spec) {
+            is RetrySpec.SingleFile -> spec.chatId to spec.options.encryption.enabled
+            is RetrySpec.FolderZip -> spec.request.chatId to spec.request.encryption.enabled
+            is RetrySpec.UrisZip -> spec.request.chatId to spec.request.encryption.enabled
+        }
+        runCatching {
+            pendingUploadDao.upsert(
+                PendingUploadEntity(
+                    id = id,
+                    kind = kind,
+                    chatId = chatId,
+                    displayName = displayName,
+                    totalBytes = totalBytes.coerceAtLeast(0L),
+                    status = status,
+                    payloadJson = payload,
+                    isEncrypted = isEncrypted,
+                ),
+            )
+        }
+    }
+
+    private fun serializeSpec(spec: RetrySpec): Pair<String, String>? {
+        return when (spec) {
+            is RetrySpec.SingleFile -> {
+                val map = linkedMapOf(
+                    "chatId" to spec.chatId.toString(),
+                    "uri" to spec.file.uri.toString(),
+                    "name" to spec.file.displayName,
+                    "mime" to spec.file.mimeType,
+                    "size" to spec.file.sizeBytes.toString(),
+                    "vpath" to spec.virtualPath,
+                    "mtime" to spec.lastModifiedMs.toString(),
+                    "conflict" to spec.options.conflictStrategy.name,
+                    "split" to spec.options.autoSplitOversized.toString(),
+                    "wifi" to spec.options.wifiOnly.toString(),
+                    "enc" to spec.options.encryption.enabled.toString(),
+                    "vault" to spec.options.encryption.useVaultKey.toString(),
+                )
+                val pass = spec.options.encryption.customPassphrase
+                if (spec.options.encryption.enabled && !spec.options.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                    encryptSecretHex(pass)?.let { map["pass"] = it }
+                }
+                KIND_SINGLE to encodeKvMap(map)
+            }
+            is RetrySpec.FolderZip -> {
+                val req = spec.request
+                val map = linkedMapOf(
+                    "treeUri" to spec.treeUri.toString(),
+                    "chatId" to req.chatId.toString(),
+                    "baseName" to req.baseName,
+                    "mode" to req.compressionMode.name,
+                    "excl" to req.excludePatterns,
+                    "wifi" to req.wifiOnly.toString(),
+                    "enc" to req.encryption.enabled.toString(),
+                    "vault" to req.encryption.useVaultKey.toString(),
+                )
+                req.maxPartBytesOverride?.let { map["maxPart"] = it.toString() }
+                val pass = req.encryption.customPassphrase
+                if (req.encryption.enabled && !req.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                    encryptSecretHex(pass)?.let { map["pass"] = it }
+                }
+                KIND_FOLDER_ZIP to encodeKvMap(map)
+            }
+            is RetrySpec.UrisZip -> {
+                if (spec.files.isEmpty()) return null
+                val req = spec.request
+                val map = linkedMapOf(
+                    "chatId" to req.chatId.toString(),
+                    "baseName" to req.baseName,
+                    "mode" to req.compressionMode.name,
+                    "excl" to req.excludePatterns,
+                    "wifi" to req.wifiOnly.toString(),
+                    "enc" to req.encryption.enabled.toString(),
+                    "vault" to req.encryption.useVaultKey.toString(),
+                    "count" to spec.files.size.toString(),
+                )
+                req.maxPartBytesOverride?.let { map["maxPart"] = it.toString() }
+                val pass = req.encryption.customPassphrase
+                if (req.encryption.enabled && !req.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                    encryptSecretHex(pass)?.let { map["pass"] = it }
+                }
+                spec.files.forEachIndexed { idx, f ->
+                    map["f_${idx}_uri"] = f.uri.toString()
+                    map["f_${idx}_name"] = f.displayName
+                    map["f_${idx}_mime"] = f.mimeType
+                    map["f_${idx}_size"] = f.sizeBytes.toString()
+                }
+                KIND_URIS_ZIP to encodeKvMap(map)
+            }
+        }
+    }
+
+    private fun deserializeSpec(kind: String, payload: String): RetrySpec? {
+        val map = decodeKvMap(payload)
+        if (map.isEmpty()) return null
+        val customPass = map["pass"]?.let { decryptSecretHex(it) }
+        val encSpec = UploadEncryptionSpec(
+            enabled = map["enc"]?.toBooleanStrictOrNull() ?: false,
+            useVaultKey = map["vault"]?.toBooleanStrictOrNull() ?: true,
+            customPassphrase = customPass,
+        )
+        return when (kind) {
+            KIND_SINGLE -> {
+                val uriStr = map["uri"]?.takeIf { it.isNotBlank() } ?: return null
+                val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
+                val conflict = map["conflict"]?.let { name ->
+                    UploadConflictStrategy.entries.firstOrNull { it.name == name }
+                } ?: UploadConflictStrategy.KEEP_BOTH
+                RetrySpec.SingleFile(
+                    chatId = map["chatId"]?.toLongOrNull() ?: 0L,
+                    file = UploadFileItem(
+                        uri = uri,
+                        displayName = map["name"].orEmpty().ifBlank { "file" },
+                        mimeType = map["mime"].orEmpty().ifBlank { "application/octet-stream" },
+                        sizeBytes = map["size"]?.toLongOrNull() ?: 0L,
+                    ),
+                    options = NormalUploadOptions(
+                        conflictStrategy = conflict,
+                        encryption = encSpec,
+                        autoSplitOversized = map["split"]?.toBooleanStrictOrNull() ?: true,
+                        wifiOnly = map["wifi"]?.toBooleanStrictOrNull() ?: false,
+                    ),
+                    virtualPath = map["vpath"].orEmpty(),
+                    lastModifiedMs = map["mtime"]?.toLongOrNull() ?: 0L,
+                )
+            }
+            KIND_FOLDER_ZIP -> {
+                val treeStr = map["treeUri"]?.takeIf { it.isNotBlank() } ?: return null
+                val treeUri = runCatching { Uri.parse(treeStr) }.getOrNull() ?: return null
+                val mode = map["mode"]?.let { m ->
+                    ZipCompressionMode.entries.firstOrNull { it.name == m }
+                } ?: ZipCompressionMode.SMART
+                RetrySpec.FolderZip(
+                    treeUri = treeUri,
+                    request = ZipUploadRequest(
+                        chatId = map["chatId"]?.toLongOrNull() ?: 0L,
+                        baseName = map["baseName"].orEmpty().ifBlank { "archive" },
+                        compressionMode = mode,
+                        maxPartBytesOverride = map["maxPart"]?.toLongOrNull(),
+                        excludePatterns = map["excl"].orEmpty(),
+                        encryption = encSpec,
+                        wifiOnly = map["wifi"]?.toBooleanStrictOrNull() ?: false,
+                    ),
+                )
+            }
+            KIND_URIS_ZIP -> {
+                val count = map["count"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                if (count <= 0) return null
+                val files = buildList {
+                    for (i in 0 until count) {
+                        val uStr = map["f_${i}_uri"]?.takeIf { it.isNotBlank() } ?: continue
+                        val uri = runCatching { Uri.parse(uStr) }.getOrNull() ?: continue
+                        add(
+                            UploadFileItem(
+                                uri = uri,
+                                displayName = map["f_${i}_name"].orEmpty().ifBlank { "file_$i" },
+                                mimeType = map["f_${i}_mime"].orEmpty().ifBlank { "application/octet-stream" },
+                                sizeBytes = map["f_${i}_size"]?.toLongOrNull() ?: 0L,
+                            ),
+                        )
+                    }
+                }
+                if (files.isEmpty()) return null
+                val mode = map["mode"]?.let { m ->
+                    ZipCompressionMode.entries.firstOrNull { it.name == m }
+                } ?: ZipCompressionMode.SMART
+                RetrySpec.UrisZip(
+                    files = files,
+                    request = ZipUploadRequest(
+                        chatId = map["chatId"]?.toLongOrNull() ?: 0L,
+                        baseName = map["baseName"].orEmpty().ifBlank { "archive" },
+                        compressionMode = mode,
+                        maxPartBytesOverride = map["maxPart"]?.toLongOrNull(),
+                        excludePatterns = map["excl"].orEmpty(),
+                        encryption = encSpec,
+                        wifiOnly = map["wifi"]?.toBooleanStrictOrNull() ?: false,
+                    ),
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun encryptSecretHex(raw: String): String? = runCatching {
+        val out = ByteArrayOutputStream()
+        BackupCrypto.encryptStream(
+            keyBytes = backupCrypto.vaultKey(),
+            input = ByteArrayInputStream(raw.toByteArray(Charsets.UTF_8)),
+            output = out,
+        )
+        out.toByteArray().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    private fun decryptSecretHex(hex: String): String? = runCatching {
+        if (hex.length % 2 != 0 || hex.isEmpty()) return@runCatching null
+        val bytes = ByteArray(hex.length / 2) { idx ->
+            hex.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
+        }
+        val out = ByteArrayOutputStream()
+        BackupCrypto.decryptStream(
+            keyBytes = backupCrypto.vaultKey(),
+            input = ByteArrayInputStream(bytes),
+            output = out,
+        )
+        out.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    private fun encodeKvMap(map: Map<String, String>): String =
+        map.entries.joinToString("\n") { (k, v) ->
+            "${escapeKv(k)}=${escapeKv(v)}"
+        }
+
+    private fun escapeKv(raw: String): String = buildString(raw.length) {
+        for (ch in raw) {
+            when (ch) {
+                '\\' -> append("\\\\")
+                '=' -> append("\\=")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                else -> append(ch)
+            }
+        }
+    }
+
+    private fun decodeKvMap(raw: String): Map<String, String> {
+        if (raw.isBlank()) return emptyMap()
+        val result = LinkedHashMap<String, String>()
+        raw.split('\n').forEach { line ->
+            if (line.isEmpty()) return@forEach
+            var eqIdx = -1
+            var escaped = false
+            for (i in line.indices) {
+                val c = line[i]
+                if (escaped) {
+                    escaped = false
+                } else if (c == '\\') {
+                    escaped = true
+                } else if (c == '=') {
+                    eqIdx = i
+                    break
+                }
+            }
+            if (eqIdx > 0) {
+                val k = unescapeKv(line.substring(0, eqIdx))
+                val v = unescapeKv(line.substring(eqIdx + 1))
+                result[k] = v
+            }
+        }
+        return result
+    }
+
+    private fun unescapeKv(raw: String): String = buildString(raw.length) {
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (raw[i + 1]) {
+                    '\\' -> append('\\')
+                    '=' -> append('=')
+                    'n' -> append('\n')
+                    'r' -> append('\r')
+                    else -> append(raw[i + 1])
+                }
+                i += 2
+            } else {
+                append(ch)
+                i += 1
+            }
+        }
+    }
+
     private fun purgeStaleStaging() {
         val cutoff = System.currentTimeMillis() - STALE_STAGING_MS
         listOf(STAGING_DIR_NAME, "share_staging").forEach { dirName ->
@@ -1389,6 +1965,10 @@ class UploadManager @Inject constructor(
     }
 
     companion object {
+        private const val KIND_SINGLE = "SINGLE"
+        private const val KIND_FOLDER_ZIP = "FOLDER_ZIP"
+        private const val KIND_URIS_ZIP = "URIS_ZIP"
+        private const val STATUS_WAITING_WIFI = "WAITING_WIFI"
         private const val STAGING_DIR_NAME = "upload_staging"
         private const val STALE_STAGING_MS = 12L * 60 * 60 * 1000
         private const val MAX_SMALL_PARALLEL = 3

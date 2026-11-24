@@ -8,8 +8,10 @@ import com.tgdrive.core.db.entity.AlbumEntity
 import com.tgdrive.core.db.entity.AlbumItemEntity
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.FolderEntity
+import com.tgdrive.core.db.entity.PendingUploadEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -267,11 +269,49 @@ class TgDriveDatabaseTest {
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_4_5,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_5_6,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_6_7,
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_7_8,
             )
             .allowMainThreadQueries()
             .build()
         try {
             assertThat(migrated.fileCacheDao().getPinnedOffline()).isEmpty()
+            migrated.pendingUploadDao().upsert(
+                PendingUploadEntity(
+                    id = "pend_1",
+                    kind = "SINGLE_FILE",
+                    chatId = 10L,
+                    displayName = "video.mp4.tgenc",
+                    totalBytes = 2048L,
+                    status = "PAUSED",
+                    payloadJson = "{}",
+                    isEncrypted = true,
+                    createdAtMs = 1234L,
+                ),
+            )
+            val restoredPending = migrated.pendingUploadDao().getAll()
+            assertThat(restoredPending).hasSize(1)
+            assertThat(restoredPending.single().status).isEqualTo("PAUSED")
+            migrated.pendingUploadDao().updateStatus("pend_1", "QUEUED")
+            assertThat(migrated.pendingUploadDao().getAll().single().status).isEqualTo("QUEUED")
+            migrated.pendingUploadDao().deleteById("pend_1")
+            assertThat(migrated.pendingUploadDao().getAll()).isEmpty()
+
+            migrated.fileCacheDao().upsertAll(
+                listOf(
+                    FileCacheEntity(
+                        messageId = 701L,
+                        chatId = 10L,
+                        fileName = "secret.jpg.tgenc",
+                        fileSize = 1024L,
+                        mimeType = "application/octet-stream",
+                        thumbnailPath = null,
+                        date = 600L,
+                        isEncryptedVault = true,
+                    ),
+                ),
+            )
+            assertThat(migrated.fileCacheDao().observeEncryptedVaultFiles().first().map { it.messageId })
+                .containsExactly(701L)
             migrated.zipEntryDao().upsertAll(
                 listOf(
                     com.tgdrive.core.db.entity.ZipEntryEntity(

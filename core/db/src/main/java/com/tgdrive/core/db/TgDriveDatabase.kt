@@ -5,6 +5,7 @@ import androidx.room.RoomDatabase
 import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.TrashEntryDao
@@ -13,6 +14,7 @@ import com.tgdrive.core.db.entity.AlbumEntity
 import com.tgdrive.core.db.entity.AlbumItemEntity
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.FolderEntity
+import com.tgdrive.core.db.entity.PendingUploadEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
@@ -28,8 +30,9 @@ import com.tgdrive.core.db.entity.ZipEntryEntity
         TrashEntryEntity::class,
         AlbumEntity::class,
         AlbumItemEntity::class,
+        PendingUploadEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 abstract class TgDriveDatabase : RoomDatabase() {
@@ -40,6 +43,7 @@ abstract class TgDriveDatabase : RoomDatabase() {
     abstract fun zipEntryDao(): ZipEntryDao
     abstract fun trashEntryDao(): TrashEntryDao
     abstract fun albumDao(): AlbumDao
+    abstract fun pendingUploadDao(): PendingUploadDao
 
     companion object {
         const val NAME = "tgdrive.db"

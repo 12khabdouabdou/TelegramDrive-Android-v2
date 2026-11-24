@@ -275,4 +275,24 @@
     <string name="zip_browser_extracting_all">Extracting archive…</string>
     <string name="zip_browser_extracted_all_done">Extracted %1$d file(s) to Downloads</string>
     <string name="home_quick_upload_zip_desc_direct">Pick a device folder to archive &amp; upload</string>
+    <string name="browser_upload_wifi_only">Upload over Wi-Fi only</string>
+    <string name="browser_batch_decrypt">Decrypt selected</string>
+    <string name="browser_batch_decrypt_title">Decrypt %1$d encrypted file(s)</string>
+    <string name="browser_batch_decrypt_desc">All selected files will be decrypted and saved to Downloads/TelegramDrive.</string>
+    <string name="browser_batch_decrypt_passphrase_hint">Passphrase (leave blank for Device Vault Key)</string>
+    <string name="browser_batch_decrypt_action">Decrypt &amp; Save</string>
+    <string name="browser_batch_decrypt_progress">Decrypting %1$d / %2$d…</string>
+    <string name="browser_batch_decrypt_done">Decrypted %1$d file(s) to Downloads</string>
+    <string name="browser_batch_decrypt_partial">Decrypted %1$d of %2$d file(s)</string>
+    <string name="home_vault">Private Vault</string>
+    <string name="vault_title">Private Vault</string>
+    <string name="vault_locked_title">Vault locked</string>
+    <string name="vault_locked_desc">Verify biometrics or device lock to view encrypted files and previews.</string>
+    <string name="vault_unlock">Unlock Vault</string>
+    <string name="vault_lock">Lock Vault</string>
+    <string name="vault_empty_title">Private Vault is empty</string>
+    <string name="vault_empty_desc">Upload files or archives with encryption enabled to see your vault items here.</string>
+    <string name="vault_items_count">%1$d encrypted item(s)</string>
+    <string name="vault_biometric_title">Unlock Private Vault</string>
+    <string name="vault_biometric_subtitle">Confirm your identity to access encrypted files</string>
 </resources>

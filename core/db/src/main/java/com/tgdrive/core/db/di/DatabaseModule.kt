@@ -8,6 +8,7 @@ import com.tgdrive.core.db.TgDriveDatabase
 import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.TrashEntryDao
@@ -193,11 +194,32 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_7_8 = object : Migration(7, 8) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS pending_uploads (
+                    id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    display_name TEXT NOT NULL,
+                    total_bytes INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    is_encrypted INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(id)
+                )
+                """.trimIndent(),
+            )
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()
@@ -207,4 +229,5 @@ object DatabaseModule {
     @Provides fun provideZipEntryDao(db: TgDriveDatabase): ZipEntryDao = db.zipEntryDao()
     @Provides fun provideTrashEntryDao(db: TgDriveDatabase): TrashEntryDao = db.trashEntryDao()
     @Provides fun provideAlbumDao(db: TgDriveDatabase): AlbumDao = db.albumDao()
+    @Provides fun providePendingUploadDao(db: TgDriveDatabase): PendingUploadDao = db.pendingUploadDao()
 }

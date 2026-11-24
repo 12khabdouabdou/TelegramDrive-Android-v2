@@ -114,6 +114,8 @@ data class FolderUiState(
     val zipPreviewLoading: Boolean = false,
     val decryptDialog: DecryptDialogState? = null,
     val hasSavedBackupPassphrase: Boolean = false,
+    val manualUploadWifiOnly: Boolean = false,
+    val batchDecryptProgress: Pair<Int, Int>? = null,
 )
 
 data class FolderSnackbarEvent(
@@ -158,6 +160,7 @@ class FolderViewModel
         private val _zipPreviewSummary = MutableStateFlow<ZipSelectionSummary?>(null)
         private val _zipPreviewLoading = MutableStateFlow(false)
         private val _decryptDialog = MutableStateFlow<DecryptDialogState?>(null)
+        private val _batchDecryptProgress = MutableStateFlow<Pair<Int, Int>?>(null)
         private val _decryptedOpenEvent = MutableStateFlow<DecryptedOpenEvent?>(null)
         val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = _decryptedOpenEvent.asStateFlow()
 
@@ -217,14 +220,20 @@ class FolderViewModel
                 ) { review, zipFolder, summary, summaryLoading, decrypt ->
                     FolderOverlayState(review, zipFolder, summary, summaryLoading, decrypt)
                 },
-                combine(_search, preferences.data, uploadManager.uploads, _pdfThumbnails, _boundChatId) {
+                combine(
+                    _search,
+                    preferences.data,
+                    uploadManager.uploads,
+                    _pdfThumbnails,
+                    combine(_boundChatId, _batchDecryptProgress) { b, bp -> b to bp },
+                ) {
                         search,
                         prefs,
                         uploadQueue,
                         pdfThumbs,
-                        boundId,
+                        boundPair,
                     ->
-                    listOf(search, prefs, uploadQueue, pdfThumbs, boundId)
+                    listOf(search, prefs, uploadQueue, pdfThumbs, boundPair)
                 },
             ) { c, overlays, aux ->
                 val search = aux[0] as String
@@ -232,7 +241,10 @@ class FolderViewModel
                 val uploadQueue = aux[2] as com.tgdrive.core.download.UploadQueueState
                 @Suppress("UNCHECKED_CAST")
                 val pdfThumbs = aux[3] as Map<Long, String>
-                val boundId = aux[4] as Long?
+                @Suppress("UNCHECKED_CAST")
+                val boundPair = aux[4] as Pair<Long?, Pair<Int, Int>?>
+                val boundId = boundPair.first
+                val batchProgress = boundPair.second
 
                 val searched =
                     if (search.isBlank()) {
@@ -264,6 +276,8 @@ class FolderViewModel
                     zipPreviewLoading = overlays.zipSummaryLoading,
                     decryptDialog = overlays.decryptDialog,
                     hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+                    manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                    batchDecryptProgress = batchProgress,
                 )
             }.flowOn(dispatchers.default)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
@@ -783,6 +797,7 @@ class FolderViewModel
                                 useVaultKey = action.options.useVaultKey,
                                 customPassphrase = action.options.password,
                             ),
+                            wifiOnly = action.options.wifiOnly,
                         ),
                     )
                 }
@@ -862,6 +877,7 @@ class FolderViewModel
                         useVaultKey = options.useVaultKey,
                         customPassphrase = options.password,
                     ),
+                    wifiOnly = options.wifiOnly,
                 ),
             )
         }
@@ -999,6 +1015,63 @@ class FolderViewModel
         fun dismissDecryptDialog() {
             decryptWaitJob?.cancel()
             _decryptDialog.value = null
+        }
+
+        fun batchDecryptSelected(passphrase: String? = null) {
+            val targets = _items.value.filter {
+                it.messageId in _selected.value && BackupCrypto.isEncryptedFileName(it.fileName)
+            }
+            if (targets.isEmpty() || _batchDecryptProgress.value != null) return
+            viewModelScope.launch(dispatchers.io) {
+                var succeeded = 0
+                try {
+                    for ((idx, item) in targets.withIndex()) {
+                        _batchDecryptProgress.value = (idx + 1) to targets.size
+                        var localFile = getLocalPath(item.messageId)?.let(::File)?.takeIf { it.isFile }
+                        if (localFile == null && item.remoteId.isNotBlank()) {
+                            downloadFile(item)
+                            val terminal = downloadManager.state
+                                .map { st ->
+                                    st.items.find { it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId) }
+                                }
+                                .first { dl ->
+                                    dl == null ||
+                                        dl.status == DownloadStatus.DONE ||
+                                        dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.CANCELLED
+                                }
+                            if (terminal?.status == DownloadStatus.DONE) {
+                                localFile = terminal.localPath?.let(::File)?.takeIf { it.isFile }
+                            }
+                        }
+                        if (localFile == null || !localFile.isFile) continue
+                        val outcome = uploadManager.decryptLocalFile(
+                            encryptedFile = localFile,
+                            originalDisplayName = item.fileName,
+                            passphrase = passphrase,
+                            saveToDownloads = true,
+                        )
+                        if (outcome is DecryptOutcome.Success) {
+                            succeeded++
+                        }
+                    }
+                    _selected.update { cur -> cur - targets.map { it.messageId }.toSet() }
+                    showSnackbar(
+                        if (succeeded == targets.size) {
+                            appContext.getString(R.string.browser_batch_decrypt_done, succeeded)
+                        } else {
+                            appContext.getString(R.string.browser_batch_decrypt_partial, succeeded, targets.size)
+                        },
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("FolderViewModel: batchDecryptSelected failed", t)
+                    _error.value = t.message ?: "Batch decryption failed"
+                } finally {
+                    _batchDecryptProgress.value = null
+                }
+            }
         }
 
         fun downloadFile(item: FileCacheEntity) {

@@ -93,6 +93,8 @@ fun TextViewerScreen(
     messageId: Long,
     onBack: () -> Unit,
     chatId: Long = 0L,
+    initialLocalPath: String? = null,
+    initialTitle: String? = null,
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
     val ctx = LocalContext.current
@@ -102,9 +104,11 @@ fun TextViewerScreen(
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var cachedEntry by remember(chatId, messageId) { mutableStateOf<FileCacheEntity?>(null) }
-    var localPath by remember(chatId, messageId) { mutableStateOf<String?>(vm.getLocalPath(messageId, chatId)) }
-    var content by remember(chatId, messageId) { mutableStateOf<LoadedTextContent?>(null) }
-    var readError by remember(chatId, messageId) { mutableStateOf<String?>(null) }
+    var localPath by remember(chatId, messageId, initialLocalPath) {
+        mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))
+    }
+    var content by remember(chatId, messageId, initialLocalPath) { mutableStateOf<LoadedTextContent?>(null) }
+    var readError by remember(chatId, messageId, initialLocalPath) { mutableStateOf<String?>(null) }
     var showSearch by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var showLineNumbers by remember { mutableStateOf(true) }
@@ -114,12 +118,15 @@ fun TextViewerScreen(
         it.id == messageId && (chatId == 0L || it.chatId == 0L || it.chatId == chatId)
     }
     val isDownloading =
-        downloadItem?.status == DownloadStatus.DOWNLOADING ||
-            downloadItem?.status == DownloadStatus.QUEUED
-    val isFailed = downloadItem?.status == DownloadStatus.FAILED
+        initialLocalPath.isNullOrBlank() && (
+            downloadItem?.status == DownloadStatus.DOWNLOADING ||
+                downloadItem?.status == DownloadStatus.QUEUED
+            )
+    val isFailed = initialLocalPath.isNullOrBlank() && downloadItem?.status == DownloadStatus.FAILED
     val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
 
-    LaunchedEffect(chatId, messageId) {
+    LaunchedEffect(chatId, messageId, initialLocalPath) {
+        if (!initialLocalPath.isNullOrBlank()) return@LaunchedEffect
         val entry = vm.getCachedEntry(chatId, messageId)
         cachedEntry = entry
         if (vm.getLocalPath(messageId, chatId) == null && entry != null && vm.downloadManager.findItem(chatId, messageId) == null) {
@@ -127,7 +134,8 @@ fun TextViewerScreen(
         }
     }
 
-    LaunchedEffect(chatId, messageId, downloadState.items) {
+    LaunchedEffect(chatId, messageId, initialLocalPath, downloadState.items) {
+        if (!initialLocalPath.isNullOrBlank()) return@LaunchedEffect
         val path = vm.getLocalPath(messageId, chatId)
         if (path != null && path != localPath) {
             localPath = path
@@ -202,7 +210,11 @@ fun TextViewerScreen(
                     )
                 }
                 Text(
-                    text = cachedEntry?.fileName ?: downloadItem?.fileName ?: "Document",
+                    text = initialTitle?.takeIf { it.isNotBlank() }
+                        ?: cachedEntry?.fileName
+                        ?: downloadItem?.fileName
+                        ?: localPath?.let { File(it).name }
+                        ?: "Document",
                     style = TgTypography.Display.titleMedium,
                     color = MaterialTheme.colorScheme.onBackground,
                     maxLines = 1,
@@ -237,7 +249,12 @@ fun TextViewerScreen(
                                     putExtra(Intent.EXTRA_STREAM, uri)
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
-                                ctx.startActivity(Intent.createChooser(intent, cachedEntry?.fileName ?: file.name))
+                                ctx.startActivity(
+                                    Intent.createChooser(
+                                        intent,
+                                        initialTitle?.takeIf { it.isNotBlank() } ?: cachedEntry?.fileName ?: file.name,
+                                    ),
+                                )
                             }
                         }
                     }) {

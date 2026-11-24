@@ -14,24 +14,34 @@ class ExtractedFileRouterTest {
     }
 
     @Test
-    fun `pdf routes to External with application-pdf mime`() {
+    fun `pdf routes to in-app PdfView`() {
         val route = routeForExtractedFile("document.pdf", "/tmp/document.pdf")
-        assertThat(route).isInstanceOf(ExtractedFileRoute.External::class.java)
-        val ext = route as ExtractedFileRoute.External
-        assertThat(ext.localPath).isEqualTo("/tmp/document.pdf")
-        assertThat(ext.mimeType).isEqualTo("application/pdf")
+        assertThat(route).isInstanceOf(ExtractedFileRoute.PdfView::class.java)
+        val pdf = route as ExtractedFileRoute.PdfView
+        assertThat(pdf.localPath).isEqualTo("/tmp/document.pdf")
+        assertThat(pdf.fileName).isEqualTo("document.pdf")
     }
 
     @Test
-    fun `video extensions route to External with video mime`() {
-        val route = routeForExtractedFile("clip.mp4", "/tmp/clip.mp4") as ExtractedFileRoute.External
-        assertThat(route.mimeType).isEqualTo("video/mp4")
+    fun `video extensions route to in-app VideoView`() {
+        val route = routeForExtractedFile("clip.mp4", "/tmp/clip.mp4") as ExtractedFileRoute.VideoView
+        assertThat(route.localPath).isEqualTo("/tmp/clip.mp4")
     }
 
     @Test
-    fun `audio extensions route to External with audio mime`() {
-        val route = routeForExtractedFile("song.mp3", "/tmp/song.mp3") as ExtractedFileRoute.External
-        assertThat(route.mimeType).isEqualTo("audio/mpeg")
+    fun `audio extensions route to in-app AudioPlay`() {
+        val route = routeForExtractedFile("song.mp3", "/tmp/song.mp3") as ExtractedFileRoute.AudioPlay
+        assertThat(route.localPath).isEqualTo("/tmp/song.mp3")
+        assertThat(route.fileName).isEqualTo("song.mp3")
+    }
+
+    @Test
+    fun `text extensions route to in-app TextView`() {
+        listOf("notes.txt", "readme.md", "config.json", "Main.kt").forEach { name ->
+            val route = routeForExtractedFile(name, "/tmp/$name") as ExtractedFileRoute.TextView
+            assertThat(route.localPath).isEqualTo("/tmp/$name")
+            assertThat(route.fileName).isEqualTo(name)
+        }
     }
 
     @Test

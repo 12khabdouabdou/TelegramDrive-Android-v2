@@ -4,9 +4,14 @@ import android.content.Context
 import android.net.Uri
 import com.google.common.truth.Truth.assertThat
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.datastore.AppPreferences
+import com.tgdrive.core.datastore.AppPreferencesData
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.db.entity.PendingUploadEntity
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.EncryptedFileFormat
 import com.tgdrive.core.security.KeystoreHelper
@@ -16,7 +21,11 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -70,6 +79,16 @@ class UploadManagerTest {
         dispatcher: CoroutineDispatcher,
         telegramClient: TelegramClient,
         fileCacheDao: FileCacheDao,
+        pendingUploadDao: PendingUploadDao = mockk(relaxed = true) {
+            coEvery { getAll() } returns emptyList()
+        },
+        appPreferences: AppPreferences = mockk(relaxed = true) {
+            every { data } returns flowOf(AppPreferencesData())
+        },
+        networkMonitor: NetworkMonitor = mockk(relaxed = true) {
+            every { isUnmetered } returns MutableStateFlow(true)
+            every { isCurrentlyUnmetered() } returns true
+        },
     ): Pair<UploadManager, UploadTracker> {
         val ctx = fakeContext(File(tmp, "cache").apply { mkdirs() })
         val tracker = UploadTracker(ctx)
@@ -83,9 +102,12 @@ class UploadManagerTest {
             telegramClient = telegramClient,
             fileCacheDao = fileCacheDao,
             zipEntryDao = zipEntryDao,
+            pendingUploadDao = pendingUploadDao,
             mediaThumbnailCache = thumbCache,
             uploadTracker = tracker,
             backupCrypto = crypto,
+            appPreferences = appPreferences,
+            networkMonitor = networkMonitor,
             dispatchers = testDispatchers(dispatcher),
         )
         return manager to tracker
@@ -349,5 +371,121 @@ class UploadManagerTest {
         assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.CANCELLED)
         tracker.updateProgress(id, 850L, 1000L)
         assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.CANCELLED)
+    }
+
+    @Test
+    fun `persisted pending upload restores as PAUSED on startup and resumes to DONE`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "restored.txt").apply { writeBytes("persist-payload".toByteArray()) }
+        mockkStatic(Uri::class)
+        try {
+            val fakeUri = fileUri(src)
+            every { Uri.parse("file://${src.absolutePath}") } returns fakeUri
+
+            val savedPayload = listOf(
+                "chatId=77",
+                "uri=file://${src.absolutePath}",
+                "name=restored.txt",
+                "mime=text/plain",
+                "size=${src.length()}",
+                "vpath=",
+                "mtime=0",
+                "conflict=KEEP_BOTH",
+                "split=true",
+                "wifi=false",
+                "enc=false",
+                "vault=true",
+            ).joinToString("\n")
+            val pendingDao = mockk<PendingUploadDao>(relaxed = true) {
+                coEvery { getAll() } returns listOf(
+                    PendingUploadEntity(
+                        id = "ul_saved_1",
+                        kind = "SINGLE",
+                        chatId = 77L,
+                        displayName = "restored.txt",
+                        totalBytes = src.length(),
+                        status = "QUEUED",
+                        payloadJson = savedPayload,
+                        isEncrypted = false,
+                    ),
+                )
+            }
+            val tg = mockk<TelegramClient>(relaxed = true) {
+                coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+                coEvery { uploadFile(any(), any(), any(), any(), any()) } returns
+                    UploadResult(messageId = 401L, remoteId = "rem401")
+            }
+            val dao = mockk<FileCacheDao>(relaxed = true) {
+                coEvery { forChat(77L) } returns emptyList()
+            }
+            val (manager, tracker) = createManager(
+                tmp = tmp,
+                dispatcher = d,
+                telegramClient = tg,
+                fileCacheDao = dao,
+                pendingUploadDao = pendingDao,
+            )
+            runCurrent()
+
+            val restored = tracker.state.value.items.single()
+            assertThat(restored.id).isEqualTo("ul_saved_1")
+            assertThat(restored.status).isEqualTo(UploadStatus.PAUSED)
+            assertThat(restored.canRetry).isTrue()
+
+            manager.resume("ul_saved_1")
+            runCurrent()
+
+            assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.DONE)
+            coVerify { tg.uploadFile(77L, any(), "restored.txt", "text/plain", any()) }
+            coVerify { pendingDao.deleteById("ul_saved_1") }
+        } finally {
+            unmockkStatic(Uri::class)
+        }
+    }
+
+    @Test
+    fun `wifiOnly upload defers on metered network and auto-resumes when unmetered`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "wifi.bin").apply { writeBytes("wifi-payload".toByteArray()) }
+        val unmeteredFlow = MutableStateFlow(false)
+        val net = mockk<NetworkMonitor>(relaxed = true) {
+            every { isUnmetered } returns unmeteredFlow
+            every { isCurrentlyUnmetered() } answers { unmeteredFlow.value }
+        }
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } returns
+                UploadResult(messageId = 501L, remoteId = "rem501")
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(88L) } returns emptyList()
+        }
+        val (manager, tracker) = createManager(
+            tmp = tmp,
+            dispatcher = d,
+            telegramClient = tg,
+            fileCacheDao = dao,
+            networkMonitor = net,
+        )
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 88L,
+            files = listOf(UploadFileItem(fileUri(src), "wifi.bin", "application/octet-stream", src.length())),
+            options = NormalUploadOptions(wifiOnly = true),
+        )
+        runCurrent()
+
+        val deferred = tracker.state.value.items.single()
+        assertThat(deferred.status).isEqualTo(UploadStatus.PAUSED)
+        assertThat(deferred.statusDetail).isEqualTo("Waiting for Wi-Fi…")
+        coVerify(exactly = 0) { tg.uploadFile(any(), any(), any(), any(), any()) }
+
+        unmeteredFlow.value = true
+        runCurrent()
+
+        val completed = tracker.state.value.items.single()
+        assertThat(completed.status).isEqualTo(UploadStatus.DONE)
+        coVerify(exactly = 1) { tg.uploadFile(88L, any(), "wifi.bin", any(), any()) }
     }
 }

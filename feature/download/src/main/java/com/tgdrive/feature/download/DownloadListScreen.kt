@@ -72,6 +72,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.download.DecryptOutcome
 import com.tgdrive.core.download.DownloadItem
@@ -166,6 +167,9 @@ fun DownloadListScreen(
     showBack: Boolean = false,
     onBack: () -> Unit = {},
     onOpenLocalVideo: ((String) -> Unit)? = null,
+    onOpenLocalPdf: ((String, String) -> Unit)? = null,
+    onOpenLocalText: ((String, String) -> Unit)? = null,
+    onPlayLocalAudio: ((String, String) -> Unit)? = null,
     vm: DownloadListViewModel = hiltViewModel(),
 ) {
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
@@ -214,9 +218,27 @@ fun DownloadListScreen(
             ?: "*/*"
         val isVideo = resolvedMime.startsWith("video/", ignoreCase = true) ||
             ext in setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
-        if (isVideo && onOpenLocalVideo != null) {
-            onOpenLocalVideo(file.absolutePath)
-            return
+        val isAudio = resolvedMime.startsWith("audio/", ignoreCase = true) ||
+            ext in setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff")
+        val isPdf = resolvedMime.equals("application/pdf", ignoreCase = true) || ext == "pdf"
+        val isText = isTextPreviewable(resolvedMime, file.name)
+        when {
+            isVideo && onOpenLocalVideo != null -> {
+                onOpenLocalVideo(file.absolutePath)
+                return
+            }
+            isAudio && onPlayLocalAudio != null -> {
+                onPlayLocalAudio(file.absolutePath, file.name)
+                return
+            }
+            isPdf && onOpenLocalPdf != null -> {
+                onOpenLocalPdf(file.absolutePath, file.name)
+                return
+            }
+            isText && onOpenLocalText != null -> {
+                onOpenLocalText(file.absolutePath, file.name)
+                return
+            }
         }
         try {
             val uri = FileProvider.getUriForFile(

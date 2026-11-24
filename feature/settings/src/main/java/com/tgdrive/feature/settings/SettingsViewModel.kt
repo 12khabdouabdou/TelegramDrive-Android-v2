@@ -13,12 +13,16 @@ import com.tgdrive.core.datastore.ThemeMode
 import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.dao.ZipEntryDao
+import com.tgdrive.core.download.DecryptedTempSweeper
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.VaultKeyCloudBackup
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
@@ -54,6 +58,11 @@ data class SettingsUiState(
     val backupUseCustomPassphrase: Boolean = false,
     val hasCustomPassphrase: Boolean = false,
     val vaultKeyFingerprint: String = "",
+    val decryptedTempTtlMinutes: Int = 30,
+    val manualUploadWifiOnly: Boolean = false,
+    val tempDecryptedCount: Int = 0,
+    val tempDecryptedBytes: Long = 0L,
+    val cloudVaultBusy: Boolean = false,
 )
 
 @HiltViewModel
@@ -64,6 +73,9 @@ class SettingsViewModel @Inject constructor(
     private val biometricHelper: BiometricHelper,
     private val telegramClient: TelegramClient,
     private val downloadManager: DownloadManager,
+    private val uploadManager: UploadManager,
+    private val decryptedTempSweeper: DecryptedTempSweeper,
+    private val vaultKeyCloudBackup: VaultKeyCloudBackup,
     private val audioPlayerController: AudioPlayerController,
     private val folderDao: FolderDao,
     private val fileCacheDao: FileCacheDao,
@@ -72,6 +84,7 @@ class SettingsViewModel @Inject constructor(
     private val zipEntryDao: ZipEntryDao,
     private val trashEntryDao: TrashEntryDao,
     private val albumDao: AlbumDao,
+    private val pendingUploadDao: PendingUploadDao,
     private val cloudSyncManager: CloudSyncManager,
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatchersProvider,
@@ -81,16 +94,20 @@ class SettingsViewModel @Inject constructor(
     private val _credsVersion = MutableStateFlow(0)
     private val _vaultVersion = MutableStateFlow(0)
     private val _clearingCache = MutableStateFlow(false)
+    private val _tempStatsVersion = MutableStateFlow(0)
+    private val _cloudVaultBusy = MutableStateFlow(false)
 
     val state: StateFlow<SettingsUiState> = combine(
-        preferences.data,
-        _credsVersion,
-        _vaultVersion,
-        _clearingCache,
-        cloudSyncManager.syncing,
-    ) { p, _, _, clearing, syncing ->
+        combine(preferences.data, _credsVersion, _vaultVersion) { p, c, v ->
+            Triple(p, c, v)
+        },
+        combine(_clearingCache, cloudSyncManager.syncing, _tempStatsVersion, _cloudVaultBusy) { clearing, syncing, _, busy ->
+            Triple(clearing, syncing, busy)
+        },
+    ) { (p, _, _), (clearing, syncing, busy) ->
         val creds = keystore.getApiCreds()
         val fingerprint = runCatching { backupCrypto.vaultKeyFingerprint() }.getOrDefault("")
+        val (tempCount, tempBytes) = runCatching { decryptedTempSweeper.tempCacheStats() }.getOrDefault(0 to 0L)
         SettingsUiState(
             themeMode = p.themeMode,
             cacheLimitBytes = p.cacheLimitBytes,
@@ -105,6 +122,11 @@ class SettingsViewModel @Inject constructor(
             backupUseCustomPassphrase = p.backupUseCustomPassphrase,
             hasCustomPassphrase = backupCrypto.hasCustomBackupPassphrase(),
             vaultKeyFingerprint = fingerprint,
+            decryptedTempTtlMinutes = p.decryptedTempTtlMinutes,
+            manualUploadWifiOnly = p.manualUploadWifiOnly,
+            tempDecryptedCount = tempCount,
+            tempDecryptedBytes = tempBytes,
+            cloudVaultBusy = busy,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -182,12 +204,53 @@ class SettingsViewModel @Inject constructor(
     }
 
     suspend fun clearDecryptedTempFiles(): Int = withContext(dispatchers.io) {
-        val dir = File(appContext.cacheDir, "decrypted")
-        if (!dir.isDirectory) return@withContext 0
-        val children = dir.listFiles().orEmpty()
-        var removed = 0
-        children.forEach { child -> if (child.deleteRecursively()) removed++ }
+        val activeAudio = audioPlayerController.state.value.path
+        val removed = decryptedTempSweeper.wipeAll(excludePaths = setOfNotNull(activeAudio))
+        _tempStatsVersion.value += 1
         removed
+    }
+
+    fun setDecryptedTempTtlMinutes(minutes: Int) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(decryptedTempTtlMinutes = minutes) }
+            if (minutes >= 0) {
+                val activeAudio = audioPlayerController.state.value.path
+                decryptedTempSweeper.sweepExpired(minutes, excludePaths = setOfNotNull(activeAudio))
+            }
+            _tempStatsVersion.value += 1
+        }
+    }
+
+    fun setManualUploadWifiOnly(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(manualUploadWifiOnly = enabled) }
+        }
+    }
+
+    fun refreshTempStats() {
+        _tempStatsVersion.value += 1
+    }
+
+    suspend fun backupVaultKeyToCloud(recoveryPassphrase: String): Result<Long> {
+        _cloudVaultBusy.value = true
+        return try {
+            vaultKeyCloudBackup.backupToTelegram(recoveryPassphrase)
+        } finally {
+            _cloudVaultBusy.value = false
+        }
+    }
+
+    suspend fun restoreVaultKeyFromCloud(recoveryPassphrase: String): Result<String> {
+        _cloudVaultBusy.value = true
+        return try {
+            val res = vaultKeyCloudBackup.restoreFromTelegram(recoveryPassphrase)
+            if (res.isSuccess) {
+                _vaultVersion.value += 1
+            }
+            res
+        } finally {
+            _cloudVaultBusy.value = false
+        }
     }
 
     fun syncNow() {
@@ -212,9 +275,12 @@ class SettingsViewModel @Inject constructor(
             withContext(NonCancellable) {
                 Log.i("SettingsViewModel: starting full logout")
 
-                // 1. Stop background workers, active downloads, and audio playback first.
+                // 1. Stop background workers, active transfers, and audio playback first.
                 try { WorkManager.getInstance(appContext).cancelAllWork() } catch (t: Throwable) {
                     Log.w("logout: cancelAllWork failed", t)
+                }
+                try { uploadManager.cancelAll() } catch (t: Throwable) {
+                    Log.w("logout: uploadManager.cancelAll failed", t)
                 }
                 try { downloadManager.clearCache() } catch (t: Throwable) {
                     Log.w("logout: downloadManager.clearCache failed", t)
@@ -239,6 +305,7 @@ class SettingsViewModel @Inject constructor(
                 try { zipEntryDao.clear() } catch (t: Throwable) { Log.w("logout: zipEntryDao.clear failed", t) }
                 try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
                 try { albumDao.clear() } catch (t: Throwable) { Log.w("logout: albumDao.clear failed", t) }
+                try { pendingUploadDao.clear() } catch (t: Throwable) { Log.w("logout: pendingUploadDao.clear failed", t) }
                 try { offlinePinStore.clearAll() } catch (t: Throwable) { Log.w("logout: offlinePinStore.clearAll failed", t) }
 
                 // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
@@ -268,6 +335,8 @@ class SettingsViewModel @Inject constructor(
                             backupFolderTargetsJson = "{}",
                             recentSearchQueries = "",
                             lastCloudSyncMs = 0L,
+                            decryptedTempTtlMinutes = 30,
+                            manualUploadWifiOnly = false,
                         )
                     }
                 } catch (t: Throwable) {
@@ -275,7 +344,8 @@ class SettingsViewModel @Inject constructor(
                 }
 
                 // 5. Purge all local cache / staging directories.
-                for (dirName in listOf("backup_staging", "upload_staging", "decrypted", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs")) {
+                try { decryptedTempSweeper.wipeAll() } catch (_: Throwable) {}
+                for (dirName in listOf("backup_staging", "upload_staging", "decrypted", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs", "encrypted_thumbs", "vault_sync")) {
                     try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
                 }
 

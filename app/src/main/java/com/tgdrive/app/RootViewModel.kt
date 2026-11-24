@@ -2,6 +2,7 @@ package com.tgdrive.app
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.tgdrive.core.audio.AudioPlayerController
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
@@ -9,6 +10,7 @@ import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.download.DecryptedTempSweeper
 import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.UploadConflictStrategy
 import com.tgdrive.core.download.UploadEncryptionSpec
@@ -76,6 +78,8 @@ data class RootState(
     val shareUploadInProgress: Boolean = false,
     /** Last share-upload result message (shown briefly in the dialog). */
     val shareUploadMessage: String? = null,
+    val manualUploadWifiOnly: Boolean = false,
+    val decryptedTempTtlMinutes: Int = 30,
 )
 
 @HiltViewModel
@@ -88,6 +92,8 @@ class RootViewModel @Inject constructor(
     private val fileCacheDao: FileCacheDao,
     private val folderDao: FolderDao,
     private val uploadManager: UploadManager,
+    private val decryptedTempSweeper: DecryptedTempSweeper,
+    private val audioPlayerController: AudioPlayerController,
     private val dispatchers: DispatchersProvider,
     @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
@@ -98,6 +104,7 @@ class RootViewModel @Inject constructor(
     // Shadow flags for biometric lock & persisted background timeout.
     private var biometricPrefEnabled = false
     private var biometricLastBgTimeMs = 0L
+    private var decryptedTempTtlMinutes = 30
     private var initialPrefSynced = false
     private var cloudSyncedForSession = false
 
@@ -109,6 +116,7 @@ class RootViewModel @Inject constructor(
         observeNetwork()
         startSplashTimer()
         checkStoredCreds()
+        sweepExpiredTempFiles()
     }
 
     private fun observeShareFolders() {
@@ -190,6 +198,7 @@ class RootViewModel @Inject constructor(
             preferences.data.collect { prefs ->
                 biometricPrefEnabled = prefs.biometricLockEnabled
                 biometricLastBgTimeMs = prefs.biometricLastBgTime
+                decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes
                 _state.update { current ->
                     val coldStartLock = if (!initialPrefSynced) {
                         initialPrefSynced = true
@@ -202,6 +211,8 @@ class RootViewModel @Inject constructor(
                         onboardingCompleted = prefs.onboardingCompleted,
                         biometricRequired = current.isAuthorized && prefs.biometricLockEnabled,
                         biometricUnlocked = if (coldStartLock) false else current.biometricUnlocked,
+                        manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                        decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes,
                     )
                 }
             }
@@ -260,6 +271,7 @@ class RootViewModel @Inject constructor(
     }
 
     fun onAppBackgrounded() {
+        sweepExpiredTempFiles()
         if (!biometricPrefEnabled) return
         val now = System.currentTimeMillis()
         biometricLastBgTimeMs = now
@@ -273,12 +285,42 @@ class RootViewModel @Inject constructor(
     }
 
     fun onAppForegrounded() {
+        sweepExpiredTempFiles()
         if (!biometricPrefEnabled) return
         val lastBg = biometricLastBgTimeMs
         val now = System.currentTimeMillis()
         if (lastBg == 0L || now < lastBg || (now - lastBg) > BIOMETRIC_RELOCK_MS) {
             _state.update { it.copy(biometricUnlocked = false) }
         }
+    }
+
+    fun sweepExpiredTempFiles() {
+        val ttl = decryptedTempTtlMinutes
+        viewModelScope.launch(dispatchers.io) {
+            runCatching {
+                val activeAudio = audioPlayerController.state.value.path
+                decryptedTempSweeper.sweepExpired(
+                    ttlMinutes = ttl,
+                    excludePaths = setOfNotNull(activeAudio),
+                )
+            }
+        }
+    }
+
+    fun onTempViewerClosed(localPath: String) {
+        if (decryptedTempTtlMinutes != 0 || localPath.isBlank()) return
+        viewModelScope.launch(dispatchers.io) {
+            runCatching {
+                val activeAudio = audioPlayerController.state.value.path
+                if (activeAudio != localPath) {
+                    decryptedTempSweeper.deleteIfTempDecrypted(localPath)
+                }
+            }
+        }
+    }
+
+    fun playLocalAudio(localPath: String, fileName: String) {
+        audioPlayerController.playAudio(localPath, fileName)
     }
 
     // ---------- Share-to-app intent handling ----------
@@ -338,6 +380,7 @@ class RootViewModel @Inject constructor(
         encryptFiles: Boolean = false,
         useVaultKey: Boolean = true,
         compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
+        wifiOnly: Boolean = false,
     ) {
         val uris = _state.value.pendingShareUris
         if (uris.isEmpty()) return
@@ -367,6 +410,7 @@ class RootViewModel @Inject constructor(
                             baseName = base,
                             compressionMode = compressionMode,
                             encryption = encSpec,
+                            wifiOnly = wifiOnly,
                         ),
                     )
                 } else {
@@ -377,6 +421,7 @@ class RootViewModel @Inject constructor(
                             conflictStrategy = UploadConflictStrategy.KEEP_BOTH,
                             encryption = encSpec,
                             autoSplitOversized = true,
+                            wifiOnly = wifiOnly,
                         ),
                     )
                 }

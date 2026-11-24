@@ -16,6 +16,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipUploader
@@ -29,6 +30,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -47,10 +49,14 @@ class MediaThumbnailCache @Inject constructor(
     private val fileCacheDao: FileCacheDao,
     private val downloadManager: DownloadManager,
     private val offlinePinStore: OfflinePinStore,
+    private val backupCrypto: BackupCrypto,
     private val dispatchers: DispatchersProvider,
 ) {
     private val thumbsDir: File
         get() = File(ctx.cacheDir, "media_thumbs").apply { mkdirs() }
+
+    private val encryptedThumbsDir: File
+        get() = File(ctx.cacheDir, "encrypted_thumbs").apply { mkdirs() }
 
     private val semaphore = Semaphore(2)
     private val inFlight = ConcurrentHashMap<Pair<Long, Long>, Deferred<String?>>()
@@ -98,6 +104,69 @@ class MediaThumbnailCache @Inject constructor(
             runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, saved) }
         }
         saved
+    }
+
+    /**
+     * Encodes a scaled JPEG preview in memory and writes an AES-256 `TGE1` encrypted sidecar
+     * under `encrypted_thumbs/` without ever storing plaintext thumbnail bytes on disk.
+     */
+    suspend fun buildEncryptedThumbnailBytes(
+        localPath: String,
+        mimeType: String?,
+        originalFileName: String,
+    ): ByteArray? = withContext(dispatchers.io) {
+        val src = File(localPath)
+        if (!src.isFile || src.length() <= 0L) return@withContext null
+        val bucket = classifyFile(mimeType, originalFileName)
+        val rawBmp: Bitmap? = when {
+            bucket == FileBucket.IMAGES -> decodeSampledImageFile(localPath)
+            bucket == FileBucket.VIDEOS -> decodeVideoFrame(localPath)
+            bucket == FileBucket.PDF -> decodePdfFirstPage(localPath)
+            else -> null
+        }
+        if (rawBmp == null || rawBmp.isRecycled) return@withContext null
+        var scaled: Bitmap = rawBmp
+        return@withContext try {
+            scaled = scaleToMax(rawBmp, TARGET_MAX_PX)
+            val jpegOut = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 80, jpegOut)
+            val plainBytes = jpegOut.toByteArray()
+            if (plainBytes.isEmpty()) return@withContext null
+            val encOut = ByteArrayOutputStream()
+            BackupCrypto.encryptStream(backupCrypto.vaultKey(), ByteArrayInputStream(plainBytes), encOut)
+            encOut.toByteArray()
+        } catch (t: Throwable) {
+            Log.w("MediaThumbnailCache: buildEncryptedThumbnailBytes failed", t)
+            null
+        } finally {
+            if (scaled !== rawBmp && !scaled.isRecycled) scaled.recycle()
+            if (!rawBmp.isRecycled) rawBmp.recycle()
+        }
+    }
+
+    fun saveEncryptedThumbnailBytes(
+        chatId: Long,
+        messageId: Long,
+        encryptedBytes: ByteArray,
+    ): String? {
+        if (encryptedBytes.isEmpty()) return null
+        return runCatching {
+            val out = File(encryptedThumbsDir, "${chatId}_${messageId}$ENCRYPTED_THUMB_EXT")
+            out.writeBytes(encryptedBytes)
+            out.absolutePath
+        }.getOrNull()
+    }
+
+    suspend fun decryptThumbnailToBytes(encryptedThumbPath: String): ByteArray? = withContext(dispatchers.io) {
+        val f = File(encryptedThumbPath)
+        if (!f.isFile || f.length() <= 0L) return@withContext null
+        runCatching {
+            val out = ByteArrayOutputStream()
+            f.inputStream().buffered().use { input ->
+                BackupCrypto.decryptStream(backupCrypto.vaultKey(), input, out)
+            }
+            out.toByteArray()
+        }.getOrNull()
     }
 
     suspend fun ensureThumbnail(entity: FileCacheEntity): String? {
@@ -154,6 +223,7 @@ class MediaThumbnailCache @Inject constructor(
     }
 
     private suspend fun resolveThumbnailInternal(entity: FileCacheEntity): String? = withContext(dispatchers.io) {
+        if (entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)) return@withContext null
         val pinned = offlinePinStore.getPinnedFilePathSync(entity.chatId, entity.messageId)
         val dlLocal = downloadManager.findItem(entity.chatId, entity.messageId)
             ?.takeIf { it.status == DownloadStatus.DONE }
@@ -378,6 +448,7 @@ class MediaThumbnailCache @Inject constructor(
     }
 
     companion object {
+        const val ENCRYPTED_THUMB_EXT = ".tgethumb"
         private const val TARGET_MAX_PX = 360
         private const val MAX_REMOTE_IMAGE_BYTES = 15L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024

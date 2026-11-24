@@ -53,4 +53,6 @@
     <string name="decrypt_passphrase_or_saved_hint">Enter passphrase, or leave blank to use your saved backup passphrase.</string>
     <string name="decrypt_action_open">Decrypt &amp; Open</string>
     <string name="decrypt_action_save">Save to Downloads</string>
+    <string name="upload_wifi_only_title">Upload over Wi-Fi only</string>
+    <string name="upload_wifi_only_desc">Pause on mobile data and auto-resume on Wi-Fi</string>
 </resources>

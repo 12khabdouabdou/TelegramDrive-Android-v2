@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -26,6 +27,7 @@ import com.tgdrive.feature.autobackup.BackupHistoryScreen
 import com.tgdrive.feature.autobackup.FreeUpSpaceScreen
 import com.tgdrive.feature.autobackup.SyncLogDetailsScreen
 import com.tgdrive.feature.browser.TrashScreen
+import com.tgdrive.feature.browser.VaultScreen
 import com.tgdrive.feature.browser.ZipBrowserScreen
 import com.tgdrive.feature.download.DownloadListScreen
 import com.tgdrive.feature.player.AudioPlayerScaffold
@@ -84,6 +86,18 @@ fun RootNavHost(
     }
 
     val navContent: @Composable () -> Unit = {
+        val openLocalVideo: (String) -> Unit = { path ->
+            nav.navigate("local_video?path=${Uri.encode(path)}")
+        }
+        val openLocalPdf: (String, String) -> Unit = { path, title ->
+            nav.navigate("local_pdf?path=${Uri.encode(path)}&title=${Uri.encode(title)}")
+        }
+        val openLocalText: (String, String) -> Unit = { path, title ->
+            nav.navigate("local_text?path=${Uri.encode(path)}&title=${Uri.encode(title)}")
+        }
+        val playLocalAudio: (String, String) -> Unit = { path, name ->
+            rootVm.playLocalAudio(path, name)
+        }
         NavHost(navController = nav, startDestination = initialRoute) {
             composable("onboarding") {
                 OnboardingScreen(
@@ -102,7 +116,10 @@ fun RootNavHost(
                     rootVm = rootVm,
                     mainNav = mainNav,
                     onOpenVideo = { chatId, msgId -> nav.navigate("video/$msgId?chatId=$chatId") },
-                    onOpenLocalVideo = { path -> nav.navigate("local_video?path=${Uri.encode(path)}") },
+                    onOpenLocalVideo = openLocalVideo,
+                    onOpenLocalPdf = openLocalPdf,
+                    onOpenLocalText = openLocalText,
+                    onPlayLocalAudio = playLocalAudio,
                     onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
                     onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
@@ -117,6 +134,7 @@ fun RootNavHost(
                     onOpenSettings = { nav.navigate("settings") },
                     onOpenTrash = { nav.navigate("trash") },
                     onOpenFreeUpSpace = { nav.navigate("free_up_space") },
+                    onOpenVault = { nav.navigate("vault") },
                 )
             }
 
@@ -161,13 +179,93 @@ fun RootNavHost(
             ) { entry ->
                 val path = Uri.decode(entry.arguments?.getString("path").orEmpty())
                 if (path.isNotBlank()) {
+                    DisposableEffect(path) {
+                        onDispose { rootVm.onTempViewerClosed(path) }
+                    }
                     VideoPlayerScreen(
                         messageId = 0L,
                         chatId = 0L,
                         initialLocalPath = path,
-                        onBack = { nav.popBackStack() },
+                        onBack = {
+                            rootVm.onTempViewerClosed(path)
+                            nav.popBackStack()
+                        },
                     )
                 }
+            }
+
+            composable(
+                "local_pdf?path={path}&title={title}",
+                arguments = listOf(
+                    navArgument("path") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                    navArgument("title") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                ),
+            ) { entry ->
+                val path = Uri.decode(entry.arguments?.getString("path").orEmpty())
+                val title = Uri.decode(entry.arguments?.getString("title").orEmpty()).takeIf { it.isNotBlank() }
+                if (path.isNotBlank()) {
+                    DisposableEffect(path) {
+                        onDispose { rootVm.onTempViewerClosed(path) }
+                    }
+                    PdfViewerScreen(
+                        messageId = 0L,
+                        initialLocalPath = path,
+                        initialTitle = title,
+                        onBack = {
+                            rootVm.onTempViewerClosed(path)
+                            nav.popBackStack()
+                        },
+                    )
+                }
+            }
+
+            composable(
+                "local_text?path={path}&title={title}",
+                arguments = listOf(
+                    navArgument("path") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                    navArgument("title") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
+                ),
+            ) { entry ->
+                val path = Uri.decode(entry.arguments?.getString("path").orEmpty())
+                val title = Uri.decode(entry.arguments?.getString("title").orEmpty()).takeIf { it.isNotBlank() }
+                if (path.isNotBlank()) {
+                    DisposableEffect(path) {
+                        onDispose { rootVm.onTempViewerClosed(path) }
+                    }
+                    TextViewerScreen(
+                        messageId = 0L,
+                        chatId = 0L,
+                        initialLocalPath = path,
+                        initialTitle = title,
+                        onBack = {
+                            rootVm.onTempViewerClosed(path)
+                            nav.popBackStack()
+                        },
+                    )
+                }
+            }
+
+            composable("vault") {
+                VaultScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
+                    onOpenLocalVideo = openLocalVideo,
+                    onOpenLocalPdf = openLocalPdf,
+                    onOpenLocalText = openLocalText,
+                    onPlayLocalAudio = playLocalAudio,
+                )
             }
 
             composable(
@@ -234,6 +332,10 @@ fun RootNavHost(
                     messageId = msgId,
                     chatId = chatId,
                     initialEntryPath = Uri.decode(entryPath),
+                    onOpenLocalVideo = openLocalVideo,
+                    onOpenLocalPdf = openLocalPdf,
+                    onOpenLocalText = openLocalText,
+                    onPlayLocalAudio = playLocalAudio,
                     onBack = { nav.popBackStack() },
                 )
             }
@@ -242,7 +344,10 @@ fun RootNavHost(
                 DownloadListScreen(
                     showBack = true,
                     onBack = { nav.popBackStack() },
-                    onOpenLocalVideo = { path -> nav.navigate("local_video?path=${Uri.encode(path)}") },
+                    onOpenLocalVideo = openLocalVideo,
+                    onOpenLocalPdf = openLocalPdf,
+                    onOpenLocalText = openLocalText,
+                    onPlayLocalAudio = playLocalAudio,
                 )
             }
 

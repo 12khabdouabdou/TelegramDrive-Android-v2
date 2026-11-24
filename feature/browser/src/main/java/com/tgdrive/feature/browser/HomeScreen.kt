@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Search
@@ -123,6 +124,7 @@ fun HomeScreen(
     onOpenSettings: () -> Unit = {},
     onOpenTrash: () -> Unit = {},
     onOpenFreeUpSpace: () -> Unit = {},
+    onOpenVault: () -> Unit = {},
     vm: HomeViewModel = hiltViewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -320,32 +322,48 @@ fun HomeScreen(
             // Storage status bento
             item { StorageStatusBento(state) }
 
-            // Quick utility pills (Free up space + Trash)
+            // Quick utility pills (Private Vault + Free up space + Trash)
             item {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     QuickActionPill(
-                        label = stringResource(R.string.home_free_up_space),
-                        icon = Icons.Filled.CleaningServices,
-                        tint = MaterialTheme.colorScheme.tertiary,
-                        modifier = Modifier.weight(1f),
-                        onClick = onOpenFreeUpSpace,
-                    )
-                    QuickActionPill(
-                        label = if (state.trashCount > 0) {
-                            "${stringResource(R.string.home_trash)} (${state.trashCount})"
+                        label = if (state.encryptedVaultCount > 0) {
+                            "${stringResource(R.string.home_vault)} (${state.encryptedVaultCount})"
                         } else {
-                            stringResource(R.string.home_trash)
+                            stringResource(R.string.home_vault)
                         },
-                        icon = Icons.Filled.DeleteOutline,
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.weight(1f),
-                        onClick = onOpenTrash,
+                        icon = Icons.Filled.Lock,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = onOpenVault,
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        QuickActionPill(
+                            label = stringResource(R.string.home_free_up_space),
+                            icon = Icons.Filled.CleaningServices,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.weight(1f),
+                            onClick = onOpenFreeUpSpace,
+                        )
+                        QuickActionPill(
+                            label = if (state.trashCount > 0) {
+                                "${stringResource(R.string.home_trash)} (${state.trashCount})"
+                            } else {
+                                stringResource(R.string.home_trash)
+                            },
+                            icon = Icons.Filled.DeleteOutline,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.weight(1f),
+                            onClick = onOpenTrash,
+                        )
+                    }
                 }
             }
 
@@ -591,6 +609,7 @@ fun HomeScreen(
                 initialFiles = files,
                 onDismiss = vm::dismissFileReview,
                 onConfirm = vm::confirmFileReview,
+                defaultWifiOnly = state.manualUploadWifiOnly,
             )
         }
     }
@@ -600,6 +619,7 @@ fun HomeScreen(
             initialName = folderName,
             summary = zipPreviewSummary,
             summaryLoading = zipPreviewLoading,
+            defaultWifiOnly = state.manualUploadWifiOnly,
             onExcludePatternsChanged = { pat ->
                 zipExcludesDraft = pat
                 vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)

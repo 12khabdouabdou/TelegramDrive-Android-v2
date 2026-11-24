@@ -47,6 +47,7 @@
     <string name="share_encrypt_files">Encrypt with AES-256</string>
     <string name="share_encrypt_vault_key">Device Vault Key</string>
     <string name="share_encrypt_custom_password">Custom password</string>
+    <string name="share_wifi_only">Upload over Wi-Fi only</string>
     <string name="share_upload_action">Upload</string>
 
     <!-- Onboarding -->

@@ -259,4 +259,14 @@ interface FileCacheDao {
 
     @Query("SELECT * FROM file_cache WHERE is_locked = 0 ORDER BY date DESC")
     suspend fun getAllUnlocked(): List<FileCacheEntity>
+
+    @Query(
+        "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",
+    )
+    fun observeEncryptedVaultFiles(): Flow<List<FileCacheEntity>>
+
+    @Query(
+        "SELECT COUNT(*) FROM file_cache WHERE is_encrypted_vault = 1 OR lower(file_name) LIKE '%.tgenc'",
+    )
+    fun observeEncryptedVaultCount(): Flow<Int>
 }

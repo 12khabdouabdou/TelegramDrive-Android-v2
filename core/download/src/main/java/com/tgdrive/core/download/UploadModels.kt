@@ -27,6 +27,7 @@ data class NormalUploadOptions(
     val conflictStrategy: UploadConflictStrategy = UploadConflictStrategy.KEEP_BOTH,
     val encryption: UploadEncryptionSpec = UploadEncryptionSpec(),
     val autoSplitOversized: Boolean = true,
+    val wifiOnly: Boolean = false,
 )
 
 data class ZipUploadRequest(
@@ -36,6 +37,7 @@ data class ZipUploadRequest(
     val maxPartBytesOverride: Long? = null,
     val excludePatterns: String = "",
     val encryption: UploadEncryptionSpec = UploadEncryptionSpec(),
+    val wifiOnly: Boolean = false,
 )
 
 sealed class DecryptOutcome {

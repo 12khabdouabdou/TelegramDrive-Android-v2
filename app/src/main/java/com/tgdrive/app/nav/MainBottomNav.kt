@@ -96,6 +96,9 @@ fun MainBottomNav(
     mainNav: NavHostController,
     onOpenVideo: (Long, Long) -> Unit,
     onOpenLocalVideo: (String) -> Unit = {},
+    onOpenLocalPdf: (String, String) -> Unit = { _, _ -> },
+    onOpenLocalText: (String, String) -> Unit = { _, _ -> },
+    onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
@@ -108,6 +111,7 @@ fun MainBottomNav(
     onOpenSettings: () -> Unit = {},
     onOpenTrash: () -> Unit = {},
     onOpenFreeUpSpace: () -> Unit = {},
+    onOpenVault: () -> Unit = {},
 ) {
     val nav = mainNav
     val backStack by nav.currentBackStackEntryAsState()
@@ -239,6 +243,7 @@ fun MainBottomNav(
                     onOpenSettings = onOpenSettings,
                     onOpenTrash = onOpenTrash,
                     onOpenFreeUpSpace = onOpenFreeUpSpace,
+                    onOpenVault = onOpenVault,
                 )
             }
             composable(Tab.PHOTOS.route) {
@@ -254,6 +259,9 @@ fun MainBottomNav(
                     showBack = false,
                     onBack = { nav.popBackStack() },
                     onOpenLocalVideo = onOpenLocalVideo,
+                    onOpenLocalPdf = onOpenLocalPdf,
+                    onOpenLocalText = onOpenLocalText,
+                    onPlayLocalAudio = onPlayLocalAudio,
                 )
             }
             composable(Tab.FOLDERS.route) {
@@ -337,6 +345,9 @@ fun MainBottomNav(
                     initialFilter = initialFilter,
                     onOpenVideo = onOpenVideo,
                     onOpenLocalVideo = onOpenLocalVideo,
+                    onOpenLocalPdf = onOpenLocalPdf,
+                    onOpenLocalText = onOpenLocalText,
+                    onPlayLocalAudio = onPlayLocalAudio,
                     onOpenImage = onOpenImage,
                     onOpenPdf = onOpenPdf,
                     onOpenZip = onOpenZip,
@@ -352,6 +363,7 @@ fun MainBottomNav(
                 folders = rootState.shareFolders,
                 inProgress = rootState.shareUploadInProgress,
                 message = rootState.shareUploadMessage,
+                defaultWifiOnly = rootState.manualUploadWifiOnly,
                 onConfirm = rootVm::confirmShareUpload,
                 onDismiss = rootVm::cancelShareUpload,
             )
@@ -365,6 +377,7 @@ private fun ShareUploadDialog(
     folders: List<ShareTargetFolder>,
     inProgress: Boolean,
     message: String?,
+    defaultWifiOnly: Boolean = false,
     onConfirm: (
         targetChatId: Long?,
         packAsZip: Boolean,
@@ -373,6 +386,7 @@ private fun ShareUploadDialog(
         encryptFiles: Boolean,
         useVaultKey: Boolean,
         compressionMode: ZipCompressionMode,
+        wifiOnly: Boolean,
     ) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -385,6 +399,7 @@ private fun ShareUploadDialog(
     var encryptFiles by remember { mutableStateOf(false) }
     var useVaultKey by remember { mutableStateOf(true) }
     var zipPassword by remember { mutableStateOf("") }
+    var wifiOnly by remember(defaultWifiOnly) { mutableStateOf(defaultWifiOnly) }
 
     AlertDialog(
         onDismissRequest = { if (!inProgress) onDismiss() },
@@ -551,6 +566,25 @@ private fun ShareUploadDialog(
                         )
                     }
                 }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = !inProgress) { wifiOnly = !wifiOnly }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = wifiOnly,
+                        enabled = !inProgress,
+                        onCheckedChange = null,
+                    )
+                    Text(
+                        text = stringResource(R.string.share_wifi_only),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
                 if (inProgress) {
                     Spacer(Modifier.height(4.dp))
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -574,6 +608,7 @@ private fun ShareUploadDialog(
                         encryptFiles,
                         useVaultKey,
                         compressionMode,
+                        wifiOnly,
                     )
                 },
                 enabled = !inProgress && (!encryptFiles || useVaultKey || zipPassword.length >= 4),

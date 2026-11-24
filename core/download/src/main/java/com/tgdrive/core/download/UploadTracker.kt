@@ -63,7 +63,9 @@ class UploadTracker @Inject constructor(
         _state.update { cur ->
             cur.copy(items = cur.items.filterNot { it.id == id } + item)
         }
-        TransferKeepAliveWorker.ensureRunning(ctx)
+        if (status.isActive) {
+            TransferKeepAliveWorker.ensureRunning(ctx)
+        }
     }
 
     fun updatePhase(
@@ -210,7 +212,7 @@ class UploadTracker @Inject constructor(
         }
     }
 
-    fun markPaused(id: String) {
+    fun markPaused(id: String, detail: String = "Paused") {
         samples.remove(id)
         _state.update { cur ->
             cur.copy(
@@ -222,7 +224,7 @@ class UploadTracker @Inject constructor(
                             speedBytesPerSec = 0L,
                             etaSeconds = null,
                             status = UploadStatus.PAUSED,
-                            statusDetail = "Paused",
+                            statusDetail = detail,
                             errorMessage = null,
                             canCancel = true,
                             canRetry = true,

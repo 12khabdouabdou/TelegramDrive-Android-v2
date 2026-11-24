@@ -13,12 +13,22 @@ class NetworkMonitor(ctx: Context) {
     private val _isOnline = MutableStateFlow(checkInitial())
     val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
 
+    private val _isUnmetered = MutableStateFlow(isCurrentlyUnmetered())
+    val isUnmetered: StateFlow<Boolean> = _isUnmetered.asStateFlow()
+
     private val callback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) { _isOnline.value = hasInternet() }
-        override fun onLost(network: Network) { _isOnline.value = hasInternet() }
+        override fun onAvailable(network: Network) {
+            _isOnline.value = hasInternet()
+            _isUnmetered.value = isCurrentlyUnmetered()
+        }
+        override fun onLost(network: Network) {
+            _isOnline.value = hasInternet()
+            _isUnmetered.value = isCurrentlyUnmetered()
+        }
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
             _isOnline.value = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            _isUnmetered.value = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
         }
     }
 
@@ -31,6 +41,12 @@ class NetworkMonitor(ctx: Context) {
     fun close() {
         runCatching { cm.unregisterNetworkCallback(callback) }
     }
+
+    fun isCurrentlyUnmetered(): Boolean = runCatching {
+        val active = cm.activeNetwork ?: return@runCatching false
+        val caps = cm.getNetworkCapabilities(active) ?: return@runCatching false
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }.getOrDefault(true)
 
     private fun checkInitial(): Boolean = runCatching { hasInternet() }.getOrDefault(true)
 

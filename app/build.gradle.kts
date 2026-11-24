@@ -120,6 +120,7 @@ dependencies {
     implementation(project(":core:download"))
     implementation(project(":core:zip"))
     implementation(project(":core:security"))
+    implementation(project(":core:audio"))
 
     // Feature modules
     implementation(project(":feature:auth"))

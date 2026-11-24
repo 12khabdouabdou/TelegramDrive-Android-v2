@@ -98,4 +98,24 @@
     <string name="settings_passvault_wipe_decrypted">Wipe temporary decrypted files</string>
     <string name="settings_passvault_wiped_count">Removed %1$d temporary decrypted item(s)</string>
     <string name="settings_passvault_verify_export">Verify identity to view Vault Key</string>
+    <string name="settings_passvault_cloud_backup">Cloud backup</string>
+    <string name="settings_passvault_cloud_restore">Cloud restore</string>
+    <string name="settings_passvault_cloud_backup_title">Back up Vault Key to Telegram</string>
+    <string name="settings_passvault_cloud_backup_desc">Encrypts your 256-bit Device Vault Key with a recovery passphrase and saves it to your private TelegramDrive System channel.</string>
+    <string name="settings_passvault_cloud_restore_title">Restore Vault Key from Telegram</string>
+    <string name="settings_passvault_cloud_restore_desc">Downloads your encrypted Vault Key backup from the TelegramDrive System channel and unlocks it with your recovery passphrase.</string>
+    <string name="settings_passvault_cloud_passphrase_label">Recovery passphrase</string>
+    <string name="settings_passvault_cloud_backup_ok">Encrypted Vault Key uploaded to System channel</string>
+    <string name="settings_passvault_cloud_restore_ok">Cloud Vault Key restored (%1$s)</string>
+    <string name="settings_passvault_cloud_busy">Syncing Vault Key…</string>
+    <string name="settings_passvault_ttl_title">Auto-wipe temporary decrypted files</string>
+    <string name="settings_passvault_ttl_desc">Automatically remove unencrypted cache copies after viewing</string>
+    <string name="settings_passvault_ttl_on_close">On close</string>
+    <string name="settings_passvault_ttl_15m">15m</string>
+    <string name="settings_passvault_ttl_30m">30m</string>
+    <string name="settings_passvault_ttl_60m">60m</string>
+    <string name="settings_passvault_ttl_manual">Manual</string>
+    <string name="settings_passvault_temp_stats">%1$d cached item(s) · %2$s</string>
+    <string name="settings_uploads_wifi_only">Upload over Wi-Fi only by default</string>
+    <string name="settings_uploads_wifi_only_desc">Pause manual &amp; ZIP uploads on cellular and auto-resume on Wi-Fi</string>
 </resources>

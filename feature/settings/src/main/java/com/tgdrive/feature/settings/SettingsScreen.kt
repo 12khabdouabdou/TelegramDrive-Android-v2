@@ -7,6 +7,7 @@ import android.content.ContextWrapper
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +29,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
@@ -41,9 +44,11 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -56,6 +61,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -115,13 +121,18 @@ fun SettingsScreen(
     var showPassphraseDialog by remember { mutableStateOf(false) }
     var exportedVaultKey by remember { mutableStateOf<String?>(null) }
     var showImportVaultDialog by remember { mutableStateOf(false) }
+    var showCloudBackupDialog by remember { mutableStateOf(false) }
+    var showCloudRestoreDialog by remember { mutableStateOf(false) }
     var passvaultNotice by remember { mutableStateOf<String?>(null) }
     var bioAvail by remember { mutableStateOf(vm.biometricAvailability()) }
+
+    LaunchedEffect(Unit) { vm.refreshTempStats() }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 bioAvail = vm.biometricAvailability()
+                vm.refreshTempStats()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -462,6 +473,208 @@ fun SettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showImportVaultDialog = false }) {
+                    Text(stringResource(R.string.settings_api_cancel))
+                }
+            },
+        )
+    }
+
+    if (showCloudBackupDialog) {
+        var passInput by remember { mutableStateOf("") }
+        var confirmInput by remember { mutableStateOf("") }
+        var showPass by remember { mutableStateOf(false) }
+        var dialogErr by remember { mutableStateOf<String?>(null) }
+        val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
+        val mismatchErr = stringResource(R.string.settings_passvault_passphrase_mismatch)
+        val backupOkMsg = stringResource(R.string.settings_passvault_cloud_backup_ok)
+
+        AlertDialog(
+            onDismissRequest = { if (!state.cloudVaultBusy) showCloudBackupDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_passvault_cloud_backup_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_passvault_cloud_backup_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = passInput,
+                        onValueChange = { passInput = it; dialogErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_cloud_passphrase_label)) },
+                        singleLine = true,
+                        enabled = !state.cloudVaultBusy,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showPass = !showPass }) {
+                                Icon(
+                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = null,
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = confirmInput,
+                        onValueChange = { confirmInput = it; dialogErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_passphrase_confirm)) },
+                        singleLine = true,
+                        enabled = !state.cloudVaultBusy,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (state.cloudVaultBusy) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text(
+                                stringResource(R.string.settings_passvault_cloud_busy),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                    dialogErr?.let {
+                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !state.cloudVaultBusy,
+                    onClick = {
+                        when {
+                            passInput.trim().length < 4 -> dialogErr = shortErr
+                            passInput != confirmInput -> dialogErr = mismatchErr
+                            else -> {
+                                scope.launch {
+                                    vm.backupVaultKeyToCloud(passInput.trim())
+                                        .onSuccess {
+                                            passvaultNotice = backupOkMsg
+                                            showCloudBackupDialog = false
+                                        }
+                                        .onFailure { err ->
+                                            dialogErr = err.message ?: "Cloud backup failed"
+                                        }
+                                }
+                            }
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_passvault_cloud_backup))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !state.cloudVaultBusy,
+                    onClick = { showCloudBackupDialog = false },
+                ) {
+                    Text(stringResource(R.string.settings_api_cancel))
+                }
+            },
+        )
+    }
+
+    if (showCloudRestoreDialog) {
+        var passInput by remember { mutableStateOf("") }
+        var showPass by remember { mutableStateOf(false) }
+        var dialogErr by remember { mutableStateOf<String?>(null) }
+        val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
+        val restoreOkFmt = stringResource(R.string.settings_passvault_cloud_restore_ok)
+
+        AlertDialog(
+            onDismissRequest = { if (!state.cloudVaultBusy) showCloudRestoreDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_passvault_cloud_restore_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_passvault_cloud_restore_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = passInput,
+                        onValueChange = { passInput = it; dialogErr = null },
+                        label = { Text(stringResource(R.string.settings_passvault_cloud_passphrase_label)) },
+                        singleLine = true,
+                        enabled = !state.cloudVaultBusy,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showPass = !showPass }) {
+                                Icon(
+                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = null,
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (state.cloudVaultBusy) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text(
+                                stringResource(R.string.settings_passvault_cloud_busy),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                    dialogErr?.let {
+                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !state.cloudVaultBusy,
+                    onClick = {
+                        if (passInput.trim().length < 4) {
+                            dialogErr = shortErr
+                        } else {
+                            scope.launch {
+                                vm.restoreVaultKeyFromCloud(passInput.trim())
+                                    .onSuccess { fp ->
+                                        passvaultNotice = String.format(restoreOkFmt, fp)
+                                        showCloudRestoreDialog = false
+                                    }
+                                    .onFailure { err ->
+                                        dialogErr = err.message ?: "Cloud restore failed"
+                                    }
+                            }
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_passvault_cloud_restore))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !state.cloudVaultBusy,
+                    onClick = { showCloudRestoreDialog = false },
+                ) {
                     Text(stringResource(R.string.settings_api_cancel))
                 }
             },
@@ -865,6 +1078,71 @@ fun SettingsScreen(
                 }
             }
             Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { showCloudBackupDialog = true },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Filled.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.settings_passvault_cloud_backup), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                OutlinedButton(
+                    onClick = { showCloudRestoreDialog = true },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(R.string.settings_passvault_cloud_restore), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = stringResource(R.string.settings_passvault_ttl_title),
+                style = TgTypography.Display.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = stringResource(R.string.settings_passvault_ttl_desc),
+                style = TgTypography.Display.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(6.dp))
+            val ttlOptions = listOf(
+                0 to stringResource(R.string.settings_passvault_ttl_on_close),
+                15 to stringResource(R.string.settings_passvault_ttl_15m),
+                30 to stringResource(R.string.settings_passvault_ttl_30m),
+                60 to stringResource(R.string.settings_passvault_ttl_60m),
+                -1 to stringResource(R.string.settings_passvault_ttl_manual),
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ttlOptions.forEach { (minutes, label) ->
+                    FilterChip(
+                        selected = state.decryptedTempTtlMinutes == minutes,
+                        onClick = { vm.setDecryptedTempTtlMinutes(minutes) },
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Text(
+                text = stringResource(
+                    R.string.settings_passvault_temp_stats,
+                    state.tempDecryptedCount,
+                    state.tempDecryptedBytes.toHumanSize(),
+                ),
+                style = TgTypography.Caption,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
             val wipedMsgFmt = stringResource(R.string.settings_passvault_wiped_count)
             TextButton(
                 onClick = {
@@ -877,6 +1155,39 @@ fun SettingsScreen(
                 Icon(Icons.Filled.CleaningServices, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
                 Text(stringResource(R.string.settings_passvault_wipe_decrypted))
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .toggleable(
+                        value = state.manualUploadWifiOnly,
+                        role = Role.Switch,
+                        onValueChange = vm::setManualUploadWifiOnly,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Wifi,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_uploads_wifi_only),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_uploads_wifi_only_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.manualUploadWifiOnly, onCheckedChange = null)
             }
             passvaultNotice?.let { msg ->
                 Text(

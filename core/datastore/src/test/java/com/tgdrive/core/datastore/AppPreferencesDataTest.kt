@@ -22,6 +22,8 @@ class AppPreferencesDataTest {
         assertThat(d.backupStrictMode).isFalse()
         assertThat(d.backupDeleteAfterUpload).isFalse()
         assertThat(d.backupPaused).isFalse()
+        assertThat(d.decryptedTempTtlMinutes).isEqualTo(30)
+        assertThat(d.manualUploadWifiOnly).isFalse()
     }
 
     @Test

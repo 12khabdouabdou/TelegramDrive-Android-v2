@@ -198,4 +198,26 @@ class BackupCryptoTest {
         }
         assertThat(out.exists()).isFalse()
     }
+
+    @Test
+    fun `wrapVaultKeyWithPassphrase and unwrapAndImportVaultKey recover vault across devices`(@TempDir tmp: File) {
+        val src = BackupCrypto(inMemoryKeystore())
+        val dst = BackupCrypto(inMemoryKeystore())
+        val secretFile = File(tmp, "doc.txt").apply { writeBytes("top-secret-vault-data".repeat(20).toByteArray()) }
+        val encFile = File(tmp, "doc.txt.tgenc")
+        src.encryptFile(secretFile, encFile)
+
+        val wrapped = src.wrapVaultKeyWithPassphrase("recovery-pass-2026")
+        assertThat(BackupCrypto.detectMagicFormat(wrapped)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+
+        assertThrows<WrongPassphraseException> {
+            dst.unwrapAndImportVaultKey(wrapped, "wrong-recovery-pass")
+        }
+        assertThat(dst.unwrapAndImportVaultKey(wrapped, "recovery-pass-2026")).isTrue()
+        assertThat(dst.vaultKeyFingerprint()).isEqualTo(src.vaultKeyFingerprint())
+
+        val outFile = File(tmp, "doc.txt")
+        dst.decryptFile(encFile, outFile)
+        assertThat(outFile.readBytes()).isEqualTo(secretFile.readBytes())
+    }
 }

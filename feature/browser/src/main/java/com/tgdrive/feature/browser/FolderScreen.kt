@@ -56,6 +56,7 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OfflinePin
@@ -72,6 +73,7 @@ import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -82,6 +84,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -161,6 +164,9 @@ fun FolderScreen(
     initialFilter: FileFilter? = null,
     onOpenVideo: (Long, Long) -> Unit,
     onOpenLocalVideo: (String) -> Unit = {},
+    onOpenLocalPdf: (String, String) -> Unit = { _, _ -> },
+    onOpenLocalText: (String, String) -> Unit = { _, _ -> },
+    onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
@@ -194,6 +200,7 @@ fun FolderScreen(
     var zipExcludesDraft by remember { mutableStateOf("") }
     var zipPartCapDraft by remember { mutableStateOf<Long?>(null) }
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
+    var showBatchDecryptDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(snackbarEvent?.id) {
         val ev = snackbarEvent ?: return@LaunchedEffect
@@ -215,12 +222,25 @@ fun FolderScreen(
         val ext = file.extension.lowercase()
         val isVideo = ev.outcome.mimeType.startsWith("video/", ignoreCase = true) ||
             ext in setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
+        val isAudio = ev.outcome.mimeType.startsWith("audio/", ignoreCase = true) ||
+            ext in setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff")
+        val isPdf = ev.outcome.mimeType.equals("application/pdf", ignoreCase = true) || ext == "pdf"
+        val isText = isTextPreviewable(ev.outcome.mimeType, ev.outcome.displayName)
         when {
             ev.outcome.mimeType.startsWith("image/", ignoreCase = true) -> {
                 decryptedImageViewerPath = file.absolutePath
             }
             isVideo -> {
                 onOpenLocalVideo(file.absolutePath)
+            }
+            isAudio -> {
+                onPlayLocalAudio(file.absolutePath, ev.outcome.displayName)
+            }
+            isPdf -> {
+                onOpenLocalPdf(file.absolutePath, ev.outcome.displayName)
+            }
+            isText -> {
+                onOpenLocalText(file.absolutePath, ev.outcome.displayName)
             }
             else -> {
                 try {
@@ -386,6 +406,18 @@ fun FolderScreen(
                                 tint = MaterialTheme.colorScheme.tertiary,
                             )
                         }
+                        val hasSelectedEncrypted = state.items.any {
+                            it.messageId in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
+                        }
+                        if (hasSelectedEncrypted) {
+                            IconButton(onClick = { showBatchDecryptDialog = true }) {
+                                Icon(
+                                    Icons.Filled.LockOpen,
+                                    contentDescription = stringResource(R.string.browser_batch_decrypt),
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
                         IconButton(onClick = {
                             moveFromDetails = false
                             showMovePicker = true
@@ -522,6 +554,26 @@ fun FolderScreen(
                     onRetry = vm::retryUpload,
                     onClear = vm::clearFinishedUploads,
                 )
+            }
+
+            state.batchDecryptProgress?.let { (done, total) ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceContainer)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.browser_batch_decrypt_progress, done, total),
+                        style = TgTypography.Caption,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    LinearProgressIndicator(
+                        progress = { if (total > 0) (done.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f },
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
+                    )
+                }
             }
 
             state.error?.let { err ->
@@ -675,12 +727,14 @@ fun FolderScreen(
             initialFiles = state.pendingReviewFiles,
             onDismiss = vm::dismissFileUploadReview,
             onConfirm = vm::confirmFileReview,
+            defaultWifiOnly = state.manualUploadWifiOnly,
         )
     }
 
     pendingNormalFolder?.let { (folderUri, folderName) ->
         FolderNormalUploadDialog(
             folderName = folderName,
+            defaultWifiOnly = state.manualUploadWifiOnly,
             onDismiss = { pendingNormalFolder = null },
             onConfirm = { options ->
                 pendingNormalFolder = null
@@ -694,6 +748,7 @@ fun FolderScreen(
             initialName = state.pendingZipFolderName,
             summary = state.zipPreviewSummary,
             summaryLoading = state.zipPreviewLoading,
+            defaultWifiOnly = state.manualUploadWifiOnly,
             onExcludePatternsChanged = { pat ->
                 zipExcludesDraft = pat
                 vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)
@@ -704,6 +759,20 @@ fun FolderScreen(
             },
             onDismiss = vm::dismissZipDialog,
             onConfirm = vm::confirmZipFolderUpload,
+        )
+    }
+
+    if (showBatchDecryptDialog) {
+        val tgencCount = state.items.count {
+            it.messageId in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
+        }
+        BatchDecryptPassphraseDialog(
+            count = tgencCount,
+            onConfirm = { pwd ->
+                showBatchDecryptDialog = false
+                vm.batchDecryptSelected(pwd)
+            },
+            onDismiss = { showBatchDecryptDialog = false },
         )
     }
 
@@ -967,12 +1036,14 @@ private fun UploadsStrip(
 @Composable
 private fun FolderNormalUploadDialog(
     folderName: String,
+    defaultWifiOnly: Boolean = false,
     onDismiss: () -> Unit,
     onConfirm: (NormalUploadOptions) -> Unit,
 ) {
     var conflict by remember { mutableStateOf(UploadConflictStrategy.KEEP_BOTH) }
     var encrypt by remember { mutableStateOf(false) }
     var useVaultKey by remember { mutableStateOf(true) }
+    var wifiOnly by remember(defaultWifiOnly) { mutableStateOf(defaultWifiOnly) }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var showPwd by remember { mutableStateOf(false) }
@@ -1102,6 +1173,23 @@ private fun FolderNormalUploadDialog(
                         )
                     }
                 }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .toggleable(value = wifiOnly, role = Role.Switch, onValueChange = { wifiOnly = it })
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Wifi, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        stringResource(R.string.browser_upload_wifi_only),
+                        style = TgTypography.Display.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(checked = wifiOnly, onCheckedChange = null)
+                }
                 error?.let {
                     Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
                 }
@@ -1120,6 +1208,7 @@ private fun FolderNormalUploadDialog(
                                 useVaultKey = useVaultKey,
                                 customPassphrase = if (encrypt && !useVaultKey) password else null,
                             ),
+                            wifiOnly = wifiOnly,
                         ),
                     )
                 }
@@ -1211,8 +1300,12 @@ private fun FileGridCell(
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
     val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
-    val thumbFile = remember(thumbModel) {
-        thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    val thumbFile = remember(thumbModel, item.isEncryptedVault) {
+        if (item.isEncryptedVault || thumbModel?.endsWith(".tgethumb", ignoreCase = true) == true) {
+            null
+        } else {
+            thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+        }
     }
     val partBadge = remember(item.fileName) {
         PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
@@ -1454,8 +1547,12 @@ private fun FileListRow(
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
     val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
-    val thumbFile = remember(thumbModel) {
-        thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    val thumbFile = remember(thumbModel, item.isEncryptedVault) {
+        if (item.isEncryptedVault || thumbModel?.endsWith(".tgethumb", ignoreCase = true) == true) {
+            null
+        } else {
+            thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+        }
     }
     val partBadge = remember(item.fileName) {
         PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }

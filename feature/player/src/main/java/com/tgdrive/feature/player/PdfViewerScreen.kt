@@ -108,22 +108,29 @@ private class PdfRendererSession(
 fun PdfViewerScreen(
     messageId: Long,
     onBack: () -> Unit,
+    initialLocalPath: String? = null,
+    initialTitle: String? = null,
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
-    var pageCount by remember(messageId) { mutableIntStateOf(0) }
-    var session by remember(messageId) { mutableStateOf<PdfRendererSession?>(null) }
-    var loading by remember(messageId) { mutableStateOf(true) }
-    var error by remember(messageId) { mutableStateOf<String?>(null) }
-    var localPath by remember(messageId) { mutableStateOf<String?>(vm.getLocalPath(messageId)) }
+    var pageCount by remember(messageId, initialLocalPath) { mutableIntStateOf(0) }
+    var session by remember(messageId, initialLocalPath) { mutableStateOf<PdfRendererSession?>(null) }
+    var loading by remember(messageId, initialLocalPath) { mutableStateOf(true) }
+    var error by remember(messageId, initialLocalPath) { mutableStateOf<String?>(null) }
+    var localPath by remember(messageId, initialLocalPath) {
+        mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId))
+    }
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     val downloadItem = downloadState.items.find { it.id == messageId }
     val isDownloading =
-        downloadItem?.status == DownloadStatus.DOWNLOADING ||
-            downloadItem?.status == DownloadStatus.QUEUED
-    val isFailed = downloadItem?.status == DownloadStatus.FAILED
+        initialLocalPath.isNullOrBlank() && (
+            downloadItem?.status == DownloadStatus.DOWNLOADING ||
+                downloadItem?.status == DownloadStatus.QUEUED
+            )
+    val isFailed = initialLocalPath.isNullOrBlank() && downloadItem?.status == DownloadStatus.FAILED
 
-    LaunchedEffect(messageId, downloadState.items) {
+    LaunchedEffect(messageId, initialLocalPath, downloadState.items) {
+        if (!initialLocalPath.isNullOrBlank()) return@LaunchedEffect
         val path = vm.getLocalPath(messageId)
         if (path != null && path != localPath) {
             localPath = path
@@ -177,8 +184,8 @@ fun PdfViewerScreen(
             if (pageCount <= 0) 0 else (listState.firstVisibleItemIndex + 1).coerceIn(1, pageCount)
         }
     }
-    var scale by remember(messageId) { mutableFloatStateOf(1f) }
-    var offset by remember(messageId) { mutableStateOf(Offset.Zero) }
+    var scale by remember(messageId, initialLocalPath) { mutableFloatStateOf(1f) }
+    var offset by remember(messageId, initialLocalPath) { mutableStateOf(Offset.Zero) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
@@ -204,7 +211,10 @@ fun PdfViewerScreen(
             }
             Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
                 Text(
-                    text = downloadItem?.fileName ?: "PDF",
+                    text = initialTitle?.takeIf { it.isNotBlank() }
+                        ?: downloadItem?.fileName
+                        ?: localPath?.let { File(it).name }
+                        ?: "PDF",
                     style = TgTypography.Display.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.SemiBold,

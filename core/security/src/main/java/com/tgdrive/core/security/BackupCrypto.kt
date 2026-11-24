@@ -2,6 +2,8 @@ package com.tgdrive.core.security
 
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -85,6 +87,43 @@ class BackupCrypto @Inject constructor(
         val decoded = runCatching { Base64.getDecoder().decode(clean) }.getOrNull() ?: return false
         if (decoded.size != KEY_BYTES) return false
         keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(decoded))
+        return true
+    }
+
+    /** Wraps the 256-bit Device Vault Key in an AES-256 `TGE2` container protected by [recoveryPassphrase]. */
+    fun wrapVaultKeyWithPassphrase(recoveryPassphrase: String): ByteArray {
+        val cleanPass = recoveryPassphrase.trim()
+        require(cleanPass.length >= 4) { "Recovery passphrase must be at least 4 characters" }
+        val out = ByteArrayOutputStream()
+        encryptStreamWithPassphrase(
+            passphrase = cleanPass.toCharArray(),
+            input = ByteArrayInputStream(vaultKey()),
+            output = out,
+        )
+        return out.toByteArray()
+    }
+
+    /** Unwraps a passphrase-protected Vault Key blob produced by [wrapVaultKeyWithPassphrase] and imports it. */
+    @Synchronized
+    fun unwrapAndImportVaultKey(
+        wrappedBytes: ByteArray,
+        recoveryPassphrase: String,
+    ): Boolean {
+        val cleanPass = recoveryPassphrase.trim()
+        if (cleanPass.isEmpty()) throw WrongPassphraseException("Recovery passphrase is required")
+        val out = ByteArrayOutputStream()
+        try {
+            decryptStreamWithPassphrase(
+                passphrase = cleanPass.toCharArray(),
+                input = ByteArrayInputStream(wrappedBytes),
+                output = out,
+            )
+        } catch (e: AEADBadTagException) {
+            throw WrongPassphraseException("Incorrect recovery passphrase", e)
+        }
+        val key = out.toByteArray()
+        if (key.size != KEY_BYTES) return false
+        keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(key))
         return true
     }
 

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -63,6 +64,7 @@ data class ZipUploadOptions(
     val compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
     val maxPartBytesOverride: Long? = null,
     val excludePatterns: String = "",
+    val wifiOnly: Boolean = false,
 )
 
 @Composable
@@ -74,6 +76,7 @@ fun ZipUploadOptionsDialog(
     summary: ZipSelectionSummary? = null,
     summaryLoading: Boolean = false,
     showExcludePatterns: Boolean = true,
+    defaultWifiOnly: Boolean = false,
     onExcludePatternsChanged: ((String) -> Unit)? = null,
     onMaxPartSizeChanged: ((Long?) -> Unit)? = null,
 ) {
@@ -94,6 +97,7 @@ fun ZipUploadOptionsDialog(
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var wifiOnly by remember(defaultWifiOnly) { mutableStateOf(defaultWifiOnly) }
     var error by remember { mutableStateOf<String?>(null) }
 
     val errEmptyName = stringResource(R.string.upload_zip_error_empty_name)
@@ -413,6 +417,43 @@ fun ZipUploadOptionsDialog(
                     }
                 }
 
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .toggleable(
+                            value = wifiOnly,
+                            role = Role.Switch,
+                            onValueChange = { wifiOnly = it },
+                        )
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.Wifi,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 10.dp),
+                    ) {
+                        Text(
+                            stringResource(R.string.upload_wifi_only_title),
+                            style = TgTypography.Display.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            stringResource(R.string.upload_wifi_only_desc),
+                            style = TgTypography.Caption,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = wifiOnly, onCheckedChange = null)
+                }
+
                 error?.let {
                     Text(it, style = TgTypography.Display.bodySmall, color = MaterialTheme.colorScheme.error)
                 }
@@ -431,6 +472,7 @@ fun ZipUploadOptionsDialog(
                             compressionMode = compressionMode,
                             maxPartBytesOverride = partCapOverride,
                             excludePatterns = excludePatterns.trim(),
+                            wifiOnly = wifiOnly,
                         ),
                     )
                     useVaultKey -> onConfirm(
@@ -441,6 +483,7 @@ fun ZipUploadOptionsDialog(
                             compressionMode = compressionMode,
                             maxPartBytesOverride = partCapOverride,
                             excludePatterns = excludePatterns.trim(),
+                            wifiOnly = wifiOnly,
                         ),
                     )
                     password.isBlank() -> error = errEmptyPwd
@@ -454,6 +497,7 @@ fun ZipUploadOptionsDialog(
                             compressionMode = compressionMode,
                             maxPartBytesOverride = partCapOverride,
                             excludePatterns = excludePatterns.trim(),
+                            wifiOnly = wifiOnly,
                         ),
                     )
                 }
