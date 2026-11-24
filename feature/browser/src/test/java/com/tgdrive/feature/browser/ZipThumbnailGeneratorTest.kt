@@ -375,7 +375,9 @@ class ZipThumbnailGeneratorTest {
         assertThat(cachedFiles.any { it.name.endsWith(".jpg") && it.length() > 0L }).isTrue()
 
         gen.clear()
-        assertThat(zipFile.delete()).isTrue()
+        val origMtime = zipFile.lastModified()
+        zipFile.writeBytes(byteArrayOf(1, 2, 3))
+        zipFile.setLastModified(origMtime)
 
         val fromDisk = gen.getThumbnail(zipFile.absolutePath, "persist.png")
         assertThat(fromDisk).isNotNull()
