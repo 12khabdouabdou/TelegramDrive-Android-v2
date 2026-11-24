@@ -220,34 +220,34 @@ object ZipUploader {
         excludeMatcher: ((relPath: String, name: String) -> Boolean)? = null,
     ): ZipSelectionSummary {
         val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
-        val entries = if (!rootDocId.isNullOrBlank()) {
-            collectTreeEntriesViaCursor(
-                context = context,
-                treeUri = treeUri,
-                rootDocId = rootDocId,
-                rootName = rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "folder" },
-                excludeMatcher = null,
-                excludePathMatcher = excludeMatcher,
-                includedRelativePaths = null,
-                includedUris = null,
-            )
-        } else {
-            val root = DocumentFile.fromTreeUri(context, treeUri)
-            if (root != null) {
-                collectTreeEntriesFallback(
+        val cursorEntries = if (!rootDocId.isNullOrBlank()) {
+            runCatching {
+                collectTreeEntriesViaCursor(
                     context = context,
-                    dir = root,
-                    rootName = root.name ?: "folder",
-                    subPath = "",
+                    treeUri = treeUri,
+                    rootDocId = rootDocId,
+                    rootName = rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "folder" },
                     excludeMatcher = null,
                     excludePathMatcher = excludeMatcher,
                     includedRelativePaths = null,
                     includedUris = null,
                 )
-            } else {
-                emptyList()
-            }
+            }.getOrNull()
+        } else {
+            null
         }
+        val entries: List<ZipSourceEntry> = cursorEntries ?: DocumentFile.fromTreeUri(context, treeUri)?.let { root ->
+            collectTreeEntriesFallback(
+                context = context,
+                dir = root,
+                rootName = root.name ?: "folder",
+                subPath = "",
+                excludeMatcher = null,
+                excludePathMatcher = excludeMatcher,
+                includedRelativePaths = null,
+                includedUris = null,
+            )
+        }.orEmpty()
         return buildSelectionSummary(context, entries.size, entries.sumOf { it.sizeBytes.coerceAtLeast(0L) }, maxPartBytes)
     }
 

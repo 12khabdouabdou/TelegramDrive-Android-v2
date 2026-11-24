@@ -1206,7 +1206,7 @@ class UploadManager @Inject constructor(
     ): Long {
         if (mimeType.startsWith("image/", ignoreCase = true) && file.isFile) {
             val exifMs = runCatching {
-                val exif = ExifInterface(file)
+                val exif = ExifInterface(file.absolutePath)
                 val raw = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
                     ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
                     ?: return@runCatching null

@@ -32,6 +32,7 @@ class UploadManagerTest {
             override val main: CoroutineDispatcher = d
             override val io: CoroutineDispatcher = d
             override val default: CoroutineDispatcher = d
+            override val unconfined: CoroutineDispatcher = d
         }
 
     private fun fakeContext(cacheRoot: File): Context = mockk(relaxed = true) {
