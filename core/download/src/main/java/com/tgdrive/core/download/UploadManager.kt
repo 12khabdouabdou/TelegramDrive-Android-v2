@@ -1149,7 +1149,8 @@ class UploadManager @Inject constructor(
             val rows = mutableListOf<Row>()
             val cursor = runCatching {
                 ctx.contentResolver.query(childrenUri, projection, null, null, null)
-            }.getOrNull() ?: run {
+            }.getOrNull()
+            if (cursor == null) {
                 if (dirsVisited == 1) return null
                 continue
             }
