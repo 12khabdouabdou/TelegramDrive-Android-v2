@@ -1051,7 +1051,7 @@ class UploadManager @Inject constructor(
     private fun hasEnoughDiskSpace(dir: File, requiredBytes: Long): Boolean {
         if (requiredBytes <= 0L) return true
         val available = try {
-            StatFs(dir.absolutePath).availableBytes
+            StatFs(dir.absolutePath).availableBytes.takeIf { it > 0L } ?: dir.usableSpace
         } catch (_: Throwable) {
             dir.usableSpace
         }

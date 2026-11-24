@@ -54,7 +54,8 @@ class StagingManager @Inject constructor(
         if (requiredBytes <= 0L) return true
         return try {
             stagingDir.mkdirs()
-            val available = StatFs(stagingDir.path).availableBytes
+            val available = StatFs(stagingDir.path).availableBytes.takeIf { it > 0L }
+                ?: stagingDir.usableSpace
             available >= requiredBytes + FREE_SPACE_SAFETY_BUFFER_BYTES
         } catch (_: Throwable) {
             true

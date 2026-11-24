@@ -208,7 +208,7 @@ object ZipUploader {
             }
         }
         return try {
-            StatFs(probe.absolutePath).availableBytes
+            StatFs(probe.absolutePath).availableBytes.takeIf { it > 0L } ?: probe.usableSpace
         } catch (_: Throwable) {
             probe.usableSpace
         }
