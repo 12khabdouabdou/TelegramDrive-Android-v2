@@ -83,6 +83,7 @@ class GlobalSearchViewModel
         private val downloadManager: DownloadManager,
         private val offlinePinStore: OfflinePinStore,
         private val uploadManager: UploadManager,
+        private val backupCrypto: BackupCrypto,
         private val audioPlayerController: AudioPlayerController,
         private val mediaThumbnailCache: MediaThumbnailCache,
         private val preferences: AppPreferences,
@@ -148,7 +149,7 @@ class GlobalSearchViewModel
                     _filterCriteria.update { it.copy(folderNames = map) }
                     systemChannelId = runCatching { telegramClient.getOrCreateSystemChannel() }.getOrNull()
                     _hasSavedBackupPassphrase.value = runCatching {
-                        uploadManager.hasSavedBackupPassphrase()
+                        backupCrypto.hasCustomBackupPassphrase()
                     }.getOrDefault(false)
                 } catch (e: CancellationException) {
                     throw e
