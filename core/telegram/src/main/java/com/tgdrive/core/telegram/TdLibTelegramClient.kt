@@ -906,7 +906,7 @@ class TdLibTelegramClient(
                     out.write(buf, 0, n)
                 }
                 out.toByteArray()
-            }
+            } ?: return@use null
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@use null

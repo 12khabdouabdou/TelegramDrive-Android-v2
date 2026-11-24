@@ -173,7 +173,8 @@ object ZipUploader {
                             } else {
                                 "$basePath$name"
                             }
-                            val params = buildZipParameters(entryPath, usePassword, ZipCompressionMode.SMART)
+                            val childSize = child.length().takeIf { it > 0L } ?: resolveUriSize(context, child.uri)
+                            val params = buildZipParameters(entryPath, usePassword, ZipCompressionMode.SMART, childSize)
                             context.contentResolver.openInputStream(child.uri)?.use { input ->
                                 zos.putNextEntry(params)
                                 input.copyTo(zos, COPY_BUFFER_SIZE)
@@ -408,7 +409,7 @@ object ZipUploader {
         val usePassword = !password.isNullOrBlank()
         val splitOutZip = File(workDir, "$stem.zip")
         if (splitOutZip.exists()) splitOutZip.delete()
-        val params = buildZipParameters(safeLeaf, usePassword, ZipCompressionMode.STORE)
+        val params = buildZipParameters(safeLeaf, usePassword, ZipCompressionMode.STORE, sourceFile.length())
         val splitLen = (maxPartBytes - PART_HEADER_MARGIN_BYTES).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
         val zf = if (usePassword) ZipFile(splitOutZip, password!!.toCharArray()) else ZipFile(splitOutZip)
         zf.use { zip ->
@@ -829,7 +830,7 @@ object ZipUploader {
                         }
                         val splitOutZip = File(workDir, "$splitBase.zip")
                         if (splitOutZip.exists()) splitOutZip.delete()
-                        val params = buildZipParameters(safeRelPath, usePassword, compressionMode)
+                        val params = buildZipParameters(safeRelPath, usePassword, compressionMode, stagedFile.length())
                         val splitLen = (maxPartBytes - PART_HEADER_MARGIN_BYTES).coerceAtLeast(MIN_ZIP4J_SPLIT_BYTES)
                         val zf = if (usePassword) {
                             ZipFile(splitOutZip, password!!.toCharArray())
@@ -896,7 +897,8 @@ object ZipUploader {
                 val stream = entry.openStream() ?: continue
                 stream.use { input ->
                     val zos = currentZipOut!!
-                    zos.putNextEntry(buildZipParameters(safeRelPath, usePassword, compressionMode))
+                    val params = buildZipParameters(safeRelPath, usePassword, compressionMode, entry.sizeBytes)
+                    zos.putNextEntry(params)
                     val copied = copyStreamWithCancelCheck(input, zos)
                     zos.closeEntry()
                     currentEntries.add(safeRelPath)
@@ -1073,11 +1075,19 @@ object ZipUploader {
         entryPath: String,
         encrypt: Boolean,
         compressionMode: ZipCompressionMode,
+        entrySizeBytes: Long = -1L,
     ): ZipParameters {
-        val method = resolveCompressionMethod(entryPath, compressionMode)
+        val resolved = resolveCompressionMethod(entryPath, compressionMode)
+        val method = if (resolved == CompressionMethod.STORE && entrySizeBytes <= 0L) {
+            CompressionMethod.DEFLATE
+        } else {
+            resolved
+        }
         return ZipParameters().apply {
             compressionMethod = method
-            if (method == CompressionMethod.DEFLATE) {
+            if (method == CompressionMethod.STORE) {
+                entrySize = entrySizeBytes
+            } else {
                 compressionLevel = CompressionLevel.NORMAL
             }
             fileNameInZip = entryPath
@@ -1392,7 +1402,8 @@ object ZipUploader {
                 uris.forEachIndexed { idx, uri ->
                     val rawName = resolveUriDisplayName(context, uri) ?: "file_${idx + 1}"
                     val entryName = deduplicateEntryName(sanitizeZipBaseName(rawName), usedNames)
-                    val params = buildZipParameters(entryName, encrypted, compressionMode)
+                    val entrySize = resolveUriSize(context, uri)
+                    val params = buildZipParameters(entryName, encrypted, compressionMode, entrySize)
                     context.contentResolver.openInputStream(uri)?.use { input ->
                         stream.putNextEntry(params)
                         while (true) {
