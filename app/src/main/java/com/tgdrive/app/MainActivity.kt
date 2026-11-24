@@ -82,7 +82,18 @@ class MainActivity : FragmentActivity() {
             val state by rootVm.state.collectAsStateWithLifecycle()
 
             LaunchedEffect(currentIntent) {
-                currentIntent?.let { rootVm.handleShareIntent(it) }
+                currentIntent?.let { rootVm.handleAppIntent(it) }
+            }
+
+            LaunchedEffect(state.blockScreenshotsEverywhere) {
+                if (state.blockScreenshotsEverywhere) {
+                    window.setFlags(
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                    )
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
             }
 
             val darkTheme = when (state.themeMode) {

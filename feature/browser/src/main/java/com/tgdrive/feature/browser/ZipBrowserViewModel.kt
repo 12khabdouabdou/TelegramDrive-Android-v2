@@ -40,6 +40,11 @@ import javax.inject.Inject
  * UI state and ViewModel for the in-app ZIP browser with Vault Key auto-unlock,
  * password caching, single-entry preview, and full Extract-All-to-Downloads support.
  */
+data class ZipImageViewerData(
+    val paths: List<String>,
+    val initialIndex: Int,
+)
+
 data class ZipBrowserUiState(
     val entries: List<ZipEntryInfo> = emptyList(),
     val loading: Boolean = false,
@@ -47,6 +52,7 @@ data class ZipBrowserUiState(
     val zipReady: Boolean = false,
     val passwordRequired: Boolean = false,
     val extractedPath: String? = null,
+    val imageViewerData: ZipImageViewerData? = null,
     val extractingEntry: String? = null,
     val unlockedPassword: String? = null,
     val resolvedLocalPath: String? = null,
@@ -73,7 +79,7 @@ class ZipBrowserViewModel
         private val zipAllExtractor: ZipAllExtractor,
         private val zipIndexService: ZipIndexService,
         private val offlinePinStore: OfflinePinStore,
-        private val backupCrypto: BackupCrypto,
+        val backupCrypto: BackupCrypto,
     ) : ViewModel() {
         private val _state = MutableStateFlow(
             ZipBrowserUiState(hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase()),
@@ -188,13 +194,27 @@ class ZipBrowserViewModel
                             }
                         }
                     }
+                    val hasEncrypted = entries.any { e -> e.isEncrypted }
+                    if (hasEncrypted && cachedPassword == null) {
+                        val candidates = buildList {
+                            add(backupCrypto.zipVaultPassword())
+                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
+                        }.distinct()
+                        for (candidate in candidates) {
+                            if (probeZipPassword(zipPath, entries, candidate)) {
+                                cachedPassword = candidate
+                                break
+                            }
+                        }
+                    }
                     _state.update {
                         it.copy(
                             entries = entries,
                             loading = false,
                             error = null,
                             zipReady = true,
-                            passwordRequired = entries.any { e -> e.isEncrypted },
+                            passwordRequired = hasEncrypted,
+                            unlockedPassword = cachedPassword,
                             hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
                         )
                     }
@@ -700,6 +720,158 @@ class ZipBrowserViewModel
 
         fun clearStatusMessage() {
             _state.update { it.copy(statusMessage = null) }
+        }
+
+        private fun probeZipPassword(
+            zipPath: String,
+            entries: List<ZipEntryInfo>,
+            password: String,
+        ): Boolean {
+            if (password.isBlank()) return false
+            val target = entries
+                .filter { !it.isDirectory && it.isEncrypted }
+                .minByOrNull { it.compressedSize.coerceAtLeast(0L) }
+                ?: return false
+            return runCatching {
+                net.lingala.zip4j.ZipFile(File(zipPath), password.toCharArray()).use { zip ->
+                    val header = zip.getFileHeader(target.name)
+                        ?: zip.fileHeaders.firstOrNull { !it.isDirectory && it.isEncrypted }
+                        ?: return@use false
+                    zip.getInputStream(header).use { input ->
+                        val buf = ByteArray(64)
+                        input.read(buf)
+                    }
+                    true
+                }
+            }.getOrDefault(false)
+        }
+
+        fun unlockPreviews(password: String) {
+            val zipPath = currentZipPath ?: return
+            val pwd = password.ifBlank { return }
+            viewModelScope.launch(dispatchers.io) {
+                val ok = probeZipPassword(zipPath, _state.value.entries, pwd)
+                if (ok) {
+                    cachedPassword = pwd
+                    _state.update { it.copy(unlockedPassword = pwd, error = null) }
+                } else {
+                    _state.update { it.copy(error = "Incorrect password for previews") }
+                }
+            }
+        }
+
+        fun unlockPreviewsWithVault(useSavedBackupPassphrase: Boolean = false) {
+            val zipPath = currentZipPath ?: return
+            viewModelScope.launch(dispatchers.io) {
+                val candidates = buildList {
+                    if (useSavedBackupPassphrase) {
+                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
+                        add(backupCrypto.zipVaultPassword())
+                    } else {
+                        add(backupCrypto.zipVaultPassword())
+                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
+                    }
+                }.distinct()
+                for (candidate in candidates) {
+                    if (probeZipPassword(zipPath, _state.value.entries, candidate)) {
+                        cachedPassword = candidate
+                        _state.update { it.copy(unlockedPassword = candidate, error = null) }
+                        return@launch
+                    }
+                }
+                _state.update { it.copy(error = "Vault key did not unlock previews — enter password") }
+            }
+        }
+
+        fun openImageEntryWithSiblings(
+            targetEntry: ZipEntryInfo,
+            siblingImages: List<ZipEntryInfo>,
+            onNeedPassword: () -> Unit,
+        ) {
+            val zipPath = currentZipPath ?: return
+            if (targetEntry.isEncrypted && cachedPassword == null) {
+                if (!isVaultHinted) {
+                    onNeedPassword()
+                    return
+                }
+            }
+            if (_state.value.extractingEntry != null) return
+            _state.update { it.copy(extractingEntry = targetEntry.name, error = null) }
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    var activePassword = cachedPassword
+                    if (targetEntry.isEncrypted && activePassword == null) {
+                        val candidates = buildList {
+                            add(backupCrypto.zipVaultPassword())
+                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
+                        }.distinct()
+                        for (candidate in candidates) {
+                            if (probeZipPassword(zipPath, _state.value.entries, candidate)) {
+                                activePassword = candidate
+                                cachedPassword = candidate
+                                break
+                            }
+                        }
+                        if (activePassword == null) {
+                            _state.update { it.copy(extractingEntry = null) }
+                            withContext(dispatchers.main) { onNeedPassword() }
+                            return@launch
+                        }
+                    }
+
+                    val outDir = File(appContext.cacheDir, "zip_extracts/swipe").apply { mkdirs() }
+                    val orderedSiblings = siblingImages.ifEmpty { listOf(targetEntry) }
+                    val targetIdx = orderedSiblings.indexOfFirst { it.name == targetEntry.name }
+                        .takeIf { it >= 0 } ?: 0
+                    val windowStart = (targetIdx - 8).coerceAtLeast(0)
+                    val windowEnd = (targetIdx + 8).coerceAtMost(orderedSiblings.lastIndex)
+                    val extractedList = ArrayList<Pair<Int, String>>()
+                    for (i in windowStart..windowEnd) {
+                        val e = orderedSiblings[i]
+                        val pwd = if (e.isEncrypted) activePassword else null
+                        val extracted = runCatching {
+                            zipExtractor.extractEntry(zipPath, e.name, outDir, pwd)
+                        }.getOrNull()
+                        if (extracted != null) {
+                            extractedList.add(i to extracted)
+                        }
+                    }
+                    val targetResult = extractedList.firstOrNull { it.first == targetIdx }
+                    if (targetResult == null) {
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                error = "Failed to extract '${targetEntry.name}'",
+                            )
+                        }
+                        return@launch
+                    }
+                    val paths = extractedList.map { it.second }
+                    val initialViewerIdx = extractedList.indexOfFirst { it.first == targetIdx }.coerceAtLeast(0)
+                    _state.update {
+                        it.copy(
+                            extractingEntry = null,
+                            unlockedPassword = cachedPassword,
+                            imageViewerData = ZipImageViewerData(paths = paths, initialIndex = initialViewerIdx),
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    _state.update { it.copy(extractingEntry = null) }
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("ZipBrowser: openImageEntryWithSiblings failed", t)
+                    _state.update {
+                        it.copy(
+                            extractingEntry = null,
+                            error = t.message ?: "Failed to open image",
+                        )
+                    }
+                }
+            }
+        }
+
+        fun clearImageViewerData() {
+            _state.update { it.copy(imageViewerData = null) }
         }
 
         fun clearExtractedPath() {

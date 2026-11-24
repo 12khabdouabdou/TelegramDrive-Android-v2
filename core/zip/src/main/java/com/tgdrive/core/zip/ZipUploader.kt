@@ -7,7 +7,6 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import com.tgdrive.core.common.Log
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -1338,40 +1337,69 @@ object ZipUploader {
     }
 
     /**
+     * Reads the bytes of up to [maxCount] unencrypted image entries in [zipPath]
+     * (for single-cover or 2x2 collage ZIP thumbnails).
+     */
+    fun readPreviewImageEntriesBytes(
+        zipPath: String,
+        maxCount: Int = 4,
+        maxBytesPerEntry: Int = 10 * 1024 * 1024,
+        password: String? = null,
+    ): List<ByteArray> {
+        if (maxCount <= 0) return emptyList()
+        return try {
+            val zipFile = File(zipPath)
+            if (!zipFile.isFile) return emptyList()
+            val allowEncrypted = !password.isNullOrBlank()
+            val openZip = if (allowEncrypted) {
+                ZipFile(zipFile, password!!.toCharArray())
+            } else {
+                ZipFile(zipFile)
+            }
+            openZip.use { zip ->
+                val headers = zip.fileHeaders.filter { h ->
+                    !h.isDirectory &&
+                        (!h.isEncrypted || allowEncrypted) &&
+                        (h.uncompressedSize <= 0L || h.uncompressedSize <= maxBytesPerEntry.toLong()) &&
+                        h.fileName.substringAfterLast('.', "").lowercase() in IMAGE_COVER_EXTS
+                }.take(maxCount)
+                val outList = ArrayList<ByteArray>(headers.size)
+                for (header in headers) {
+                    val bytes = zip.getInputStream(header).use { input ->
+                        val out = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(16 * 1024)
+                        var total = 0
+                        var exceeded = false
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            total += n
+                            if (total > maxBytesPerEntry) {
+                                exceeded = true
+                                break
+                            }
+                            out.write(buf, 0, n)
+                        }
+                        if (exceeded) null else out.toByteArray()
+                    }
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        outList.add(bytes)
+                    }
+                }
+                outList
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    /**
      * Reads the bytes of the first unencrypted image entry in [zipPath] (for ZIP cover thumbnails).
      */
     fun readFirstImageEntryBytes(
         zipPath: String,
         maxBytes: Int = 10 * 1024 * 1024,
-    ): ByteArray? {
-        return try {
-            val zipFile = File(zipPath)
-            if (!zipFile.isFile) return null
-            ZipFile(zipFile).use { zip ->
-                val header = zip.fileHeaders.firstOrNull { h ->
-                    !h.isDirectory &&
-                        !h.isEncrypted &&
-                        (h.uncompressedSize <= 0L || h.uncompressedSize <= maxBytes.toLong()) &&
-                        h.fileName.substringAfterLast('.', "").lowercase() in IMAGE_COVER_EXTS
-                } ?: return null
-                zip.getInputStream(header).use { input ->
-                    val out = java.io.ByteArrayOutputStream()
-                    val buf = ByteArray(16 * 1024)
-                    var total = 0
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        total += n
-                        if (total > maxBytes) return null
-                        out.write(buf, 0, n)
-                    }
-                    out.toByteArray()
-                }
-            }
-        } catch (_: Throwable) {
-            null
-        }
-    }
+    ): ByteArray? = readPreviewImageEntriesBytes(zipPath, maxCount = 1, maxBytesPerEntry = maxBytes).firstOrNull()
 
     /**
      * Packs an arbitrary list of SAF [uris] into a single [outputFile] ZIP archive

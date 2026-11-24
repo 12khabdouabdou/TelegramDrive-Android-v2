@@ -9,6 +9,7 @@
     <!-- AutoBackup foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- AutoBackup media access (Android 13+) -->
@@ -79,7 +80,29 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="*/*" />
             </intent-filter>
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- Foreground media playback service for mini/lock-screen audio player -->
+        <service
+            android:name="com.tgdrive.core.audio.AudioPlaybackService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Home screen quick-actions widget -->
+        <receiver
+            android:name=".widget.TgDriveAppWidgetProvider"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_tgdrive_info" />
+        </receiver>
 
         <!-- WorkManager initializer disabled; we bootstrap it via Hilt in App class -->
         <provider

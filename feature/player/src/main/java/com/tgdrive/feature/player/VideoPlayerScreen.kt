@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.AudioManager
 import android.media.ExifInterface
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -38,12 +39,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PictureInPictureAlt
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -114,7 +121,12 @@ import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.UploadConflictStrategy
+import com.tgdrive.core.download.UploadFileItem
+import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.ai.MediaAiIndexer
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.designsystem.theme.TgTypography
@@ -153,6 +165,8 @@ class VideoPlayerViewModel @Inject constructor(
     private val offlinePinStore: OfflinePinStore,
     private val trashEntryDao: TrashEntryDao,
     private val cloudSyncManager: CloudSyncManager,
+    private val mediaAiIndexer: MediaAiIndexer,
+    private val uploadManager: UploadManager,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
@@ -218,6 +232,133 @@ class VideoPlayerViewModel @Inject constructor(
     suspend fun loadAlbumMedia(albumId: String): List<FileCacheEntity> {
         if (albumId.isBlank()) return emptyList()
         return runCatching { fileCacheDao.getMediaItemsForAlbum(albumId) }.getOrDefault(emptyList())
+    }
+
+    suspend fun loadSiblingVideos(chatId: Long): List<FileCacheEntity> {
+        if (chatId == 0L) return emptyList()
+        return runCatching {
+            fileCacheDao.forChat(chatId).filter { entity ->
+                if (entity.isLocked || entity.isEncryptedVault) return@filter false
+                val mime = entity.mimeType.orEmpty().lowercase()
+                val ext = entity.fileName.substringAfterLast('.', "").lowercase()
+                mime.startsWith("video/") || ext in VIDEO_EXTS
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun recognizeBitmapText(bitmap: Bitmap): String = mediaAiIndexer.recognizeBitmapText(bitmap)
+
+    suspend fun saveFileToPublicDownloads(
+        source: File,
+        displayName: String,
+        mimeType: String,
+    ): File? = withContext(dispatchers.io) {
+        if (!source.isFile || source.length() <= 0L) return@withContext null
+        val safeName = displayName.replace(Regex("[^A-Za-z0-9._ -]"), "_").ifBlank { source.name }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = appContext.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
+                try {
+                    resolver.openOutputStream(uri)?.use { out -> source.inputStream().use { it.copyTo(out) } }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                } catch (t: Throwable) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw t
+                }
+                source
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TelegramDrive")
+                    .apply { mkdirs() }
+                val dest = File(dir, safeName)
+                source.copyTo(dest, overwrite = true)
+                dest
+            }
+        }.getOrNull()
+    }
+
+    suspend fun saveEditedTextToDownloads(fileName: String, text: String): Boolean = withContext(dispatchers.io) {
+        val dir = File(appContext.cacheDir, "text_edits").apply { mkdirs() }
+        val tmp = File(dir, fileName.ifBlank { "edited.txt" })
+        runCatching {
+            tmp.writeText(text, Charsets.UTF_8)
+            saveFileToPublicDownloads(tmp, tmp.name, "text/plain") != null
+        }.getOrDefault(false)
+    }
+
+    fun reuploadEditedText(
+        chatId: Long,
+        fileName: String,
+        text: String,
+        virtualPath: String = "",
+    ) {
+        if (chatId == 0L) return
+        viewModelScope.launch(dispatchers.io) {
+            val dir = File(appContext.cacheDir, "text_edits").apply { mkdirs() }
+            val safeName = fileName.replace(Regex("[/\\\\]"), "_").ifBlank { "edited.txt" }
+            val out = File(dir, "${System.currentTimeMillis()}_$safeName")
+            out.writeText(text, Charsets.UTF_8)
+            val uri = Uri.fromFile(out)
+            uploadManager.enqueueFiles(
+                chatId = chatId,
+                files = listOf(
+                    UploadFileItem(
+                        uri = uri,
+                        displayName = safeName,
+                        mimeType = "text/plain",
+                        sizeBytes = out.length(),
+                    ),
+                ),
+                options = NormalUploadOptions(
+                    conflictStrategy = UploadConflictStrategy.REPLACE,
+                    virtualPath = virtualPath,
+                ),
+            )
+        }
+    }
+
+    suspend fun saveBitmapToPublicDownloads(bitmap: Bitmap, displayName: String): Boolean = withContext(dispatchers.io) {
+        val safeName = displayName.replace(Regex("[^A-Za-z0-9._ -]"), "_").ifBlank { "frame.jpg" }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
+                    put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = appContext.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching false
+                try {
+                    val ok = resolver.openOutputStream(uri)?.use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                    } ?: false
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    ok
+                } catch (t: Throwable) {
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw t
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TelegramDrive")
+                    .apply { mkdirs() }
+                File(dir, safeName).outputStream().use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                }
+            }
+        }.getOrDefault(false)
     }
 
     suspend fun updateUserNote(chatId: Long, messageId: Long, rawNote: String): String =
@@ -535,7 +676,6 @@ private tailrec fun Context.findActivity(): Activity? =
  * tap/swipe seek/brightness/volume gestures, cloud-synced resume position, and PiP.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VideoPlayerScreen(
     messageId: Long,
@@ -543,6 +683,44 @@ fun VideoPlayerScreen(
     chatId: Long = 0L,
     initialLocalPath: String? = null,
     vm: VideoPlayerViewModel = hiltViewModel(),
+) {
+    var activeMessageId by remember(chatId, messageId, initialLocalPath) { mutableLongStateOf(messageId) }
+    var siblingVideos by remember(chatId, initialLocalPath) { mutableStateOf<List<FileCacheEntity>>(emptyList()) }
+
+    LaunchedEffect(chatId, initialLocalPath) {
+        if (chatId != 0L && initialLocalPath.isNullOrBlank()) {
+            siblingVideos = vm.loadSiblingVideos(chatId)
+        }
+    }
+
+    val currentIdx = siblingVideos.indexOfFirst { it.messageId == activeMessageId }
+    val prevVideoId = if (currentIdx > 0) siblingVideos[currentIdx - 1].messageId else null
+    val nextVideoId = if (currentIdx >= 0 && currentIdx < siblingVideos.lastIndex) siblingVideos[currentIdx + 1].messageId else null
+
+    androidx.compose.runtime.key(chatId, activeMessageId, initialLocalPath) {
+        VideoPlayerBody(
+            messageId = activeMessageId,
+            onBack = onBack,
+            chatId = chatId,
+            initialLocalPath = initialLocalPath,
+            onPrevVideo = prevVideoId?.let { nextId -> { activeMessageId = nextId } },
+            onNextVideo = nextVideoId?.let { nextId -> { activeMessageId = nextId } },
+            vm = vm,
+        )
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VideoPlayerBody(
+    messageId: Long,
+    onBack: () -> Unit,
+    chatId: Long = 0L,
+    initialLocalPath: String? = null,
+    onPrevVideo: (() -> Unit)? = null,
+    onNextVideo: (() -> Unit)? = null,
+    vm: VideoPlayerViewModel,
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -596,6 +774,8 @@ fun VideoPlayerScreen(
         mutableStateOf<MediaItem.SubtitleConfiguration?>(null)
     }
     var showSubtitleSheet by remember { mutableStateOf(false) }
+    var showAudioTrackSheet by remember { mutableStateOf(false) }
+    var touchLocked by remember { mutableStateOf(false) }
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
     var gestureHudText by remember { mutableStateOf<String?>(null) }
     var gestureHudStamp by remember { mutableIntStateOf(0) }
@@ -871,28 +1051,28 @@ fun VideoPlayerScreen(
             }
             hasActiveVideo && exo != null -> {
                 val targetResizeMode = resizeMode
-                AndroidView(
-                    factory = { viewCtx ->
-                        PlayerView(viewCtx).apply {
-                            player = exo
-                            useController = !inPip
-                            this.resizeMode = targetResizeMode
-                            playerViewRef = this
-                        }
-                    },
-                    update = { view ->
-                        if (view.player !== exo) view.player = exo
-                        view.useController = !inPip
-                        view.resizeMode = targetResizeMode
-                        playerViewRef = view
-                    },
-                    onRelease = { view ->
-                        view.player = null
-                        if (playerViewRef === view) playerViewRef = null
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
-                if (!inPip) {
+                        AndroidView(
+                            factory = { viewCtx ->
+                                PlayerView(viewCtx).apply {
+                                    player = exo
+                                    useController = !inPip && !touchLocked
+                                    this.resizeMode = targetResizeMode
+                                    playerViewRef = this
+                                }
+                            },
+                            update = { view ->
+                                if (view.player !== exo) view.player = exo
+                                view.useController = !inPip && !touchLocked
+                                view.resizeMode = targetResizeMode
+                                playerViewRef = view
+                            },
+                            onRelease = { view ->
+                                view.player = null
+                                if (playerViewRef === view) playerViewRef = null
+                            },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                        if (!inPip && !touchLocked) {
                     var dragIsLeft by remember { mutableStateOf(true) }
                     var brightnessAccum by remember { mutableFloatStateOf(-1f) }
                     var volumeAccum by remember { mutableFloatStateOf(0f) }
@@ -975,6 +1155,45 @@ fun VideoPlayerScreen(
                                 )
                             },
                     )
+                }
+                if (touchLocked && !inPip) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectTapGestures(onTap = {})
+                            },
+                    ) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(20.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .navigationBarsPadding()
+                                .padding(bottom = 28.dp)
+                                .clip(RoundedCornerShape(20.dp))
+                                .clickable { touchLocked = false },
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Icon(
+                                    Icons.Filled.Lock,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Text(
+                                    text = stringResource(R.string.player_video_touch_locked_hint),
+                                    color = Color.White,
+                                    style = TgTypography.Caption,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        }
+                    }
                 }
                 if (isStreamingBuffering && !inPip) {
                     Surface(
@@ -1066,7 +1285,7 @@ fun VideoPlayerScreen(
             }
         }
 
-        if (!inPip) {
+        if (!inPip && !touchLocked) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1095,9 +1314,37 @@ fun VideoPlayerScreen(
                 }
 
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    if (onPrevVideo != null) {
+                        IconButton(
+                            onClick = onPrevVideo,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipPrevious,
+                                contentDescription = stringResource(R.string.player_video_prev),
+                                tint = Color.White,
+                            )
+                        }
+                    }
+                    if (onNextVideo != null) {
+                        IconButton(
+                            onClick = onNextVideo,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipNext,
+                                contentDescription = stringResource(R.string.player_video_next),
+                                tint = Color.White,
+                            )
+                        }
+                    }
                     if (hasActiveVideo && exo != null) {
                         val speedLabel = if (playbackSpeed == playbackSpeed.toInt().toFloat()) {
                             "${playbackSpeed.toInt()}×"
@@ -1123,6 +1370,67 @@ fun VideoPlayerScreen(
                                 style = TgTypography.Mono,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            )
+                        }
+                        IconButton(
+                            onClick = { showAudioTrackSheet = true },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.Audiotrack,
+                                contentDescription = stringResource(R.string.player_video_audio_tracks),
+                                tint = Color.White,
+                            )
+                        }
+                        IconButton(
+                            onClick = {
+                                val srcPath = localPath
+                                val posMs = exo.currentPosition.coerceAtLeast(0L)
+                                if (srcPath != null) {
+                                    scope.launch {
+                                        val frame = withContext(Dispatchers.IO) {
+                                            val retriever = MediaMetadataRetriever()
+                                            try {
+                                                retriever.setDataSource(srcPath)
+                                                retriever.getFrameAtTime(
+                                                    posMs * 1000L,
+                                                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                                )
+                                            } catch (_: Throwable) {
+                                                null
+                                            } finally {
+                                                runCatching { retriever.release() }
+                                            }
+                                        }
+                                        val ok = if (frame != null) {
+                                            try {
+                                                vm.saveBitmapToPublicDownloads(
+                                                    frame,
+                                                    "frame_${messageId}_${posMs}.jpg",
+                                                )
+                                            } finally {
+                                                if (!frame.isRecycled) frame.recycle()
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                        gestureHudText = ctx.getString(
+                                            if (ok) R.string.player_video_frame_saved else R.string.player_save_failed,
+                                        )
+                                        gestureHudStamp++
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.PhotoCamera,
+                                contentDescription = stringResource(R.string.player_video_capture_frame),
+                                tint = Color.White,
                             )
                         }
                         IconButton(
@@ -1162,6 +1470,21 @@ fun VideoPlayerScreen(
                                 tint = if (externalSubtitle != null) MaterialTheme.colorScheme.primary else Color.White,
                             )
                         }
+                        IconButton(
+                            onClick = {
+                                touchLocked = true
+                                playerViewRef?.hideController()
+                            },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.45f)),
+                        ) {
+                            Icon(
+                                Icons.Filled.LockOpen,
+                                contentDescription = stringResource(R.string.player_video_touch_lock),
+                                tint = Color.White,
+                            )
+                        }
                     }
                     if (localPath == null && cachedEntry != null && !isDownloading) {
                         IconButton(
@@ -1192,6 +1515,68 @@ fun VideoPlayerScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if (showAudioTrackSheet && exo != null) {
+        val audioGroups = exo.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        ModalBottomSheet(
+            onDismissRequest = { showAudioTrackSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = stringResource(R.string.player_video_audio_tracks),
+                    style = TgTypography.Display.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                audioGroups.forEachIndexed { gIdx, group ->
+                    for (tIdx in 0 until group.length) {
+                        val fmt = group.getTrackFormat(tIdx)
+                        val trackName = listOfNotNull(
+                            fmt.label?.takeIf { it.isNotBlank() },
+                            fmt.language?.takeIf { it.isNotBlank() },
+                            fmt.channelCount.takeIf { it > 0 }?.let { "${it}ch" },
+                        ).joinToString(" · ").ifBlank { "Audio ${gIdx + 1}.${tIdx + 1}" }
+                        val selected = group.isTrackSelected(tIdx)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    exo.trackSelectionParameters = exo.trackSelectionParameters
+                                        .buildUpon()
+                                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, tIdx))
+                                        .build()
+                                    showAudioTrackSheet = false
+                                }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(trackName, color = MaterialTheme.colorScheme.onSurface)
+                            if (selected) {
+                                Icon(
+                                    Icons.Filled.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
             }
         }
     }

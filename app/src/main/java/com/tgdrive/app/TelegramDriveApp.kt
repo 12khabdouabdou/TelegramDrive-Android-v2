@@ -22,7 +22,6 @@ import com.tgdrive.feature.autobackup.watcher.FolderWatcher
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -144,6 +143,7 @@ class TelegramDriveApp :
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: scheduledUploadScheduler failed", t)
             }
+            com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(this@TelegramDriveApp)
         }
     }
 

@@ -48,6 +48,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
             try {
                 backupScheduler.rescheduleIfEnabled()
                 scheduledUploadScheduler.rescheduleIfEnabled()
+                com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(context)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {

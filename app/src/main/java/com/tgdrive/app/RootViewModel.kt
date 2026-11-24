@@ -80,6 +80,8 @@ data class RootState(
     val shareUploadMessage: String? = null,
     val manualUploadWifiOnly: Boolean = false,
     val decryptedTempTtlMinutes: Int = 30,
+    val blockScreenshotsEverywhere: Boolean = false,
+    val pendingShortcutRoute: String? = null,
 )
 
 @HiltViewModel
@@ -104,6 +106,7 @@ class RootViewModel @Inject constructor(
     // Shadow flags for biometric lock & persisted background timeout.
     private var biometricPrefEnabled = false
     private var biometricLastBgTimeMs = 0L
+    private var biometricTimeoutSeconds = 0
     private var decryptedTempTtlMinutes = 30
     private var initialPrefSynced = false
     private var cloudSyncedForSession = false
@@ -198,6 +201,7 @@ class RootViewModel @Inject constructor(
             preferences.data.collect { prefs ->
                 biometricPrefEnabled = prefs.biometricLockEnabled
                 biometricLastBgTimeMs = prefs.biometricLastBgTime
+                biometricTimeoutSeconds = prefs.biometricTimeoutSeconds
                 decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes
                 _state.update { current ->
                     val coldStartLock = if (!initialPrefSynced) {
@@ -213,6 +217,7 @@ class RootViewModel @Inject constructor(
                         biometricUnlocked = if (coldStartLock) false else current.biometricUnlocked,
                         manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                         decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes,
+                        blockScreenshotsEverywhere = prefs.blockScreenshotsEverywhere,
                     )
                 }
             }
@@ -289,9 +294,22 @@ class RootViewModel @Inject constructor(
         if (!biometricPrefEnabled) return
         val lastBg = biometricLastBgTimeMs
         val now = System.currentTimeMillis()
-        if (lastBg == 0L || now < lastBg || (now - lastBg) > BIOMETRIC_RELOCK_MS) {
+        val timeoutMs = biometricTimeoutSeconds.coerceAtLeast(0).toLong() * 1000L
+        if (lastBg == 0L || now < lastBg || (now - lastBg) >= timeoutMs) {
             _state.update { it.copy(biometricUnlocked = false) }
         }
+    }
+
+    fun handleAppIntent(intent: android.content.Intent) {
+        val shortcutRoute = intent.getStringExtra(EXTRA_SHORTCUT_ROUTE)?.takeIf { it.isNotBlank() }
+        if (shortcutRoute != null) {
+            _state.update { it.copy(pendingShortcutRoute = shortcutRoute) }
+        }
+        handleShareIntent(intent)
+    }
+
+    fun consumeShortcutRoute() {
+        _state.update { it.copy(pendingShortcutRoute = null) }
     }
 
     fun sweepExpiredTempFiles() {
@@ -458,6 +476,6 @@ class RootViewModel @Inject constructor(
         /** Maximum splash duration. The user always reaches the auth screen
          *  within this many milliseconds, regardless of TDLib state. */
         private const val SPLASH_TIMEOUT_MS = 1500L
-        private const val BIOMETRIC_RELOCK_MS = 60_000L
+        const val EXTRA_SHORTCUT_ROUTE = "shortcut_route"
     }
 }

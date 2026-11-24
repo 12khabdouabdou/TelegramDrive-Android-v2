@@ -118,4 +118,18 @@
     <string name="settings_passvault_temp_stats">%1$d cached item(s) · %2$s</string>
     <string name="settings_uploads_wifi_only">Upload over Wi-Fi only by default</string>
     <string name="settings_uploads_wifi_only_desc">Pause manual &amp; ZIP uploads on cellular and auto-resume on Wi-Fi</string>
+    <string name="settings_biometric_timeout_title">Auto-lock timeout</string>
+    <string name="settings_biometric_timeout_now">Immediately</string>
+    <string name="settings_biometric_timeout_1m">1 min</string>
+    <string name="settings_biometric_timeout_5m">5 min</string>
+    <string name="settings_biometric_timeout_15m">15 min</string>
+    <string name="settings_block_screenshots">Block screenshots everywhere</string>
+    <string name="settings_block_screenshots_desc">Prevent screenshots, screen recording, and recents previews across the whole app</string>
+    <string name="settings_show_encrypted_previews">Show encrypted previews when unlocked</string>
+    <string name="settings_show_encrypted_previews_desc">Decrypt cached thumbnails for encrypted files and ZIPs in folders while unlocked</string>
+    <string name="settings_downloads_concurrency_title">Simultaneous downloads</string>
+    <string name="settings_downloads_wifi_only">Download over Wi-Fi only</string>
+    <string name="settings_downloads_wifi_only_desc">Pause queued downloads on cellular and auto-resume on Wi-Fi</string>
+    <string name="settings_downloads_autosave">Auto-save to Downloads/TelegramDrive</string>
+    <string name="settings_downloads_autosave_desc">Automatically export unencrypted completed downloads to public storage</string>
 </resources>

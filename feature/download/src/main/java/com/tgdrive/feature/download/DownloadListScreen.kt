@@ -40,6 +40,8 @@ import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
@@ -112,11 +114,15 @@ class DownloadListViewModel @Inject constructor(
         originalDisplayName: String,
         passphrase: String?,
         saveToDownloads: Boolean,
+        chatId: Long = 0L,
+        messageId: Long = 0L,
     ): DecryptOutcome = uploadManager.decryptLocalFile(
         encryptedFile = encryptedFile,
         originalDisplayName = originalDisplayName,
         passphrase = passphrase,
         saveToDownloads = saveToDownloads,
+        chatId = chatId,
+        messageId = messageId,
     )
 }
 
@@ -140,7 +146,9 @@ private sealed interface TransferRowUi {
         override val speedBytesPerSec: Long = item.speedBytesPerSec
         override val etaSeconds: Long? = item.etaSeconds
         override val isActive: Boolean =
-            item.status == DownloadStatus.DOWNLOADING || item.status == DownloadStatus.QUEUED
+            item.status == DownloadStatus.DOWNLOADING ||
+                item.status == DownloadStatus.QUEUED ||
+                item.status == DownloadStatus.PAUSED
         override val isFailed: Boolean = item.status == DownloadStatus.FAILED
     }
 
@@ -192,19 +200,65 @@ fun DownloadListScreen(
     val hasRetryableFailedUploads = remember(completed) {
         completed.any { it is TransferRowUi.Upload && it.isFailed && it.item.canRetry }
     }
+    val hasRetryableFailedDownloads = remember(completed) {
+        completed.any { it is TransferRowUi.Download && (it.isFailed || it.item.status == DownloadStatus.CANCELLED) }
+    }
+    val hasRetryableFailed = hasRetryableFailedUploads || hasRetryableFailedDownloads
     val hasRunningUploads = remember(active) {
         active.any { it is TransferRowUi.Upload && it.item.status.isActive }
     }
+    val hasRunningDownloads = remember(active) {
+        active.any {
+            it is TransferRowUi.Download &&
+                (it.item.status == DownloadStatus.DOWNLOADING || it.item.status == DownloadStatus.QUEUED)
+        }
+    }
+    val hasRunningTransfers = hasRunningUploads || hasRunningDownloads
     val hasPausedUploads = remember(active) {
         active.any { it is TransferRowUi.Upload && it.item.status == UploadStatus.PAUSED }
     }
+    val hasPausedDownloads = remember(active) {
+        active.any { it is TransferRowUi.Download && it.item.status == DownloadStatus.PAUSED }
+    }
+    val hasPausedTransfers = hasPausedUploads || hasPausedDownloads
     val list = if (showCompleted) completed else active
     val openFailedMsg = stringResource(R.string.transfers_open_failed)
     val savedDecryptedMsg = stringResource(R.string.transfers_decrypted_saved)
+    val savedDownloadsMsg = stringResource(R.string.transfers_saved_to_downloads)
     val bottomNavPad = if (showBack) {
         WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     } else {
         0.dp
+    }
+
+    fun shareLocalFile(file: File, mimeType: String?) {
+        if (!file.exists()) {
+            scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
+            return
+        }
+        val ext = file.extension.lowercase()
+        val resolvedMime = mimeType?.takeIf { it.isNotBlank() }
+            ?: runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }.getOrNull()
+            ?: "*/*"
+        try {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = resolvedMime
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(
+                Intent.createChooser(shareIntent, file.name)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (t: Throwable) {
+            Log.w("DownloadListScreen: share failed for ${file.name}", t)
+            scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
+        }
     }
 
     fun openLocalFile(file: File, mimeType: String?) {
@@ -297,22 +351,42 @@ fun DownloadListScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f).padding(start = if (showBack) 8.dp else 4.dp),
                 )
-                if (hasRunningUploads) {
-                    TextButton(onClick = { vm.uploadManager.pauseAll() }) {
+                if (hasRunningTransfers) {
+                    TextButton(
+                        onClick = {
+                            vm.uploadManager.pauseAll()
+                            vm.downloadManager.pauseAll()
+                        },
+                    ) {
                         Text(stringResource(R.string.transfers_pause_all), maxLines = 1)
                     }
-                    TextButton(onClick = { vm.uploadManager.cancelAll() }) {
+                    TextButton(
+                        onClick = {
+                            vm.uploadManager.cancelAll()
+                            vm.downloadManager.cancelAll()
+                        },
+                    ) {
                         Text(
                             text = stringResource(R.string.transfers_stop_all),
                             color = MaterialTheme.colorScheme.error,
                             maxLines = 1,
                         )
                     }
-                } else if (hasPausedUploads) {
-                    TextButton(onClick = { vm.uploadManager.resumeAll() }) {
+                } else if (hasPausedTransfers) {
+                    TextButton(
+                        onClick = {
+                            vm.uploadManager.resumeAll()
+                            vm.downloadManager.resumeAll()
+                        },
+                    ) {
                         Text(stringResource(R.string.transfers_resume_all), maxLines = 1)
                     }
-                    TextButton(onClick = { vm.uploadManager.cancelAll() }) {
+                    TextButton(
+                        onClick = {
+                            vm.uploadManager.cancelAll()
+                            vm.downloadManager.cancelAll()
+                        },
+                    ) {
                         Text(
                             text = stringResource(R.string.transfers_stop_all),
                             color = MaterialTheme.colorScheme.error,
@@ -320,8 +394,13 @@ fun DownloadListScreen(
                         )
                     }
                 }
-                if (hasRetryableFailedUploads) {
-                    TextButton(onClick = { vm.uploadManager.retryAllFailed() }) {
+                if (hasRetryableFailed) {
+                    TextButton(
+                        onClick = {
+                            vm.uploadManager.retryAllFailed()
+                            vm.downloadManager.retryAllFailed()
+                        },
+                    ) {
                         Text(
                             text = stringResource(R.string.transfers_retry_failed),
                             color = MaterialTheme.colorScheme.tertiary,
@@ -412,6 +491,20 @@ fun DownloadListScreen(
                                         decryptError = null
                                         decryptTarget = item
                                     },
+                                    onPause = { vm.downloadManager.pause(item.chatId, item.id) },
+                                    onResume = { vm.downloadManager.resume(item.chatId, item.id) },
+                                    onSaveToDownloads = {
+                                        scope.launch {
+                                            val saved = vm.downloadManager.saveCompletedToDownloads(item)
+                                            snackbarHostState.showSnackbar(
+                                                if (saved != null) savedDownloadsMsg else openFailedMsg,
+                                            )
+                                        }
+                                    },
+                                    onShare = {
+                                        val path = item.localPath ?: return@DownloadTransferRow
+                                        shareLocalFile(File(path), null)
+                                    },
                                     onCancel = { vm.downloadManager.cancel(item.chatId, item.id) },
                                     onRetry = { vm.downloadManager.enqueue(item) },
                                 )
@@ -452,7 +545,7 @@ fun DownloadListScreen(
                 scope.launch {
                     decryptInProgress = true
                     decryptError = null
-                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, false)) {
+                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, false, target.chatId, target.id)) {
                         is DecryptOutcome.Success -> {
                             decryptInProgress = false
                             decryptTarget = null
@@ -477,7 +570,7 @@ fun DownloadListScreen(
                 scope.launch {
                     decryptInProgress = true
                     decryptError = null
-                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, true)) {
+                    when (val outcome = vm.decryptLocalFile(localFile, target.fileName, passphrase, true, target.chatId, target.id)) {
                         is DecryptOutcome.Success -> {
                             decryptInProgress = false
                             decryptTarget = null
@@ -546,6 +639,10 @@ private fun DownloadTransferRow(
     item: DownloadItem,
     onOpen: () -> Unit,
     onDecrypt: () -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onSaveToDownloads: () -> Unit,
+    onShare: () -> Unit,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
 ) {
@@ -554,6 +651,7 @@ private fun DownloadTransferRow(
     val iconTint = when (item.status) {
         DownloadStatus.DOWNLOADING -> MaterialTheme.colorScheme.primary
         DownloadStatus.QUEUED -> MaterialTheme.colorScheme.onSurfaceVariant
+        DownloadStatus.PAUSED -> MaterialTheme.colorScheme.tertiary
         DownloadStatus.DONE -> MaterialTheme.colorScheme.secondary
         DownloadStatus.FAILED -> MaterialTheme.colorScheme.error
         DownloadStatus.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -561,6 +659,7 @@ private fun DownloadTransferRow(
     val statusIcon = when (item.status) {
         DownloadStatus.DOWNLOADING -> Icons.Filled.Download
         DownloadStatus.QUEUED -> Icons.Filled.Schedule
+        DownloadStatus.PAUSED -> Icons.Filled.Pause
         DownloadStatus.DONE -> Icons.Filled.CheckCircle
         DownloadStatus.FAILED -> Icons.Filled.ErrorOutline
         DownloadStatus.CANCELLED -> Icons.Filled.Cancel
@@ -568,6 +667,8 @@ private fun DownloadTransferRow(
     val statusText = when (item.status) {
         DownloadStatus.QUEUED -> stringResource(R.string.transfers_status_queued)
         DownloadStatus.DOWNLOADING -> stringResource(R.string.transfers_status_downloading)
+        DownloadStatus.PAUSED -> item.errorMessage?.takeIf { it.isNotBlank() }
+            ?: stringResource(R.string.transfers_status_paused)
         DownloadStatus.DONE -> stringResource(R.string.transfers_status_done)
         DownloadStatus.FAILED -> item.errorMessage?.takeIf { it.isNotBlank() }
             ?: stringResource(R.string.transfers_status_failed)
@@ -641,6 +742,29 @@ private fun DownloadTransferRow(
 
                 when (item.status) {
                     DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED -> {
+                        IconButton(onClick = onPause) {
+                            Icon(
+                                Icons.Filled.Pause,
+                                contentDescription = stringResource(R.string.transfers_pause_download),
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        IconButton(onClick = onCancel) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = stringResource(R.string.transfers_cancel),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    DownloadStatus.PAUSED -> {
+                        IconButton(onClick = onResume) {
+                            Icon(
+                                Icons.Filled.PlayArrow,
+                                contentDescription = stringResource(R.string.transfers_resume_download),
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                         IconButton(onClick = onCancel) {
                             Icon(
                                 Icons.Filled.Close,
@@ -667,12 +791,29 @@ private fun DownloadTransferRow(
                                     tint = MaterialTheme.colorScheme.primary,
                                 )
                             }
+                        } else if (canOpen) {
+                            IconButton(onClick = onSaveToDownloads) {
+                                Icon(
+                                    Icons.Filled.SaveAlt,
+                                    contentDescription = stringResource(R.string.transfers_save_downloads),
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            IconButton(onClick = onShare) {
+                                Icon(
+                                    Icons.Filled.Share,
+                                    contentDescription = stringResource(R.string.transfers_share_file),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }
             }
 
-            if (item.status == DownloadStatus.DOWNLOADING) {
+            if (item.status == DownloadStatus.DOWNLOADING ||
+                (item.status == DownloadStatus.PAUSED && item.progress > 0f)
+            ) {
                 TransferProgressBar(
                     progress = item.progress,
                     transferredBytes = item.downloadedBytes,

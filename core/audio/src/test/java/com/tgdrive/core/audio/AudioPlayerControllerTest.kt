@@ -39,4 +39,13 @@ class AudioPlayerControllerTest {
         assertThat(AudioQueueLogic.formatSpeedLabel(1.0f)).isEqualTo("1x")
         assertThat(AudioQueueLogic.formatSpeedLabel(1.25f)).isEqualTo("1.25x")
     }
+
+    @Test
+    fun `sleep timer tick and label formatting handle countdown and end of track`() {
+        assertThat(AudioQueueLogic.tickSleepTimerRemaining(90_000L, 1_000L)).isEqualTo(89_000L)
+        assertThat(AudioQueueLogic.tickSleepTimerRemaining(500L, 1_000L)).isEqualTo(0L)
+        assertThat(AudioQueueLogic.formatSleepTimerLabel(0L, false)).isNull()
+        assertThat(AudioQueueLogic.formatSleepTimerLabel(0L, true)).isEqualTo("1 track")
+        assertThat(AudioQueueLogic.formatSleepTimerLabel(15 * 60_000L, false)).isEqualTo("15m")
+    }
 }

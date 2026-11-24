@@ -24,10 +24,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
@@ -37,6 +40,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -45,6 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,12 +57,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -172,6 +182,22 @@ fun TextViewerScreen(
     }
 
     val copiedMsg = stringResource(R.string.player_text_copied)
+    val savedMsg = stringResource(R.string.player_saved_downloads)
+    val saveFailMsg = stringResource(R.string.player_save_failed)
+    val uploadQueuedMsg = stringResource(R.string.player_text_upload_queued)
+    val resolvedTitle = initialTitle?.takeIf { it.isNotBlank() }
+        ?: cachedEntry?.fileName
+        ?: downloadItem?.fileName
+        ?: localPath?.let { File(it).name }
+        ?: "Document.txt"
+    val ext = remember(resolvedTitle) { resolvedTitle.substringAfterLast('.', "").lowercase() }
+    val isMarkdown = ext == "md" || ext == "markdown"
+    val isJson = ext == "json"
+    var fontSizeSp by remember { mutableFloatStateOf(13f) }
+    var markdownMode by remember(resolvedTitle) { mutableStateOf(isMarkdown) }
+    var jsonPrettyMode by remember(resolvedTitle) { mutableStateOf(isJson) }
+    var editMode by remember { mutableStateOf(false) }
+    var editDraft by remember(content) { mutableStateOf(content?.fullText.orEmpty()) }
     val navPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val filteredLines = remember(content, query) {
         val all = content?.lines ?: emptyList()
@@ -228,8 +254,39 @@ fun TextViewerScreen(
                     )
                 }
                 if (content != null) {
+                    IconButton(onClick = { fontSizeSp = (fontSizeSp - 2f).coerceAtLeast(11f) }) {
+                        Text(
+                            text = "A-",
+                            style = TgTypography.Caption,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    IconButton(onClick = { fontSizeSp = (fontSizeSp + 2f).coerceAtMost(24f) }) {
+                        Text(
+                            text = "A+",
+                            style = TgTypography.Caption,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground,
+                        )
+                    }
+                    if (!content!!.truncated) {
+                        IconButton(onClick = {
+                            if (!editMode) {
+                                editDraft = content!!.fullText
+                            }
+                            editMode = !editMode
+                        }) {
+                            Icon(
+                                imageVector = Icons.Filled.Edit,
+                                contentDescription = stringResource(R.string.player_text_edit),
+                                tint = if (editMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
+                    }
                     IconButton(onClick = {
-                        clipboard.setText(AnnotatedString(content!!.fullText))
+                        val copyText = if (editMode) editDraft else content!!.fullText
+                        clipboard.setText(AnnotatedString(copyText))
                         scope.launch { snackbarHostState.showSnackbar(copiedMsg) }
                     }) {
                         Icon(
@@ -292,20 +349,65 @@ fun TextViewerScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    FilterChip(
-                        selected = showLineNumbers,
-                        onClick = { showLineNumbers = !showLineNumbers },
-                        label = { Text(stringResource(R.string.player_text_line_numbers)) },
-                    )
-                    FilterChip(
-                        selected = wrapLines,
-                        onClick = { wrapLines = !wrapLines },
-                        label = { Text(stringResource(R.string.player_text_wrap)) },
-                    )
+                    if (!editMode) {
+                        FilterChip(
+                            selected = showLineNumbers,
+                            onClick = { showLineNumbers = !showLineNumbers },
+                            label = { Text(stringResource(R.string.player_text_line_numbers)) },
+                        )
+                        FilterChip(
+                            selected = wrapLines,
+                            onClick = { wrapLines = !wrapLines },
+                            label = { Text(stringResource(R.string.player_text_wrap)) },
+                        )
+                        if (isMarkdown) {
+                            FilterChip(
+                                selected = markdownMode,
+                                onClick = { markdownMode = !markdownMode },
+                                label = { Text(stringResource(R.string.player_text_markdown)) },
+                            )
+                        }
+                        if (isJson) {
+                            FilterChip(
+                                selected = jsonPrettyMode,
+                                onClick = { jsonPrettyMode = !jsonPrettyMode },
+                                label = { Text(stringResource(R.string.player_text_json_pretty)) },
+                            )
+                        }
+                    } else {
+                        OutlinedButton(onClick = {
+                            scope.launch {
+                                val ok = vm.saveEditedTextToDownloads(resolvedTitle, editDraft)
+                                snackbarHostState.showSnackbar(if (ok) savedMsg else saveFailMsg)
+                            }
+                        }) {
+                            Icon(Icons.Filled.SaveAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.size(6.dp))
+                            Text(stringResource(R.string.player_text_save_copy))
+                        }
+                        val targetChatId = cachedEntry?.chatId ?: chatId
+                        if (targetChatId != 0L) {
+                            Button(onClick = {
+                                vm.reuploadEditedText(
+                                    chatId = targetChatId,
+                                    fileName = resolvedTitle,
+                                    text = editDraft,
+                                    virtualPath = cachedEntry?.virtualPath.orEmpty(),
+                                )
+                                editMode = false
+                                scope.launch { snackbarHostState.showSnackbar(uploadQueuedMsg) }
+                            }) {
+                                Icon(Icons.Filled.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.size(6.dp))
+                                Text(stringResource(R.string.player_text_reupload))
+                            }
+                        }
+                    }
                     if (content!!.truncated) {
                         Text(
                             text = stringResource(
@@ -317,7 +419,6 @@ fun TextViewerScreen(
                             color = MaterialTheme.colorScheme.tertiary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
                         )
                     }
                 }
@@ -326,6 +427,69 @@ fun TextViewerScreen(
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 val loaded = content
                 when {
+                    loaded != null && editMode -> {
+                        OutlinedTextField(
+                            value = editDraft,
+                            onValueChange = { editDraft = it },
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = fontSizeSp.sp,
+                                lineHeight = (fontSizeSp + 6f).sp,
+                            ),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = navPad + 12.dp),
+                        )
+                    }
+                    loaded != null && isMarkdown && markdownMode -> {
+                        val renderedMd = remember(loaded.fullText) { renderSimpleMarkdown(loaded.fullText) }
+                        SelectionContainer {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                    top = 8.dp,
+                                    bottom = navPad + 24.dp,
+                                ),
+                            ) {
+                                item {
+                                    Text(
+                                        text = renderedMd,
+                                        fontSize = fontSizeSp.sp,
+                                        lineHeight = (fontSizeSp + 7f).sp,
+                                        color = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    loaded != null && isJson && jsonPrettyMode -> {
+                        val keyColor = MaterialTheme.colorScheme.primary
+                        val strColor = MaterialTheme.colorScheme.tertiary
+                        val numColor = MaterialTheme.colorScheme.secondary
+                        val highlighted = remember(loaded.fullText, keyColor, strColor, numColor) {
+                            highlightJsonText(prettyPrintJson(loaded.fullText), keyColor, strColor, numColor)
+                        }
+                        SelectionContainer {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                    top = 8.dp,
+                                    bottom = navPad + 24.dp,
+                                ),
+                            ) {
+                                item {
+                                    Text(
+                                        text = highlighted,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = fontSizeSp.sp,
+                                        lineHeight = (fontSizeSp + 6f).sp,
+                                        softWrap = wrapLines,
+                                        color = MaterialTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            }
+                        }
+                    }
                     loaded != null -> {
                         val hScroll = rememberScrollState()
                         val listModifier = if (wrapLines) {
@@ -350,7 +514,7 @@ fun TextViewerScreen(
                                             Text(
                                                 text = lineNo.toString().padStart(4, ' '),
                                                 fontFamily = FontFamily.Monospace,
-                                                fontSize = 12.sp,
+                                                fontSize = (fontSizeSp - 1f).coerceAtLeast(10f).sp,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                                                 modifier = Modifier.padding(end = 10.dp),
                                             )
@@ -358,8 +522,8 @@ fun TextViewerScreen(
                                         Text(
                                             text = lineText,
                                             fontFamily = FontFamily.Monospace,
-                                            fontSize = 13.sp,
-                                            lineHeight = 19.sp,
+                                            fontSize = fontSizeSp.sp,
+                                            lineHeight = (fontSizeSp + 6f).sp,
                                             softWrap = wrapLines,
                                             color = MaterialTheme.colorScheme.onBackground,
                                         )
@@ -442,4 +606,89 @@ fun TextViewerScreen(
             }
         }
     }
+}
+
+private fun prettyPrintJson(raw: String): String = runCatching {
+    val t = raw.trim()
+    when {
+        t.startsWith("{") -> org.json.JSONObject(t).toString(2)
+        t.startsWith("[") -> org.json.JSONArray(t).toString(2)
+        else -> raw
+    }
+}.getOrDefault(raw)
+
+private fun highlightJsonText(
+    pretty: String,
+    keyColor: Color,
+    stringColor: Color,
+    numberColor: Color,
+): AnnotatedString = buildAnnotatedString {
+    val tokenRegex = Regex("""("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|(\b-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|\btrue\b|\bfalse\b|\bnull\b)""")
+    var cursor = 0
+    for (m in tokenRegex.findAll(pretty)) {
+        if (m.range.first > cursor) append(pretty.substring(cursor, m.range.first))
+        when {
+            m.groups[1] != null -> {
+                val key = m.groups[1]!!.value
+                withStyle(SpanStyle(color = keyColor, fontWeight = FontWeight.SemiBold)) { append(key) }
+                append(m.value.removePrefix(key))
+            }
+            m.groups[2] != null -> {
+                withStyle(SpanStyle(color = stringColor)) { append(m.value) }
+            }
+            else -> {
+                withStyle(SpanStyle(color = numberColor)) { append(m.value) }
+            }
+        }
+        cursor = m.range.last + 1
+    }
+    if (cursor < pretty.length) append(pretty.substring(cursor))
+}
+
+private fun renderSimpleMarkdown(md: String): AnnotatedString = buildAnnotatedString {
+    val lines = md.lines()
+    for ((idx, rawLine) in lines.withIndex()) {
+        val trimmed = rawLine.trimStart()
+        when {
+            trimmed.startsWith("### ") -> {
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Normal)) {
+                    append(trimmed.removePrefix("### "))
+                }
+            }
+            trimmed.startsWith("## ") -> {
+                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                    append(trimmed.removePrefix("## "))
+                }
+            }
+            trimmed.startsWith("# ") -> {
+                withStyle(SpanStyle(fontWeight = FontWeight.ExtraBold)) {
+                    append(trimmed.removePrefix("# "))
+                }
+            }
+            trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                append("• ")
+                appendInlineMarkdown(trimmed.drop(2))
+            }
+            else -> appendInlineMarkdown(rawLine)
+        }
+        if (idx < lines.lastIndex) append('\n')
+    }
+}
+
+private fun AnnotatedString.Builder.appendInlineMarkdown(line: String) {
+    val inlineRegex = Regex("""(\*\*[^*]+\*\*|`[^`]+`)""")
+    var cursor = 0
+    for (m in inlineRegex.findAll(line)) {
+        if (m.range.first > cursor) append(line.substring(cursor, m.range.first))
+        val tok = m.value
+        if (tok.startsWith("**") && tok.endsWith("**") && tok.length >= 4) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(tok.substring(2, tok.length - 2)) }
+        } else if (tok.startsWith("`") && tok.endsWith("`") && tok.length >= 2) {
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(tok.substring(1, tok.length - 1)) }
+        } else {
+            append(tok)
+        }
+        cursor = m.range.last + 1
+    }
+    if (cursor < line.length) append(line.substring(cursor))
 }

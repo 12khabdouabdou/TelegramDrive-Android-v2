@@ -167,15 +167,23 @@ class VaultViewModel @Inject constructor(
 
     private fun warmEncryptedThumbnails(files: List<FileCacheEntity>) {
         files.forEach { entity ->
-            val path = entity.thumbnailPath ?: return@forEach
-            if (!path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true)) return@forEach
+            val path = entity.thumbnailPath
+            val isEncryptedThumb = path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true
+            val hasCloudBackup = cloudSyncManager.getCloudEncryptedThumbRemoteId(entity.chatId, entity.messageId) != null
+            if (!isEncryptedThumb && !hasCloudBackup && mediaThumbnailCache.getEncryptedThumbnailPath(entity.chatId, entity.messageId) == null) {
+                return@forEach
+            }
             val key = entity.chatId to entity.messageId
             val shouldAttempt = synchronized(attemptedThumbKeys) { attemptedThumbKeys.add(key) }
             if (!shouldAttempt) return@forEach
             viewModelScope.launch(dispatchers.io) {
                 thumbSemaphore.withPermit {
                     if (!_isUnlocked.value) return@withPermit
-                    val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(path) }.getOrNull()
+                    val effectivePath = when {
+                        isEncryptedThumb && path != null && File(path).isFile -> path
+                        else -> mediaThumbnailCache.restoreEncryptedThumbFromCloud(entity.chatId, entity.messageId)
+                    } ?: return@withPermit
+                    val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
                     if (bytes != null && bytes.isNotEmpty() && _isUnlocked.value) {
                         _decryptedThumbs.update { cur -> cur + (key to bytes) }
                     }
@@ -393,6 +401,8 @@ class VaultViewModel @Inject constructor(
                     originalDisplayName = current.item.fileName,
                     passphrase = passphrase,
                     saveToDownloads = saveToDownloads,
+                    chatId = current.item.chatId,
+                    messageId = current.item.messageId,
                 )
             ) {
                 is DecryptOutcome.Success -> {
@@ -434,6 +444,8 @@ class VaultViewModel @Inject constructor(
                         originalDisplayName = item.fileName,
                         passphrase = passphrase,
                         saveToDownloads = true,
+                        chatId = item.chatId,
+                        messageId = item.messageId,
                     )
                     if (outcome is DecryptOutcome.Success) {
                         succeeded++

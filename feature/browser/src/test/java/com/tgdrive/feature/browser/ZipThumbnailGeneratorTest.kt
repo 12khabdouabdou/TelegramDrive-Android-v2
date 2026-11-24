@@ -312,6 +312,75 @@ class ZipThumbnailGeneratorTest {
         assertThat(result).isNull()
     }
 
+    // ─────────────────────── PDF, head-peek video, collage, disk cache ──
+
+    @Test
+    fun `pdf entry renders via injected PdfPageRenderer and cleans up temp file`() {
+        val expectedBitmap = createSolidColorBitmap(64, 84, 0xFFEEEEEE.toInt())
+        var capturedPdfFile: File? = null
+        val gen = ZipThumbnailGenerator(
+            pdfPageRenderer = { f, _ ->
+                capturedPdfFile = f
+                expectedBitmap
+            },
+        )
+        writeRawZip(zipFile, "docs/invoice.pdf" to "%PDF-1.4\n%%EOF".toByteArray())
+
+        val result = gen.getThumbnail(zipFile.absolutePath, "docs/invoice.pdf")
+        assertThat(result).isSameInstanceAs(expectedBitmap)
+        assertThat(capturedPdfFile).isNotNull()
+        assertThat(capturedPdfFile!!.exists()).isFalse()
+    }
+
+    @Test
+    fun `folder collage composes square thumbnail from subfolder entries`() {
+        val b1 = createSolidColorBitmap(40, 40, 0xFFFF0000.toInt())
+        val b2 = createSolidColorBitmap(40, 40, 0xFF00FF00.toInt())
+        val b3 = createSolidColorBitmap(40, 40, 0xFF0000FF.toInt())
+        val b4 = createSolidColorBitmap(40, 40, 0xFFFFFF00.toInt())
+        writeZip(
+            zipFile,
+            "trip/a.png" to b1,
+            "trip/b.png" to b2,
+            "trip/c.png" to b3,
+            "trip/d.png" to b4,
+        )
+
+        val collage = generator.getFolderCollage(
+            zipPath = zipFile.absolutePath,
+            folderPrefix = "trip/",
+            entryNames = listOf("trip/a.png", "trip/b.png", "trip/c.png", "trip/d.png"),
+        )
+        assertThat(collage).isNotNull()
+        assertThat(collage!!.width).isEqualTo(200)
+        assertThat(collage.height).isEqualTo(200)
+    }
+
+    @Test
+    fun `oversized video selects 4MB head peek limit instead of skipping`() {
+        assertThat(generator.selectVideoReadLimitBytes(10L * 1024 * 1024)).isEqualTo(50L * 1024 * 1024)
+        assertThat(generator.selectVideoReadLimitBytes(120L * 1024 * 1024)).isEqualTo(ZipThumbnailGenerator.VIDEO_HEAD_PEEK_BYTES)
+    }
+
+    @Test
+    fun `disk cache persists plain jpg thumbnails across clear`() {
+        val diskDir = File(tempDir, "disk_thumbs")
+        val gen = ZipThumbnailGenerator(diskCacheDir = diskDir)
+        val bmp = createSolidColorBitmap(64, 64, 0xFF336699.toInt())
+        writeZip(zipFile, "persist.png" to bmp)
+
+        val first = gen.getThumbnail(zipFile.absolutePath, "persist.png")
+        assertThat(first).isNotNull()
+        val cachedFiles = diskDir.listFiles().orEmpty()
+        assertThat(cachedFiles.any { it.name.endsWith(".jpg") && it.length() > 0L }).isTrue()
+
+        gen.clear()
+        assertThat(zipFile.delete()).isTrue()
+
+        val fromDisk = gen.getThumbnail(zipFile.absolutePath, "persist.png")
+        assertThat(fromDisk).isNotNull()
+    }
+
     // ───────────────────────────────────────────────── test helpers ──
 
     private fun createSolidColorBitmap(

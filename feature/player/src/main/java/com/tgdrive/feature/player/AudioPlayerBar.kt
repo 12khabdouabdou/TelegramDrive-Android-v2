@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
@@ -30,14 +32,18 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -79,7 +85,7 @@ class AudioPlayerViewModel @Inject constructor(
  * Persistent mini audio player sitting below the active navigation host with queue
  * skip controls, playback speed cycling, repeat-all toggle, and seek scrubber.
  */
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun AudioPlayerScaffold(
     content: @Composable () -> Unit,
@@ -91,6 +97,7 @@ fun AudioPlayerScaffold(
     var durationMs by remember { mutableIntStateOf(1) }
     var isSeeking by remember { mutableStateOf(false) }
     var seekFraction by remember { mutableFloatStateOf(0f) }
+    var showQueueSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.path, state.isPlaying) {
         if (state.path == null) return@LaunchedEffect
@@ -270,6 +277,30 @@ fun AudioPlayerScaffold(
                         }
                     }
 
+                    val sleepBadge = AudioQueueLogic.formatSleepTimerLabel(
+                        state.sleepTimerRemainingMs,
+                        state.sleepTimerEndOfTrack,
+                    )
+                    IconButton(
+                        onClick = { showQueueSheet = true },
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (sleepBadge != null) {
+                                Icons.Filled.Bedtime
+                            } else {
+                                Icons.AutoMirrored.Filled.QueueMusic
+                            },
+                            contentDescription = stringResource(R.string.player_audio_queue_title),
+                            tint = if (sleepBadge != null) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.size(19.dp),
+                        )
+                    }
+
                     IconButton(
                         onClick = { controller.release() },
                         modifier = Modifier.size(34.dp),
@@ -304,6 +335,133 @@ fun AudioPlayerScaffold(
                         .padding(horizontal = 12.dp, vertical = 0.dp)
                         .semantics { contentDescription = seekDesc },
                 )
+            }
+        }
+    }
+
+    if (showQueueSheet && isVisible) {
+        ModalBottomSheet(
+            onDismissRequest = { showQueueSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                val activeSleepLabel = AudioQueueLogic.formatSleepTimerLabel(
+                    state.sleepTimerRemainingMs,
+                    state.sleepTimerEndOfTrack,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(R.string.player_audio_sleep_timer),
+                        style = TgTypography.Display.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (activeSleepLabel != null) {
+                        Text(
+                            text = activeSleepLabel,
+                            style = TgTypography.Mono,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+                androidx.compose.foundation.layout.FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    FilterChip(
+                        selected = state.sleepTimerRemainingMs == 0L && !state.sleepTimerEndOfTrack,
+                        onClick = { controller.cancelSleepTimer() },
+                        label = { Text(stringResource(R.string.player_audio_sleep_off)) },
+                    )
+                    FilterChip(
+                        selected = state.sleepTimerEndOfTrack,
+                        onClick = { controller.setSleepTimerEndOfTrack() },
+                        label = { Text(stringResource(R.string.player_audio_sleep_end_track)) },
+                    )
+                    for ((mins, strId) in listOf(
+                        15 to R.string.player_audio_sleep_15m,
+                        30 to R.string.player_audio_sleep_30m,
+                        60 to R.string.player_audio_sleep_60m,
+                    )) {
+                        val selectedMins = ((state.sleepTimerRemainingMs + 59_999L) / 60_000L).toInt() == mins &&
+                            !state.sleepTimerEndOfTrack && state.sleepTimerRemainingMs > 0L
+                        FilterChip(
+                            selected = selectedMins,
+                            onClick = { controller.setSleepTimerMinutes(mins) },
+                            label = { Text(stringResource(strId)) },
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Text(
+                    text = "${stringResource(R.string.player_audio_queue_title)} (${state.queue.size})",
+                    style = TgTypography.Display.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                androidx.compose.foundation.lazy.LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(220.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(state.queue.size) { idx ->
+                        val track = state.queue[idx]
+                        val isCurrent = idx == state.currentIndex
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isCurrent) {
+                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                    },
+                                )
+                                .clickable { controller.playQueueIndex(idx) }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "${idx + 1}. ${track.title}",
+                                style = TgTypography.Display.bodyMedium,
+                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (isCurrent) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(
+                                onClick = { controller.removeQueueTrack(idx) },
+                                modifier = Modifier.size(28.dp),
+                            ) {
+                                Icon(
+                                    Icons.Filled.Close,
+                                    contentDescription = stringResource(R.string.player_audio_remove_track),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }

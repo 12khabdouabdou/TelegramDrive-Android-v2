@@ -39,7 +39,6 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -180,7 +179,7 @@ class UploadManager @Inject constructor(
             val id = "ul_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
             pausedIds.remove(id)
             cancelledIds.remove(id)
-            retrySpecs[id] = RetrySpec.SingleFile(chatId, f, options)
+            retrySpecs[id] = RetrySpec.SingleFile(chatId, f, options, virtualPath = options.virtualPath)
             val shownName = if (options.encryption.enabled) "${sanitizeLeafName(f.displayName)}.tgenc" else sanitizeLeafName(f.displayName)
             uploadTracker.start(
                 id = id,
@@ -208,7 +207,7 @@ class UploadManager @Inject constructor(
                 existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
 
                 val jobs = preparedIds.mapNotNull { (id, file) ->
-                    val spec = RetrySpec.SingleFile(resolvedChatId, file, options)
+                    val spec = RetrySpec.SingleFile(resolvedChatId, file, options, virtualPath = options.virtualPath)
                     retrySpecs[id] = spec
                     val shownName = if (options.encryption.enabled) {
                         "${sanitizeLeafName(file.displayName)}.tgenc"
@@ -263,11 +262,15 @@ class UploadManager @Inject constructor(
                     val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
                     pausedIds.remove(id)
                     cancelledIds.remove(id)
+                    val basePrefix = options.virtualPath.trim('/')
+                    val combinedVpath = listOf(basePrefix, entry.virtualPath.trim('/'))
+                        .filter { it.isNotEmpty() }
+                        .joinToString("/")
                     val spec = RetrySpec.SingleFile(
                         chatId = resolvedChatId,
                         file = entry.item,
                         options = options,
-                        virtualPath = entry.virtualPath,
+                        virtualPath = combinedVpath,
                         lastModifiedMs = entry.lastModifiedMs,
                     )
                     retrySpecs[id] = spec
@@ -282,7 +285,7 @@ class UploadManager @Inject constructor(
                         totalBytes = entry.item.sizeBytes,
                         chatId = resolvedChatId,
                         status = UploadStatus.QUEUED,
-                        statusDetail = entry.virtualPath.takeIf { it.isNotBlank() },
+                        statusDetail = combinedVpath.takeIf { it.isNotBlank() },
                         isEncrypted = options.encryption.enabled,
                     )
                     id to spec
@@ -520,6 +523,8 @@ class UploadManager @Inject constructor(
         originalDisplayName: String,
         passphrase: String? = null,
         saveToDownloads: Boolean = false,
+        chatId: Long = 0L,
+        messageId: Long = 0L,
         onProgress: ((Long, Long) -> Unit)? = null,
     ): DecryptOutcome = withContext(dispatchers.io) {
         if (!encryptedFile.isFile) {
@@ -542,6 +547,19 @@ class UploadManager @Inject constructor(
                 tmpOut.delete()
             }
             val mime = guessMimeType(cleanName)
+            if (chatId != 0L && messageId != 0L &&
+                mediaThumbnailCache.getEncryptedThumbnailPath(chatId, messageId) == null
+            ) {
+                runCatching {
+                    mediaThumbnailCache.generateAndSyncEncryptedThumb(
+                        chatId = chatId,
+                        messageId = messageId,
+                        localPath = finalOut.absolutePath,
+                        mimeType = mime,
+                        originalFileName = cleanName,
+                    )
+                }
+            }
             var savedFile = finalOut
             if (saveToDownloads) {
                 savedFile = writeDecryptedToDownloads(finalOut, cleanName, mime) ?: finalOut
@@ -707,7 +725,7 @@ class UploadManager @Inject constructor(
                     return@withPermit splitOk
                 }
 
-                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled && options.encryption.useVaultKey) {
+                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled) {
                     runCatching {
                         mediaThumbnailCache.buildEncryptedThumbnailBytes(
                             localPath = tempRaw.absolutePath,
@@ -774,7 +792,7 @@ class UploadManager @Inject constructor(
                 val thumbPath = if (options.encryption.enabled) {
                     if (encryptedThumbBytes != null) {
                         runCatching {
-                            mediaThumbnailCache.saveEncryptedThumbnailBytes(
+                            mediaThumbnailCache.saveAndSyncEncryptedThumbBytes(
                                 chatId = chatId,
                                 messageId = uploadResult.messageId,
                                 encryptedBytes = encryptedThumbBytes,
@@ -1049,6 +1067,8 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
+                                zipPassword = password,
+                                virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
                             )
                         }
@@ -1083,6 +1103,8 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
+                                zipPassword = password,
+                                virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
                             )
                         }
@@ -1131,6 +1153,7 @@ class UploadManager @Inject constructor(
                                 remoteId = mRes.remoteId,
                                 date = System.currentTimeMillis(),
                                 lastAccessed = System.currentTimeMillis(),
+                                virtualPath = request.virtualPath,
                             ),
                         ),
                     )
@@ -1187,6 +1210,8 @@ class UploadManager @Inject constructor(
         chatId: Long,
         part: com.tgdrive.core.zip.ZipPartOutput,
         isEncrypted: Boolean,
+        zipPassword: String?,
+        virtualPath: String = "",
         uploadedParts: MutableList<UploadedZipPartRecord>,
     ) {
         val partName = part.partFile.name
@@ -1208,7 +1233,16 @@ class UploadManager @Inject constructor(
             mimeType = "application/zip",
         )
         val partThumb = if (isEncrypted) {
-            null
+            runCatching {
+                mediaThumbnailCache.generateAndSyncEncryptedThumb(
+                    chatId = chatId,
+                    messageId = result.messageId,
+                    localPath = part.partFile.absolutePath,
+                    mimeType = "application/zip",
+                    originalFileName = partName,
+                    zipPassword = zipPassword,
+                )
+            }.getOrNull()
         } else {
             runCatching {
                 mediaThumbnailCache.generateFromLocalFile(
@@ -1232,6 +1266,7 @@ class UploadManager @Inject constructor(
                     remoteId = result.remoteId,
                     date = System.currentTimeMillis(),
                     lastAccessed = System.currentTimeMillis(),
+                    virtualPath = virtualPath,
                     isEncryptedVault = isEncrypted,
                 ),
             ),
@@ -1732,6 +1767,7 @@ class UploadManager @Inject constructor(
                     "mode" to req.compressionMode.name,
                     "excl" to req.excludePatterns,
                     "wifi" to req.wifiOnly.toString(),
+                    "vpath" to req.virtualPath,
                     "enc" to req.encryption.enabled.toString(),
                     "vault" to req.encryption.useVaultKey.toString(),
                 )
@@ -1751,6 +1787,7 @@ class UploadManager @Inject constructor(
                     "mode" to req.compressionMode.name,
                     "excl" to req.excludePatterns,
                     "wifi" to req.wifiOnly.toString(),
+                    "vpath" to req.virtualPath,
                     "enc" to req.encryption.enabled.toString(),
                     "vault" to req.encryption.useVaultKey.toString(),
                     "count" to spec.files.size.toString(),
@@ -1821,6 +1858,7 @@ class UploadManager @Inject constructor(
                         excludePatterns = map["excl"].orEmpty(),
                         encryption = encSpec,
                         wifiOnly = map["wifi"]?.toBooleanStrictOrNull() ?: false,
+                        virtualPath = map["vpath"].orEmpty(),
                     ),
                 )
             }
@@ -1855,6 +1893,7 @@ class UploadManager @Inject constructor(
                         excludePatterns = map["excl"].orEmpty(),
                         encryption = encSpec,
                         wifiOnly = map["wifi"]?.toBooleanStrictOrNull() ?: false,
+                        virtualPath = map["vpath"].orEmpty(),
                     ),
                 )
             }

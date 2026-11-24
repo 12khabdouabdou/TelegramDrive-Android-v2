@@ -113,6 +113,13 @@ object CloudSyncCodec {
         val updatedAtMs: Long,
     )
 
+    data class CloudEncryptedThumbRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val thumbRemoteId: String,
+        val updatedAtMs: Long,
+    )
+
     data class CloudMetaSnapshot(
         val version: Int = 1,
         val updatedAtMs: Long = 0L,
@@ -127,6 +134,7 @@ object CloudSyncCodec {
         val notes: List<CloudNoteRecord> = emptyList(),
         val albums: List<CloudAlbumRecord> = emptyList(),
         val albumItems: List<CloudAlbumItemRecord> = emptyList(),
+        val encryptedThumbs: List<CloudEncryptedThumbRecord> = emptyList(),
     )
 
     data class CloudZipEntryRecord(
@@ -264,6 +272,15 @@ object CloudSyncCodec {
                 removed = o.boolVal("removed") ?: false,
             )
         }
+        val encryptedThumbs = root.optArray("encryptedThumbs").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudEncryptedThumbRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                thumbRemoteId = o.strVal("thumbRemoteId") ?: return@mapNotNull null,
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
         CloudMetaSnapshot(
             version = root.longVal("version")?.toInt() ?: 1,
             updatedAtMs = root.longVal("updatedAtMs") ?: 0L,
@@ -278,6 +295,7 @@ object CloudSyncCodec {
             notes = notes,
             albums = albums,
             albumItems = albumItems,
+            encryptedThumbs = encryptedThumbs,
         )
     }.getOrNull()
 
@@ -402,6 +420,15 @@ object CloudSyncCodec {
             }
         }
 
+        val encThumbMap = LinkedHashMap<Pair<Long, Long>, CloudEncryptedThumbRecord>()
+        (local.encryptedThumbs + remote.encryptedThumbs).forEach { r ->
+            val key = r.chatId to r.messageId
+            val cur = encThumbMap[key]
+            if (cur == null || r.updatedAtMs >= cur.updatedAtMs) {
+                encThumbMap[key] = r
+            }
+        }
+
         return CloudMetaSnapshot(
             version = 1,
             updatedAtMs = maxOf(local.updatedAtMs, remote.updatedAtMs, System.currentTimeMillis()),
@@ -416,6 +443,7 @@ object CloudSyncCodec {
             notes = noteMap.values.toList(),
             albums = albumMap.values.toList(),
             albumItems = albumItemMap.values.toList(),
+            encryptedThumbs = encThumbMap.values.toList(),
         )
     }
 
@@ -556,6 +584,15 @@ object CloudSyncCodec {
                 .append(",\"messageId\":").append(r.messageId)
                 .append(",\"addedAt\":").append(r.addedAt)
                 .append(",\"removed\":").append(r.removed).append("}")
+        }
+        append("],\n")
+        append("  \"encryptedThumbs\": [")
+        s.encryptedThumbs.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"thumbRemoteId\":").append(jsonStr(r.thumbRemoteId))
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
         }
         append("]\n}\n")
     }

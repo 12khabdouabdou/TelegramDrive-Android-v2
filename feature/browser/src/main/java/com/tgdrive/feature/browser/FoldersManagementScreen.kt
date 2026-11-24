@@ -26,6 +26,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -88,6 +90,7 @@ fun FoldersManagementScreen(
     var deleteTarget by remember { mutableStateOf<FolderEntity?>(null) }
     var colorTarget by remember { mutableStateOf<FolderEntity?>(null) }
     var menuForFolder by remember { mutableStateOf<FolderEntity?>(null) }
+    var showSortMenu by remember { mutableStateOf(false) }
 
     val savedTitle = stringResource(R.string.browser_saved_messages)
 
@@ -117,7 +120,51 @@ fun FoldersManagementScreen(
                 verticalArrangement = Arrangement.spacedBy(20.dp),
             ) {
                 item {
-                    EditorialHeader(title = stringResource(R.string.folders_title))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            EditorialHeader(title = stringResource(R.string.folders_title))
+                        }
+                        Box {
+                            IconButton(onClick = { showSortMenu = true }) {
+                                Icon(
+                                    Icons.Filled.Sort,
+                                    contentDescription = stringResource(R.string.folders_sort),
+                                    tint = MaterialTheme.colorScheme.onBackground,
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = showSortMenu,
+                                onDismissRequest = { showSortMenu = false },
+                            ) {
+                                listOf(
+                                    FolderListSort.DEFAULT to R.string.folders_sort_default,
+                                    FolderListSort.NAME_ASC to R.string.folders_sort_name,
+                                    FolderListSort.SIZE_DESC to R.string.folders_sort_size,
+                                    FolderListSort.FILES_DESC to R.string.folders_sort_files,
+                                ).forEach { (sortOpt, labelId) ->
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(labelId)) },
+                                        trailingIcon = {
+                                            if (state.folderSort == sortOpt) {
+                                                Icon(
+                                                    Icons.Filled.Check,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                )
+                                            }
+                                        },
+                                        onClick = {
+                                            vm.setFolderSort(sortOpt)
+                                            showSortMenu = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
                 state.error?.let { err ->
@@ -209,6 +256,7 @@ fun FoldersManagementScreen(
                 } else {
                     items(state.folders, key = { it.id }) { folder ->
                         val size = state.folderSizes[folder.channelId] ?: 0L
+                        val isPinned = folder.channelId in state.pinnedFolderChatIds
                         Box {
                             FolderManagementRow(
                                 title = folder.title,
@@ -219,6 +267,7 @@ fun FoldersManagementScreen(
                                 },
                                 icon = Icons.Filled.Folder,
                                 tint = Color(folder.color),
+                                isPinned = isPinned,
                                 onClick = { onOpenFolder(folder.channelId, folder.title) },
                                 onMoreClick = { menuForFolder = folder },
                             )
@@ -226,6 +275,20 @@ fun FoldersManagementScreen(
                                 expanded = menuForFolder == folder,
                                 onDismissRequest = { menuForFolder = null },
                             ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            stringResource(
+                                                if (isPinned) R.string.folders_unpin else R.string.folders_pin,
+                                            ),
+                                        )
+                                    },
+                                    onClick = {
+                                        menuForFolder = null
+                                        vm.togglePinFolder(folder.channelId)
+                                    },
+                                    leadingIcon = { Icon(Icons.Filled.PushPin, contentDescription = null) },
+                                )
                                 DropdownMenuItem(
                                     text = { Text(stringResource(R.string.folders_rename)) },
                                     onClick = {
@@ -410,6 +473,7 @@ private fun FolderManagementRow(
     subtitle: String,
     icon: ImageVector,
     tint: Color,
+    isPinned: Boolean = false,
     enabled: Boolean = true,
     onClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
@@ -451,6 +515,14 @@ private fun FolderManagementRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (isPinned) {
+            Icon(
+                Icons.Filled.PushPin,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(16.dp),
             )
         }
         if (onMoreClick != null) {

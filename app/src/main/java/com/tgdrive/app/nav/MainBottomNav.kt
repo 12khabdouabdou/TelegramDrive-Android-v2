@@ -120,6 +120,19 @@ fun MainBottomNav(
     val isTopLevelTab = Tab.entries.any { it.route == current }
     val rootState by rootVm.state.collectAsStateWithLifecycle()
 
+    androidx.compose.runtime.LaunchedEffect(rootState.pendingShortcutRoute) {
+        val route = rootState.pendingShortcutRoute ?: return@LaunchedEffect
+        rootVm.consumeShortcutRoute()
+        when (route) {
+            "vault" -> onOpenVault()
+            "downloads" -> onOpenDownloads()
+            "search" -> nav.navigate("search")
+            "transfers" -> nav.navigate(Tab.TRANSFERS.route) { launchSingleTop = true }
+            "folders" -> nav.navigate(Tab.FOLDERS.route) { launchSingleTop = true }
+            "backup" -> nav.navigate(Tab.BACKUP.route) { launchSingleTop = true }
+        }
+    }
+
     BackHandler(enabled = !isTopLevelTab) {
         nav.popBackStack()
     }

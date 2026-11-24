@@ -10,7 +10,9 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
@@ -37,8 +39,35 @@ class TelegramDocumentsProvider : DocumentsProvider() {
     interface DocumentsProviderEntryPoint {
         fun fileCacheDao(): FileCacheDao
         fun folderDao(): FolderDao
+        fun trashEntryDao(): TrashEntryDao
         fun appPreferences(): AppPreferences
         fun offlinePinStore(): OfflinePinStore
+    }
+
+    /**
+     * Central privacy guard deciding whether a cached cloud file or folder should be exposed
+     * through Android's Storage Access Framework (`TelegramDocumentsProvider`).
+     */
+    internal object SafVisibilityFilter {
+        fun isHiddenFolder(
+            chatId: Long,
+            vaultChatIds: Set<Long>,
+        ): Boolean = chatId in vaultChatIds
+
+        fun isHiddenFile(
+            file: FileCacheEntity,
+            trashedIds: Set<Pair<Long, Long>>,
+            vaultChatIds: Set<Long> = emptySet(),
+        ): Boolean {
+            if (file.chatId in vaultChatIds) return true
+            if (file.isLocked || file.isEncryptedVault) return true
+            val lower = file.fileName.lowercase()
+            if (lower.endsWith(".tgenc") || lower.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT)) {
+                return true
+            }
+            if ((file.chatId to file.messageId) in trashedIds) return true
+            return false
+        }
     }
 
     private fun entryPoint(): DocumentsProviderEntryPoint? = try {
@@ -108,10 +137,12 @@ class TelegramDocumentsProvider : DocumentsProvider() {
                 if (isBiometricLocked(ep)) return@runBlocking
                 if (documentId.startsWith("chat_")) {
                     val chatId = documentId.removePrefix("chat_").toLongOrNull() ?: return@runBlocking
+                    val folder = ep.folderDao().getByChannelId(chatId)
+                    if (folder?.isVault == true) return@runBlocking
                     val title = if (chatId == 0L) {
                         "Saved Messages"
                     } else {
-                        ep.folderDao().getByChannelId(chatId)?.title ?: "Folder $chatId"
+                        folder?.title ?: "Folder $chatId"
                     }
                     addFolderRow(cursor, documentId, title, 0)
                 } else if (documentId.startsWith("file_")) {
@@ -120,7 +151,12 @@ class TelegramDocumentsProvider : DocumentsProvider() {
                         val chatId = parts[0].toLongOrNull() ?: return@runBlocking
                         val messageId = parts[1].toLongOrNull() ?: return@runBlocking
                         val file = ep.fileCacheDao().getById(chatId, messageId)
-                        if (file != null) {
+                        val trashedIds = ep.trashEntryDao().getAll()
+                            .mapTo(HashSet()) { it.chatId to it.messageId }
+                        val vaultChatIds = ep.folderDao().getAll()
+                            .filter { it.isVault }
+                            .mapTo(HashSet()) { it.channelId }
+                        if (file != null && !SafVisibilityFilter.isHiddenFile(file, trashedIds, vaultChatIds)) {
                             addFileRow(cursor, documentId, file)
                         }
                     }
@@ -146,7 +182,11 @@ class TelegramDocumentsProvider : DocumentsProvider() {
                     parentDocumentId == ROOT_ID -> {
                         val chatIds = ep.fileCacheDao().getAllChatIds()
                         val foldersByChat = ep.folderDao().getAll().associateBy { it.channelId }
+                        val vaultChatIds = foldersByChat.values
+                            .filter { it.isVault }
+                            .mapTo(HashSet()) { it.channelId }
                         for (chatId in chatIds) {
+                            if (SafVisibilityFilter.isHiddenFolder(chatId, vaultChatIds)) continue
                             val title = if (chatId == 0L) {
                                 "Saved Messages"
                             } else {
@@ -157,9 +197,17 @@ class TelegramDocumentsProvider : DocumentsProvider() {
                     }
                     parentDocumentId.startsWith("chat_") -> {
                         val chatId = parentDocumentId.removePrefix("chat_").toLongOrNull() ?: return@runBlocking
+                        val vaultChatIds = ep.folderDao().getAll()
+                            .filter { it.isVault }
+                            .mapTo(HashSet()) { it.channelId }
+                        if (chatId in vaultChatIds) return@runBlocking
+                        val trashedIds = ep.trashEntryDao().getAll()
+                            .mapTo(HashSet()) { it.chatId to it.messageId }
                         val files = ep.fileCacheDao().forChat(chatId)
                         for (file in files) {
-                            addFileRow(cursor, "file_${chatId}_${file.messageId}", file)
+                            if (!SafVisibilityFilter.isHiddenFile(file, trashedIds, vaultChatIds)) {
+                                addFileRow(cursor, "file_${chatId}_${file.messageId}", file)
+                            }
                         }
                     }
                 }
@@ -195,7 +243,17 @@ class TelegramDocumentsProvider : DocumentsProvider() {
             if (isBiometricLocked(ep)) {
                 throw FileNotFoundException("TelegramDrive is locked")
             }
-            ep.fileCacheDao().getById(chatId, messageId)
+            val candidate = ep.fileCacheDao().getById(chatId, messageId)
+                ?: return@runBlocking null
+            val trashedIds = ep.trashEntryDao().getAll()
+                .mapTo(HashSet()) { it.chatId to it.messageId }
+            val vaultChatIds = ep.folderDao().allSync()
+                .filter { it.isVault }
+                .mapTo(HashSet()) { it.channelId }
+            if (SafVisibilityFilter.isHiddenFile(candidate, trashedIds, vaultChatIds)) {
+                throw FileNotFoundException("Document is private or trashed: $documentId")
+            }
+            candidate
         } ?: throw FileNotFoundException("Document not in cache: $documentId")
 
         val rawName = file.fileName

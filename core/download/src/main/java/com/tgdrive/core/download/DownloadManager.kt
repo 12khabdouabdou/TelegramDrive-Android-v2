@@ -1,22 +1,30 @@
 package com.tgdrive.core.download
 
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.webkit.MimeTypeMap
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import java.io.File
+import java.io.FileInputStream
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -35,12 +43,20 @@ class DownloadManager @Inject constructor(
     private val telegramClient: TelegramClient,
     private val dispatchers: DispatchersProvider,
     private val offlinePinStore: OfflinePinStore,
+    private val appPreferences: AppPreferences,
+    private val networkMonitor: NetworkMonitor,
+    private val queueStore: DownloadQueueStore,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
-    private val concurrencyLimiter = Semaphore(2)
+    private val dispatchLock = Any()
     private val jobs = ConcurrentHashMap<String, Job>()
+    private val manuallyPausedKeys = ConcurrentHashMap.newKeySet<String>()
     private val lastNotifUpdateMs = java.util.concurrent.atomic.AtomicLong(0L)
     @Volatile private var dismissNotifJob: Job? = null
+
+    @Volatile private var maxConcurrent: Int = 2
+    @Volatile private var wifiOnlyEnabled: Boolean = false
+    @Volatile private var autoSavePublic: Boolean = false
 
     private data class SpeedSample(var lastMs: Long, var lastBytes: Long, var smoothedBps: Long)
     private val speedSamples = ConcurrentHashMap<String, SpeedSample>()
@@ -49,6 +65,28 @@ class DownloadManager @Inject constructor(
     val state: StateFlow<DownloadQueueState> = _state.asStateFlow()
 
     private val downloadsDir = File(ctx.cacheDir, "downloads").apply { mkdirs() }
+
+    init {
+        val restored = queueStore.load()
+        if (restored.isNotEmpty()) {
+            _state.value = DownloadQueueState(items = restored)
+        }
+        scope.launch {
+            combine(appPreferences.data, networkMonitor.isUnmetered) { prefs, isUnmetered ->
+                prefs to isUnmetered
+            }.collect { (prefs, isUnmetered) ->
+                maxConcurrent = prefs.downloadConcurrency.coerceIn(1, 4)
+                wifiOnlyEnabled = prefs.downloadWifiOnly
+                autoSavePublic = prefs.autoSaveDownloadsToPublic
+                if (prefs.downloadWifiOnly && !isUnmetered) {
+                    autoPauseForWifi()
+                } else {
+                    autoResumeFromWifi()
+                }
+                dispatchQueue()
+            }
+        }
+    }
 
     private fun keyFor(chatId: Long, id: Long): String = "${chatId}_$id"
 
@@ -60,6 +98,7 @@ class DownloadManager @Inject constructor(
 
     fun enqueue(item: DownloadItem) {
         val key = keyFor(item.chatId, item.id)
+        manuallyPausedKeys.remove(key)
         val pinnedPath = offlinePinStore.getPinnedFilePathSync(item.chatId, item.id)
         if (pinnedPath != null) {
             val doneItem = item.copy(
@@ -69,13 +108,20 @@ class DownloadManager @Inject constructor(
                 localPath = pinnedPath,
                 speedBytesPerSec = 0L,
                 etaSeconds = null,
+                autoPausedForWifi = false,
+                errorMessage = null,
             )
             _state.update { s ->
                 val without = s.items.filterNot { matchesKey(it, item.chatId, item.id) }
                 s.copy(items = without + doneItem)
             }
+            persistQueue()
             return
         }
+
+        val waitForWifi = wifiOnlyEnabled && !networkMonitor.isCurrentlyUnmetered()
+        val initialStatus = if (waitForWifi) DownloadStatus.PAUSED else DownloadStatus.QUEUED
+        val initialErr = if (waitForWifi) WIFI_WAIT_MESSAGE else null
 
         val existing = _state.value.items.find { matchesKey(it, item.chatId, item.id) }
         if (existing != null) {
@@ -88,6 +134,7 @@ class DownloadManager @Inject constructor(
                         scope.launch {
                             offlinePinStore.pinFile(item.chatId, item.id, existing.localPath, item.fileName)?.let { pinned ->
                                 updateItem(item.chatId, item.id) { it.copy(localPath = pinned, pinOfflineWhenDone = true) }
+                                persistQueue()
                             }
                         }
                     }
@@ -95,83 +142,339 @@ class DownloadManager @Inject constructor(
                 }
                 updateItem(item.chatId, item.id) {
                     it.copy(
-                        status = DownloadStatus.QUEUED,
+                        status = initialStatus,
                         progress = 0f,
                         downloadedBytes = 0L,
                         speedBytesPerSec = 0L,
                         etaSeconds = null,
-                        errorMessage = null,
+                        errorMessage = initialErr,
                         localPath = null,
+                        autoPausedForWifi = waitForWifi,
                         pinOfflineWhenDone = it.pinOfflineWhenDone || item.pinOfflineWhenDone,
                     )
                 }
-            } else if (existing.status != DownloadStatus.FAILED && existing.status != DownloadStatus.CANCELLED) {
+            } else if (existing.status == DownloadStatus.DOWNLOADING || existing.status == DownloadStatus.QUEUED) {
                 if (item.pinOfflineWhenDone && !existing.pinOfflineWhenDone) {
                     updateItem(item.chatId, item.id) { it.copy(pinOfflineWhenDone = true) }
+                    persistQueue()
                 }
                 return
             } else {
                 updateItem(item.chatId, item.id) {
                     it.copy(
-                        status = DownloadStatus.QUEUED,
+                        status = initialStatus,
                         progress = 0f,
                         downloadedBytes = 0L,
                         speedBytesPerSec = 0L,
                         etaSeconds = null,
-                        errorMessage = null,
+                        errorMessage = initialErr,
+                        autoPausedForWifi = waitForWifi,
                         pinOfflineWhenDone = it.pinOfflineWhenDone || item.pinOfflineWhenDone,
                     )
                 }
             }
             jobs[key]?.cancel()
-            TransferKeepAliveWorker.ensureRunning(ctx)
-            jobs[key] = scope.launch { runDownload(item.copy(pinOfflineWhenDone = existing.pinOfflineWhenDone || item.pinOfflineWhenDone)) }
+            jobs.remove(key)
+            persistQueue()
+            if (!waitForWifi) {
+                TransferKeepAliveWorker.ensureRunning(ctx)
+                dispatchQueue()
+            } else {
+                updateNotification(force = true)
+            }
             return
         }
-        _state.update { it.copy(items = it.items + item) }
-        TransferKeepAliveWorker.ensureRunning(ctx)
-        jobs[key] = scope.launch { runDownload(item) }
+        val queuedItem = item.copy(
+            status = initialStatus,
+            errorMessage = initialErr,
+            autoPausedForWifi = waitForWifi,
+        )
+        _state.update { it.copy(items = it.items + queuedItem) }
+        persistQueue()
+        if (!waitForWifi) {
+            TransferKeepAliveWorker.ensureRunning(ctx)
+            dispatchQueue()
+        } else {
+            updateNotification(force = true)
+        }
+    }
+
+    fun pause(chatId: Long, id: Long, autoForWifi: Boolean = false) {
+        val k = keyFor(chatId, id)
+        manuallyPausedKeys.add(k)
+        jobs[k]?.cancel()
+        jobs.remove(k)
+        speedSamples.remove(k)
+        updateItem(chatId, id) {
+            if (it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING) {
+                it.copy(
+                    status = DownloadStatus.PAUSED,
+                    speedBytesPerSec = 0L,
+                    etaSeconds = null,
+                    autoPausedForWifi = autoForWifi,
+                    errorMessage = if (autoForWifi) WIFI_WAIT_MESSAGE else null,
+                )
+            } else {
+                it
+            }
+        }
+        persistQueue()
+        updateNotification(force = true)
+        dispatchQueue()
+    }
+
+    fun resume(chatId: Long, id: Long) {
+        val k = keyFor(chatId, id)
+        manuallyPausedKeys.remove(k)
+        var resumedAny = false
+        updateItem(chatId, id) {
+            if (it.status == DownloadStatus.PAUSED) {
+                resumedAny = true
+                it.copy(
+                    status = DownloadStatus.QUEUED,
+                    autoPausedForWifi = false,
+                    errorMessage = null,
+                )
+            } else {
+                it
+            }
+        }
+        if (resumedAny) {
+            persistQueue()
+            TransferKeepAliveWorker.ensureRunning(ctx)
+            dispatchQueue()
+            updateNotification(force = true)
+        }
+    }
+
+    fun pauseAll() {
+        val toPause = _state.value.items.filter {
+            it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
+        }
+        if (toPause.isEmpty()) return
+        for (itx in toPause) {
+            val k = keyFor(itx.chatId, itx.id)
+            manuallyPausedKeys.add(k)
+            jobs[k]?.cancel()
+            jobs.remove(k)
+            speedSamples.remove(k)
+        }
+        _state.update { s ->
+            s.copy(
+                items = s.items.map {
+                    if (it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING) {
+                        it.copy(
+                            status = DownloadStatus.PAUSED,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            autoPausedForWifi = false,
+                            errorMessage = null,
+                        )
+                    } else {
+                        it
+                    }
+                },
+            )
+        }
+        persistQueue()
+        updateNotification(force = true)
+    }
+
+    fun resumeAll() {
+        val canAuto = !wifiOnlyEnabled || networkMonitor.isCurrentlyUnmetered()
+        var resumedAny = false
+        _state.update { s ->
+            s.copy(
+                items = s.items.map {
+                    if (it.status == DownloadStatus.PAUSED && (!it.autoPausedForWifi || canAuto)) {
+                        resumedAny = true
+                        manuallyPausedKeys.remove(keyFor(it.chatId, it.id))
+                        it.copy(
+                            status = DownloadStatus.QUEUED,
+                            autoPausedForWifi = false,
+                            errorMessage = null,
+                        )
+                    } else {
+                        it
+                    }
+                },
+            )
+        }
+        if (resumedAny) {
+            persistQueue()
+            TransferKeepAliveWorker.ensureRunning(ctx)
+            dispatchQueue()
+            updateNotification(force = true)
+        }
+    }
+
+    fun cancelAll() {
+        val active = _state.value.items.filter {
+            it.status == DownloadStatus.QUEUED ||
+                it.status == DownloadStatus.DOWNLOADING ||
+                it.status == DownloadStatus.PAUSED
+        }
+        if (active.isEmpty()) return
+        for (itx in active) {
+            val k = keyFor(itx.chatId, itx.id)
+            manuallyPausedKeys.remove(k)
+            jobs[k]?.cancel()
+            jobs.remove(k)
+            speedSamples.remove(k)
+        }
+        _state.update { s ->
+            s.copy(
+                items = s.items.filterNot {
+                    it.status == DownloadStatus.QUEUED ||
+                        it.status == DownloadStatus.DOWNLOADING ||
+                        it.status == DownloadStatus.PAUSED
+                },
+            )
+        }
+        persistQueue()
+        updateNotification(force = true)
+    }
+
+    fun retryAllFailed() {
+        val failed = _state.value.items.filter {
+            it.status == DownloadStatus.FAILED || it.status == DownloadStatus.CANCELLED
+        }
+        failed.forEach { enqueue(it) }
+    }
+
+    private fun autoPauseForWifi() {
+        val toPause = _state.value.items.filter {
+            it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
+        }
+        if (toPause.isEmpty()) return
+        for (itx in toPause) {
+            val k = keyFor(itx.chatId, itx.id)
+            manuallyPausedKeys.add(k)
+            jobs[k]?.cancel()
+            jobs.remove(k)
+            speedSamples.remove(k)
+        }
+        _state.update { s ->
+            s.copy(
+                items = s.items.map {
+                    if (it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING) {
+                        it.copy(
+                            status = DownloadStatus.PAUSED,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            autoPausedForWifi = true,
+                            errorMessage = WIFI_WAIT_MESSAGE,
+                        )
+                    } else {
+                        it
+                    }
+                },
+            )
+        }
+        persistQueue()
+        updateNotification(force = true)
+    }
+
+    private fun autoResumeFromWifi() {
+        var resumedAny = false
+        _state.update { s ->
+            s.copy(
+                items = s.items.map {
+                    if (it.status == DownloadStatus.PAUSED && it.autoPausedForWifi) {
+                        resumedAny = true
+                        manuallyPausedKeys.remove(keyFor(it.chatId, it.id))
+                        it.copy(
+                            status = DownloadStatus.QUEUED,
+                            autoPausedForWifi = false,
+                            errorMessage = null,
+                        )
+                    } else {
+                        it
+                    }
+                },
+            )
+        }
+        if (resumedAny) {
+            persistQueue()
+            TransferKeepAliveWorker.ensureRunning(ctx)
+        }
+    }
+
+    private fun dispatchQueue() {
+        synchronized(dispatchLock) {
+            val activeKeys = jobs.keys
+            val queued = _state.value.items.filter {
+                it.status == DownloadStatus.QUEUED && keyFor(it.chatId, it.id) !in activeKeys
+            }
+            if (queued.isEmpty()) return
+            var available = (maxConcurrent - jobs.size).coerceAtLeast(0)
+            for (next in queued) {
+                if (available <= 0) break
+                val key = keyFor(next.chatId, next.id)
+                manuallyPausedKeys.remove(key)
+                jobs[key] = scope.launch { runDownload(next) }
+                available--
+            }
+        }
     }
 
     fun cancel(id: Long) {
         val matchingKeys = _state.value.items.filter { it.id == id }.map { keyFor(it.chatId, it.id) }
         matchingKeys.forEach { k ->
+            manuallyPausedKeys.remove(k)
             jobs[k]?.cancel()
             jobs.remove(k)
             speedSamples.remove(k)
         }
         _state.update { s -> s.copy(items = s.items.filter { it.id != id }) }
+        persistQueue()
+        updateNotification(force = true)
+        dispatchQueue()
     }
 
     fun cancel(chatId: Long, id: Long) {
         val k = keyFor(chatId, id)
+        manuallyPausedKeys.remove(k)
         jobs[k]?.cancel()
         jobs.remove(k)
         speedSamples.remove(k)
         _state.update { s -> s.copy(items = s.items.filterNot { matchesKey(it, chatId, id) }) }
+        persistQueue()
+        updateNotification(force = true)
+        dispatchQueue()
     }
 
     fun clearCompleted() {
         _state.update { s ->
             s.copy(
                 items = s.items.filter {
-                    it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
+                    it.status == DownloadStatus.QUEUED ||
+                        it.status == DownloadStatus.DOWNLOADING ||
+                        it.status == DownloadStatus.PAUSED
                 },
             )
         }
+        persistQueue()
     }
 
     private suspend fun runDownload(item: DownloadItem) {
         val key = keyFor(item.chatId, item.id)
-        concurrencyLimiter.withPermit {
-            speedSamples[key] = SpeedSample(System.currentTimeMillis(), 0L, 0L)
-            updateItem(item.chatId, item.id) { it.copy(status = DownloadStatus.DOWNLOADING, progress = 0f) }
-            updateNotification(force = true)
-            try {
-                downloadsDir.mkdirs()
-                Log.i("DownloadManager: starting download for '${item.fileName}' (chat=${item.chatId}, id=${item.id})")
-                telegramClient.downloadFile(item.remoteId, "")
-                    .collect { upd ->
+        speedSamples[key] = SpeedSample(System.currentTimeMillis(), 0L, 0L)
+        updateItem(item.chatId, item.id) {
+            it.copy(
+                status = DownloadStatus.DOWNLOADING,
+                progress = it.progress.takeIf { p -> p.isFinite() && p > 0f } ?: 0f,
+                errorMessage = null,
+                autoPausedForWifi = false,
+            )
+        }
+        persistQueue()
+        updateNotification(force = true)
+        try {
+            downloadsDir.mkdirs()
+            Log.i("DownloadManager: starting download for '${item.fileName}' (chat=${item.chatId}, id=${item.id})")
+            telegramClient.downloadFile(item.remoteId, "")
+                .collect { upd ->
                         when (upd) {
                             is DownloadUpdate.Progress -> {
                                 val now = System.currentTimeMillis()
@@ -220,8 +523,19 @@ class DownloadManager @Inject constructor(
                                         localPath = finalPath,
                                         speedBytesPerSec = 0L,
                                         etaSeconds = null,
+                                        autoPausedForWifi = false,
+                                        errorMessage = null,
                                     )
                                 }
+                                if (autoSavePublic &&
+                                    !item.fileName.endsWith(".tgenc", ignoreCase = true) &&
+                                    !item.fileName.endsWith(".tgethumb", ignoreCase = true)
+                                ) {
+                                    runCatching {
+                                        saveCompletedToDownloads(latestItem.copy(localPath = finalPath, status = DownloadStatus.DONE))
+                                    }
+                                }
+                                persistQueue()
                                 updateNotification(force = true)
                             }
                             is DownloadUpdate.Failed -> {
@@ -232,30 +546,90 @@ class DownloadManager @Inject constructor(
                                         speedBytesPerSec = 0L,
                                         etaSeconds = null,
                                         errorMessage = upd.message,
+                                        autoPausedForWifi = false,
                                     )
                                 }
+                                persistQueue()
                                 updateNotification(force = true)
                             }
                         }
                     }
-            } catch (t: Throwable) {
-                if (t is kotlinx.coroutines.CancellationException) throw t
-                Log.w("Download failed for ${item.fileName}", t)
-                updateItem(item.chatId, item.id) {
-                    it.copy(
-                        status = DownloadStatus.FAILED,
-                        speedBytesPerSec = 0L,
-                        etaSeconds = null,
-                        errorMessage = t.message,
-                    )
+        } catch (t: Throwable) {
+            if (t is CancellationException) {
+                if (key in manuallyPausedKeys) {
+                    return
                 }
-                updateNotification(force = true)
-            } finally {
-                jobs.remove(key)
-                speedSamples.remove(key)
-                updateNotification(force = true)
+                throw t
             }
+            Log.w("Download failed for ${item.fileName}", t)
+            updateItem(item.chatId, item.id) {
+                it.copy(
+                    status = DownloadStatus.FAILED,
+                    speedBytesPerSec = 0L,
+                    etaSeconds = null,
+                    errorMessage = t.message,
+                    autoPausedForWifi = false,
+                )
+            }
+            persistQueue()
+            updateNotification(force = true)
+        } finally {
+            jobs.remove(key)
+            speedSamples.remove(key)
+            persistQueue()
+            updateNotification(force = true)
+            dispatchQueue()
         }
+    }
+
+    /**
+     * Copies a completed cached download to public `Downloads/TelegramDrive/<fileName>`.
+     */
+    fun saveCompletedToDownloads(item: DownloadItem): File? {
+        val localPath = item.localPath ?: return null
+        val src = File(localPath)
+        if (!src.isFile || src.length() <= 0L) return null
+        val ext = item.fileName.substringAfterLast('.', "").lowercase()
+        val mime = runCatching {
+            MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext)
+        }.getOrNull() ?: "application/octet-stream"
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, item.fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mime)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = ctx.contentResolver
+                val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
+                try {
+                    resolver.openOutputStream(itemUri)?.use { out ->
+                        FileInputStream(src).use { input -> input.copyTo(out, 64 * 1024) }
+                    }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(itemUri, values, null, null)
+                } catch (t: Throwable) {
+                    runCatching { resolver.delete(itemUri, null, null) }
+                    throw t
+                }
+                src
+            } else {
+                @Suppress("DEPRECATION")
+                val dlDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "TelegramDrive",
+                ).apply { mkdirs() }
+                val dest = File(dlDir, item.fileName)
+                src.copyTo(dest, overwrite = true)
+                dest
+            }
+        }.getOrNull()
+    }
+
+    private fun persistQueue() {
+        queueStore.save(_state.value.items)
     }
 
     /**
@@ -321,6 +695,7 @@ class DownloadManager @Inject constructor(
 
     companion object {
         private const val DOWNLOAD_NOTIF_ID = 50001
+        private const val WIFI_WAIT_MESSAGE = "Waiting for Wi-Fi…"
     }
 
     private fun updateItem(chatId: Long, id: Long, transform: (DownloadItem) -> DownloadItem) {
@@ -335,7 +710,11 @@ class DownloadManager @Inject constructor(
      */
     fun clearCache() {
         _state.value.items
-            .filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING }
+            .filter {
+                it.status == DownloadStatus.QUEUED ||
+                    it.status == DownloadStatus.DOWNLOADING ||
+                    it.status == DownloadStatus.PAUSED
+            }
             .forEach { cancel(it.chatId, it.id) }
 
         _state.update { s ->
@@ -345,6 +724,7 @@ class DownloadManager @Inject constructor(
                 },
             )
         }
+        persistQueue()
         updateNotification(force = true)
 
         scope.launch {
@@ -370,9 +750,10 @@ data class DownloadItem(
     val localPath: String? = null,
     val errorMessage: String? = null,
     val pinOfflineWhenDone: Boolean = false,
+    val autoPausedForWifi: Boolean = false,
 )
 
-enum class DownloadStatus { QUEUED, DOWNLOADING, DONE, FAILED, CANCELLED }
+enum class DownloadStatus { QUEUED, DOWNLOADING, PAUSED, DONE, FAILED, CANCELLED }
 
 data class DownloadQueueState(
     val items: List<DownloadItem> = emptyList(),

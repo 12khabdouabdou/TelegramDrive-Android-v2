@@ -78,13 +78,14 @@ internal class AudioMediaNotification(
         }.getOrNull()
     }
 
-    fun update(state: AudioState, positionMs: Long, durationMs: Long) {
+    fun update(state: AudioState, positionMs: Long, durationMs: Long): Notification? {
         if (state.path == null || state.title.isNullOrBlank()) {
             dismiss()
-            return
+            return null
         }
+        var built: Notification? = null
         runCatching {
-            val session = ensureInitialized() ?: return
+            val session = ensureInitialized() ?: return null
             val safeDuration = durationMs.coerceAtLeast(0L)
             val safePosition = positionMs.coerceIn(0L, safeDuration.coerceAtLeast(1L))
             val pbState = if (state.isPlaying) {
@@ -124,7 +125,7 @@ internal class AudioMediaNotification(
             )
 
             val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                ?: return
+                ?: return null
             val playPauseAction = Notification.Action.Builder(
                 Icon.createWithResource(
                     appContext,
@@ -193,10 +194,12 @@ internal class AudioMediaNotification(
                 builder.addAction(stopAction)
             }
 
-            nm.notify(NOTIFICATION_ID, builder.build())
+            built = builder.build()
+            nm.notify(NOTIFICATION_ID, built)
         }.onFailure {
             Log.w("AudioMediaNotification: update failed", it)
         }
+        return built
     }
 
     fun dismiss() {
@@ -244,7 +247,7 @@ internal class AudioMediaNotification(
         )
     }
 
-    private companion object {
+    internal companion object {
         const val CHANNEL_ID = "audio.playback"
         const val SESSION_TAG = "TelegramDriveAudioSession"
         const val NOTIFICATION_ID = 4910

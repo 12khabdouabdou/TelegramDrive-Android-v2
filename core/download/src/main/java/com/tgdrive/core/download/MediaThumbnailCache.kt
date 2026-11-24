@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
@@ -16,6 +18,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
@@ -50,6 +53,7 @@ class MediaThumbnailCache @Inject constructor(
     private val downloadManager: DownloadManager,
     private val offlinePinStore: OfflinePinStore,
     private val backupCrypto: BackupCrypto,
+    private val cloudSyncManager: CloudSyncManager,
     private val dispatchers: DispatchersProvider,
 ) {
     private val thumbsDir: File
@@ -92,8 +96,7 @@ class MediaThumbnailCache @Inject constructor(
             bucket == FileBucket.VIDEOS -> decodeVideoFrame(localPath)
             bucket == FileBucket.PDF -> decodePdfFirstPage(localPath)
             bucket == FileBucket.ARCHIVES && fileName.endsWith(".zip", ignoreCase = true) -> {
-                val imgBytes = ZipUploader.readFirstImageEntryBytes(localPath) ?: return@withContext null
-                decodeSampledImageBytes(imgBytes)
+                decodeZipPreviewCollage(localPath, password = null) ?: return@withContext null
             }
             else -> null
         }
@@ -107,6 +110,14 @@ class MediaThumbnailCache @Inject constructor(
     }
 
     /**
+     * Returns an existing local `.tgethumb` path for `(chatId, messageId)` if already cached.
+     */
+    fun getEncryptedThumbnailPath(chatId: Long, messageId: Long): String? {
+        val f = File(encryptedThumbsDir, "${chatId}_${messageId}$ENCRYPTED_THUMB_EXT")
+        return f.absolutePath.takeIf { f.isFile && f.length() > 0L }
+    }
+
+    /**
      * Encodes a scaled JPEG preview in memory and writes an AES-256 `TGE1` encrypted sidecar
      * under `encrypted_thumbs/` without ever storing plaintext thumbnail bytes on disk.
      */
@@ -114,6 +125,7 @@ class MediaThumbnailCache @Inject constructor(
         localPath: String,
         mimeType: String?,
         originalFileName: String,
+        zipPassword: String? = null,
     ): ByteArray? = withContext(dispatchers.io) {
         val src = File(localPath)
         if (!src.isFile || src.length() <= 0L) return@withContext null
@@ -122,6 +134,9 @@ class MediaThumbnailCache @Inject constructor(
             bucket == FileBucket.IMAGES -> decodeSampledImageFile(localPath)
             bucket == FileBucket.VIDEOS -> decodeVideoFrame(localPath)
             bucket == FileBucket.PDF -> decodePdfFirstPage(localPath)
+            bucket == FileBucket.ARCHIVES && originalFileName.endsWith(".zip", ignoreCase = true) -> {
+                decodeZipPreviewCollage(localPath, password = zipPassword)
+            }
             else -> null
         }
         if (rawBmp == null || rawBmp.isRecycled) return@withContext null
@@ -141,6 +156,153 @@ class MediaThumbnailCache @Inject constructor(
         } finally {
             if (scaled !== rawBmp && !scaled.isRecycled) scaled.recycle()
             if (!rawBmp.isRecycled) rawBmp.recycle()
+        }
+    }
+
+    suspend fun buildEncryptedCollageBytes(bitmaps: List<Bitmap>): ByteArray? = withContext(dispatchers.io) {
+        val collage = buildCollageBitmap(bitmaps) ?: return@withContext null
+        try {
+            val jpegOut = ByteArrayOutputStream()
+            collage.compress(Bitmap.CompressFormat.JPEG, 82, jpegOut)
+            val plain = jpegOut.toByteArray()
+            if (plain.isEmpty()) return@withContext null
+            val encOut = ByteArrayOutputStream()
+            BackupCrypto.encryptStream(backupCrypto.vaultKey(), ByteArrayInputStream(plain), encOut)
+            encOut.toByteArray()
+        } catch (t: Throwable) {
+            Log.w("MediaThumbnailCache: buildEncryptedCollageBytes failed", t)
+            null
+        } finally {
+            if (!collage.isRecycled) collage.recycle()
+        }
+    }
+
+    suspend fun saveAndSyncEncryptedThumbBytes(
+        chatId: Long,
+        messageId: Long,
+        encryptedBytes: ByteArray,
+    ): String? = withContext(dispatchers.io) {
+        val path = saveEncryptedThumbnailBytes(chatId, messageId, encryptedBytes) ?: return@withContext null
+        runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, path) }
+        runCatching { cloudSyncManager.uploadEncryptedThumbBytes(chatId, messageId, encryptedBytes) }
+        path
+    }
+
+    suspend fun generateAndSyncEncryptedThumb(
+        chatId: Long,
+        messageId: Long,
+        localPath: String,
+        mimeType: String?,
+        originalFileName: String,
+        zipPassword: String? = null,
+    ): String? = withContext(dispatchers.io) {
+        val bytes = buildEncryptedThumbnailBytes(
+            localPath = localPath,
+            mimeType = mimeType,
+            originalFileName = originalFileName,
+            zipPassword = zipPassword,
+        ) ?: return@withContext null
+        saveAndSyncEncryptedThumbBytes(chatId, messageId, bytes)
+    }
+
+    suspend fun restoreEncryptedThumbFromCloud(
+        chatId: Long,
+        messageId: Long,
+    ): String? = withContext(dispatchers.io) {
+        getEncryptedThumbnailPath(chatId, messageId)?.let { return@withContext it }
+        val bytes = cloudSyncManager.restoreEncryptedThumbBytes(chatId, messageId) ?: return@withContext null
+        val path = saveEncryptedThumbnailBytes(chatId, messageId, bytes) ?: return@withContext null
+        runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, path) }
+        path
+    }
+
+    private fun decodeZipPreviewCollage(zipPath: String, password: String?): Bitmap? {
+        val previewBytes = ZipUploader.readPreviewImageEntriesBytes(
+            zipPath = zipPath,
+            maxCount = 4,
+            password = password,
+        )
+        if (previewBytes.isEmpty()) return null
+        val bitmaps = ArrayList<Bitmap>(previewBytes.size)
+        for (bytes in previewBytes) {
+            val decoded = decodeSampledImageBytes(bytes)
+            if (decoded != null && !decoded.isRecycled) {
+                bitmaps.add(decoded)
+            }
+        }
+        if (bitmaps.isEmpty()) return null
+        if (bitmaps.size == 1) return bitmaps[0]
+        return try {
+            buildCollageBitmap(bitmaps)
+        } finally {
+            for (b in bitmaps) {
+                if (!b.isRecycled) b.recycle()
+            }
+        }
+    }
+
+    /**
+     * Composes 1..4 bitmaps into a crisp square collage (single scaled for 1, split for 2,
+     * 1+2 for 3, and 2x2 grid for 4). Caller retains ownership of input [bitmaps].
+     */
+    fun buildCollageBitmap(
+        bitmaps: List<Bitmap>,
+        sizePx: Int = TARGET_MAX_PX,
+    ): Bitmap? {
+        val valid = ArrayList<Bitmap>(4)
+        for (bmp in bitmaps) {
+            if (!bmp.isRecycled && bmp.width > 0 && bmp.height > 0) {
+                valid.add(bmp)
+                if (valid.size >= 4) break
+            }
+        }
+        if (valid.isEmpty()) return null
+        if (valid.size == 1) return scaleToMax(valid[0], sizePx)
+
+        val out = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.rgb(20, 24, 32))
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        val half = sizePx / 2
+        val gap = 2
+        val slots: List<Rect> = when (valid.size) {
+            2 -> listOf(
+                Rect(0, 0, half - gap / 2, sizePx),
+                Rect(half + gap / 2, 0, sizePx, sizePx),
+            )
+            3 -> listOf(
+                Rect(0, 0, half - gap / 2, half - gap / 2),
+                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
+                Rect(0, half + gap / 2, sizePx, sizePx),
+            )
+            else -> listOf(
+                Rect(0, 0, half - gap / 2, half - gap / 2),
+                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
+                Rect(0, half + gap / 2, half - gap / 2, sizePx),
+                Rect(half + gap / 2, half + gap / 2, sizePx, sizePx),
+            )
+        }
+        for (i in slots.indices) {
+            val bmp = valid[i]
+            val dst = slots[i]
+            val src = centerCropSrcRect(bmp.width, bmp.height, dst.width(), dst.height())
+            canvas.drawBitmap(bmp, src, dst, paint)
+        }
+        return out
+    }
+
+    private fun centerCropSrcRect(srcW: Int, srcH: Int, dstW: Int, dstH: Int): Rect {
+        if (dstW <= 0 || dstH <= 0) return Rect(0, 0, srcW, srcH)
+        val srcRatio = srcW.toFloat() / srcH.toFloat()
+        val dstRatio = dstW.toFloat() / dstH.toFloat()
+        return if (srcRatio > dstRatio) {
+            val cropW = (srcH * dstRatio).toInt().coerceIn(1, srcW)
+            val left = (srcW - cropW) / 2
+            Rect(left, 0, left + cropW, srcH)
+        } else {
+            val cropH = (srcW / dstRatio).toInt().coerceIn(1, srcH)
+            val top = (srcH - cropH) / 2
+            Rect(0, top, srcW, top + cropH)
         }
     }
 

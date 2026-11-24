@@ -271,6 +271,12 @@
     <string name="browser_folder_encrypt_label">Encrypt uploaded files (.tgenc)</string>
     <string name="zip_browser_unlock_vault">Unlock with Vault Key</string>
     <string name="zip_browser_use_saved_passphrase">Use Backup Passphrase</string>
+    <string name="zip_unlock_previews_title">Thumbnails locked</string>
+    <string name="zip_unlock_previews_desc">Unlock encrypted previews in this archive</string>
+    <string name="zip_unlock_previews_vault">Vault Key</string>
+    <string name="zip_unlock_previews_password">Password</string>
+    <string name="zip_browser_toggle_grid">Grid view</string>
+    <string name="zip_browser_toggle_list">List view</string>
     <string name="zip_browser_extract_all">Extract all</string>
     <string name="zip_browser_extracting_all">Extracting archive…</string>
     <string name="zip_browser_extracted_all_done">Extracted %1$d file(s) to Downloads</string>
@@ -382,4 +388,21 @@
     <string name="zip_split_banner_progress">Merging parts (%1$d / %2$d downloaded)…</string>
     <string name="zip_split_banner_action">Download &amp; merge parts</string>
     <string name="zip_split_merged_done">Merged %1$d volumes — browse full archive</string>
+    <string name="details_rename">Rename file</string>
+    <string name="details_rename_title">Rename file</string>
+    <string name="details_move_subfolder">Move to subfolder</string>
+    <string name="browser_new_subfolder">New subfolder</string>
+    <string name="browser_new_subfolder_hint">Subfolder name</string>
+    <string name="browser_export_zip">Export as ZIP</string>
+    <string name="browser_move_target_title">Move selected items</string>
+    <string name="browser_move_to_subfolder">Move to subfolder (same folder)</string>
+    <string name="browser_move_to_telegram_folder">Move to another Telegram folder</string>
+    <string name="folders_pin">Pin to top</string>
+    <string name="folders_unpin">Unpin folder</string>
+    <string name="folders_sort">Sort folders</string>
+    <string name="folders_sort_default">Default order</string>
+    <string name="folders_sort_name">Name (A–Z)</string>
+    <string name="folders_sort_size">Largest size</string>
+    <string name="folders_sort_files">Most files</string>
+    <string name="folders_create_action">Create</string>
 </resources>

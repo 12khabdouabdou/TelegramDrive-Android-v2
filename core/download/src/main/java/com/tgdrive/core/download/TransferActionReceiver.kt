@@ -20,14 +20,19 @@ class TransferActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             ACTION_PAUSE_ALL -> {
-                Log.i("TransferActionReceiver: pausing active uploads")
+                Log.i("TransferActionReceiver: pausing active transfers")
                 uploadManager.pauseAll()
+                downloadManager.pauseAll()
             }
             ACTION_CANCEL_ALL -> {
                 Log.i("TransferActionReceiver: cancelling active transfers")
                 uploadManager.cancelAll()
                 downloadManager.state.value.items
-                    .filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING }
+                    .filter {
+                        it.status == DownloadStatus.QUEUED ||
+                            it.status == DownloadStatus.DOWNLOADING ||
+                            it.status == DownloadStatus.PAUSED
+                    }
                     .forEach { downloadManager.cancel(it.chatId, it.id) }
             }
         }

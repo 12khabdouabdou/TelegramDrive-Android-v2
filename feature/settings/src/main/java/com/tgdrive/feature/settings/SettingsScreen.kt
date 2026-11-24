@@ -949,6 +949,96 @@ fun SettingsScreen(
                     modifier = Modifier.padding(top = 6.dp),
                 )
             }
+
+            if (state.biometricEnabled) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = stringResource(R.string.settings_biometric_timeout_title),
+                    style = TgTypography.Display.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    listOf(
+                        0 to R.string.settings_biometric_timeout_now,
+                        60 to R.string.settings_biometric_timeout_1m,
+                        300 to R.string.settings_biometric_timeout_5m,
+                        900 to R.string.settings_biometric_timeout_15m,
+                    ).forEach { (sec, labelId) ->
+                        FilterChip(
+                            selected = state.biometricTimeoutSeconds == sec,
+                            onClick = { vm.setBiometricTimeoutSeconds(sec) },
+                            label = { Text(stringResource(labelId)) },
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.blockScreenshotsEverywhere,
+                        role = Role.Switch,
+                        onValueChange = vm::setBlockScreenshotsEverywhere,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_block_screenshots),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_block_screenshots_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = state.blockScreenshotsEverywhere,
+                    onCheckedChange = null,
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.showEncryptedPreviewsWhenUnlocked,
+                        role = Role.Switch,
+                        onValueChange = vm::setShowEncryptedPreviewsWhenUnlocked,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_show_encrypted_previews),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_show_encrypted_previews_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = state.showEncryptedPreviewsWhenUnlocked,
+                    onCheckedChange = null,
+                )
+            }
         }
 
         // PassVault & Encryption
@@ -1189,6 +1279,78 @@ fun SettingsScreen(
                 }
                 Switch(checked = state.manualUploadWifiOnly, onCheckedChange = null)
             }
+
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = stringResource(R.string.settings_downloads_concurrency_title),
+                style = TgTypography.Display.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                (1..4).forEach { count ->
+                    FilterChip(
+                        selected = state.downloadConcurrency == count,
+                        onClick = { vm.setDownloadConcurrency(count) },
+                        label = { Text("$count×") },
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.downloadWifiOnly,
+                        role = Role.Switch,
+                        onValueChange = vm::setDownloadWifiOnly,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_downloads_wifi_only),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_downloads_wifi_only_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.downloadWifiOnly, onCheckedChange = null)
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.autoSaveDownloadsToPublic,
+                        role = Role.Switch,
+                        onValueChange = vm::setAutoSaveDownloadsToPublic,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_downloads_autosave),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_downloads_autosave_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.autoSaveDownloadsToPublic, onCheckedChange = null)
+            }
+
             passvaultNotice?.let { msg ->
                 Text(
                     text = msg,

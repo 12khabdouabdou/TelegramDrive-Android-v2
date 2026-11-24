@@ -22,6 +22,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.DriveFileRenameOutline
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
@@ -81,6 +83,8 @@ fun FileDetailsSheet(
     onDecrypt: (() -> Unit)? = null,
     onSaveNote: ((String) -> Unit)? = null,
     onToggleLock: (() -> Unit)? = null,
+    onRename: (() -> Unit)? = null,
+    onMoveSubfolder: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -243,6 +247,26 @@ fun FileDetailsSheet(
                     tint = MaterialTheme.colorScheme.tertiary,
                 ) {
                     onCopyToDownloads()
+                    onDismiss()
+                }
+            }
+            if (onRename != null) {
+                ActionRow(
+                    icon = Icons.Filled.DriveFileRenameOutline,
+                    label = stringResource(R.string.details_rename),
+                    tint = MaterialTheme.colorScheme.primary,
+                ) {
+                    onRename()
+                    onDismiss()
+                }
+            }
+            if (onMoveSubfolder != null) {
+                ActionRow(
+                    icon = Icons.Filled.Folder,
+                    label = stringResource(R.string.details_move_subfolder),
+                    tint = MaterialTheme.colorScheme.secondary,
+                ) {
+                    onMoveSubfolder()
                     onDismiss()
                 }
             }

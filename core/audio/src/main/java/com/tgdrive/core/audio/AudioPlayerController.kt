@@ -41,6 +41,8 @@ data class AudioState(
     val currentIndex: Int = 0,
     val playbackSpeed: Float = 1.0f,
     val repeatAll: Boolean = false,
+    val sleepTimerRemainingMs: Long = 0L,
+    val sleepTimerEndOfTrack: Boolean = false,
 )
 
 /**
@@ -88,6 +90,18 @@ object AudioQueueLogic {
         val v = rounded ?: speed
         return if (v % 1.0f == 0.0f) "${v.toInt()}x" else "${v}x"
     }
+
+    fun tickSleepTimerRemaining(remainingMs: Long, elapsedMs: Long): Long =
+        (remainingMs - elapsedMs.coerceAtLeast(0L)).coerceAtLeast(0L)
+
+    fun formatSleepTimerLabel(remainingMs: Long, endOfTrack: Boolean): String? = when {
+        endOfTrack -> "1 track"
+        remainingMs > 0L -> {
+            val mins = ((remainingMs + 59_999L) / 60_000L).coerceAtLeast(1L)
+            "${mins}m"
+        }
+        else -> null
+    }
 }
 
 /**
@@ -133,7 +147,39 @@ class AudioPlayerController @Inject constructor(
     }
 
     private fun syncNotification() {
-        ensureNotification().update(_state.value, cachedPositionMs, cachedDurationMs)
+        val notif = ensureNotification().update(_state.value, cachedPositionMs, cachedDurationMs)
+        lastNotification = notif
+        if (_state.value.isPlaying && _state.value.path != null) {
+            runCatching {
+                appContext.startForegroundService(
+                    android.content.Intent(appContext, AudioPlaybackService::class.java),
+                )
+            }
+        }
+    }
+
+    internal fun currentNotification(): android.app.Notification? =
+        lastNotification ?: ensureNotification().update(_state.value, cachedPositionMs, cachedDurationMs)
+
+    @Volatile
+    private var lastNotification: android.app.Notification? = null
+
+    private val sleepTickRunnable = object : Runnable {
+        override fun run() {
+            val cur = _state.value
+            if (cur.sleepTimerRemainingMs <= 0L) return
+            val next = AudioQueueLogic.tickSleepTimerRemaining(cur.sleepTimerRemainingMs, 1_000L)
+            if (next <= 0L) {
+                _state.update { it.copy(sleepTimerRemainingMs = 0L, isPlaying = false) }
+                runOnMain {
+                    runCatching { exoPlayer?.pause() }
+                    syncNotification()
+                }
+            } else {
+                _state.update { it.copy(sleepTimerRemainingMs = next) }
+                mainHandler.postDelayed(this, 1_000L)
+            }
+        }
     }
 
     private fun ensurePlayer(): ExoPlayer {
@@ -166,6 +212,12 @@ class AudioPlayerController @Inject constructor(
                 }
                 if (playbackState == Player.STATE_ENDED) {
                     val cur = _state.value
+                    if (cur.sleepTimerEndOfTrack) {
+                        cachedPositionMs = cachedDurationMs
+                        _state.update { it.copy(isPlaying = false, sleepTimerEndOfTrack = false) }
+                        syncNotification()
+                        return
+                    }
                     val next = AudioQueueLogic.nextIndex(cur.currentIndex, cur.queue.size, cur.repeatAll)
                     if (next != null) {
                         playTrackAtIndex(next)
@@ -285,6 +337,57 @@ class AudioPlayerController @Inject constructor(
         _state.update { it.copy(repeatAll = !it.repeatAll) }
     }
 
+    /** Jump directly to [index] inside the active queue. */
+    fun playQueueIndex(index: Int) {
+        if (index in _state.value.queue.indices) {
+            playTrackAtIndex(index)
+        }
+    }
+
+    /** Remove [index] from the queue, stopping if empty or advancing if current track was removed. */
+    fun removeQueueTrack(index: Int) {
+        val cur = _state.value
+        if (index !in cur.queue.indices) return
+        val newQueue = cur.queue.toMutableList().apply { removeAt(index) }
+        if (newQueue.isEmpty()) {
+            release()
+            return
+        }
+        val nextIdx = when {
+            index < cur.currentIndex -> cur.currentIndex - 1
+            index == cur.currentIndex -> index.coerceAtMost(newQueue.lastIndex)
+            else -> cur.currentIndex
+        }
+        if (index == cur.currentIndex) {
+            _state.update { it.copy(queue = newQueue, currentIndex = nextIdx) }
+            playTrackAtIndex(nextIdx)
+        } else {
+            _state.update { it.copy(queue = newQueue, currentIndex = nextIdx) }
+            syncNotification()
+        }
+    }
+
+    fun setSleepTimerMinutes(minutes: Int) {
+        mainHandler.removeCallbacks(sleepTickRunnable)
+        if (minutes <= 0) {
+            _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = false) }
+            return
+        }
+        val totalMs = minutes.toLong() * 60_000L
+        _state.update { it.copy(sleepTimerRemainingMs = totalMs, sleepTimerEndOfTrack = false) }
+        mainHandler.postDelayed(sleepTickRunnable, 1_000L)
+    }
+
+    fun setSleepTimerEndOfTrack() {
+        mainHandler.removeCallbacks(sleepTickRunnable)
+        _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = true) }
+    }
+
+    fun cancelSleepTimer() {
+        mainHandler.removeCallbacks(sleepTickRunnable)
+        _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = false) }
+    }
+
     /** Toggle play/pause. No-op if nothing is loaded. */
     fun togglePlayPause() {
         if (_state.value.path == null) return
@@ -343,6 +446,8 @@ class AudioPlayerController @Inject constructor(
 
     /** Stop and release the ExoPlayer instance and notification. */
     fun release() {
+        mainHandler.removeCallbacks(sleepTickRunnable)
+        lastNotification = null
         cachedPositionMs = 0L
         cachedDurationMs = 1L
         _state.value = AudioState()
@@ -353,6 +458,9 @@ class AudioPlayerController @Inject constructor(
             exoPlayer = null
             mediaNotification?.release()
             mediaNotification = null
+            runCatching {
+                appContext.stopService(android.content.Intent(appContext, AudioPlaybackService::class.java))
+            }
         }
     }
 }

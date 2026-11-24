@@ -25,6 +25,27 @@ class AppPreferencesDataTest {
         assertThat(d.decryptedTempTtlMinutes).isEqualTo(30)
         assertThat(d.manualUploadWifiOnly).isFalse()
         assertThat(d.photosColumns).isEqualTo(3)
+        assertThat(d.biometricTimeoutSeconds).isEqualTo(60)
+        assertThat(d.blockScreenshotsEverywhere).isFalse()
+        assertThat(d.downloadConcurrency).isEqualTo(2)
+        assertThat(d.downloadWifiOnly).isFalse()
+        assertThat(d.autoSaveDownloadsToPublic).isFalse()
+        assertThat(d.pinnedFolderChatIds).isEmpty()
+        assertThat(d.showEncryptedPreviewsWhenUnlocked).isFalse()
+    }
+
+    @Test
+    fun `pinned folder helpers toggle cleanly`() {
+        val prefs = AppPreferencesData()
+            .withToggledPinnedFolder(101L)
+            .withToggledPinnedFolder(202L)
+        assertThat(prefs.isFolderPinned(101L)).isTrue()
+        assertThat(prefs.isFolderPinned(202L)).isTrue()
+        assertThat(prefs.isFolderPinned(303L)).isFalse()
+
+        val unpinned = prefs.withToggledPinnedFolder(101L)
+        assertThat(unpinned.isFolderPinned(101L)).isFalse()
+        assertThat(unpinned.isFolderPinned(202L)).isTrue()
     }
 
     @Test

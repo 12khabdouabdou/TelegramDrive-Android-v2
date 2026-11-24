@@ -57,6 +57,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
@@ -118,6 +120,9 @@ data class FolderUiState(
     val batchDecryptProgress: Pair<Int, Int>? = null,
     val currentVirtualPath: String = "",
     val childVirtualFolders: List<Pair<String, Int>> = emptyList(),
+    val childVirtualFolderThumbs: Map<String, List<String>> = emptyMap(),
+    val allVirtualPaths: List<String> = emptyList(),
+    val decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
 )
 
 data class FolderSnackbarEvent(
@@ -146,12 +151,16 @@ class FolderViewModel
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
         private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val attemptedEncryptedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val encThumbSemaphore = Semaphore(2)
         private val _selected = MutableStateFlow<Set<Long>>(emptySet())
         private val _loading = MutableStateFlow(false)
         private val _refreshing = MutableStateFlow(false)
         private val _error = MutableStateFlow<String?>(null)
         private val _search = MutableStateFlow("")
         private val _virtualPath = MutableStateFlow("")
+        private val _createdVirtualFolders = MutableStateFlow<Map<Long, Set<String>>>(emptyMap())
+        private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
         private val _pdfThumbnails = MutableStateFlow<Map<Long, String>>(emptyMap())
         private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
         val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
@@ -191,7 +200,26 @@ class FolderViewModel
                     }
                 }
             }
+            viewModelScope.launch(dispatchers.io) {
+                combine(
+                    _items,
+                    preferences.data.map { it.showEncryptedPreviewsWhenUnlocked }.distinctUntilChanged(),
+                ) { items, showEnc -> if (showEnc) items else emptyList() }
+                    .collect { items ->
+                        if (items.isNotEmpty()) {
+                            warmUnlockedEncryptedThumbs(items)
+                        }
+                    }
+            }
         }
+
+        private data class FolderAuxTail(
+            val boundId: Long?,
+            val batchProgress: Pair<Int, Int>?,
+            val virtualPath: String,
+            val decryptedThumbs: Map<Pair<Long, Long>, ByteArray>,
+            val createdVirtualFolders: Map<Long, Set<String>>,
+        )
 
         private data class FolderCoreState(
             val items: List<FileCacheEntity>,
@@ -228,17 +256,23 @@ class FolderViewModel
                     preferences.data,
                     uploadManager.uploads,
                     _pdfThumbnails,
-                    combine(_boundChatId, _batchDecryptProgress, _virtualPath) { b, bp, vp ->
-                        Triple(b, bp, vp)
+                    combine(
+                        _boundChatId,
+                        _batchDecryptProgress,
+                        _virtualPath,
+                        _decryptedThumbs,
+                        _createdVirtualFolders,
+                    ) { b, bp, vp, decThumbs, createdVps ->
+                        FolderAuxTail(b, bp, vp, decThumbs, createdVps)
                     },
                 ) {
                         search,
                         prefs,
                         uploadQueue,
                         pdfThumbs,
-                        boundTriple,
+                        auxTail,
                     ->
-                    listOf(search, prefs, uploadQueue, pdfThumbs, boundTriple)
+                    listOf(search, prefs, uploadQueue, pdfThumbs, auxTail)
                 },
             ) { c, overlays, aux ->
                 val search = aux[0] as String
@@ -246,35 +280,79 @@ class FolderViewModel
                 val uploadQueue = aux[2] as com.tgdrive.core.download.UploadQueueState
                 @Suppress("UNCHECKED_CAST")
                 val pdfThumbs = aux[3] as Map<Long, String>
-                @Suppress("UNCHECKED_CAST")
-                val boundTriple = aux[4] as Triple<Long?, Pair<Int, Int>?, String>
-                val boundId = boundTriple.first
-                val batchProgress = boundTriple.second
-                val rawVirtualPath = normalizeVirtualPath(boundTriple.third)
+                val auxTail = aux[4] as FolderAuxTail
+                val boundId = auxTail.boundId
+                val batchProgress = auxTail.batchProgress
+                val rawVirtualPath = normalizeVirtualPath(auxTail.virtualPath)
+                val customForChat = boundId?.let { auxTail.createdVirtualFolders[it] }.orEmpty()
 
                 val unlockedItems = c.items.filterNot { it.isLocked }
                 val inVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
 
                 val childCounts = LinkedHashMap<String, Int>()
+                val childThumbs = LinkedHashMap<String, MutableList<String>>()
+                val allVPaths = LinkedHashSet<String>()
+                for (cv in customForChat) {
+                    val normCv = normalizeVirtualPath(cv)
+                    if (normCv.isNotEmpty()) allVPaths.add(normCv)
+                }
+
                 val folderScoped = if (inVirtualMode) {
                     unlockedItems.filter { item ->
                         val itemPath = normalizeVirtualPath(item.virtualPath)
+                        if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
+                        val candidateThumb = if (!item.isEncryptedVault &&
+                            !BackupCrypto.isEncryptedFileName(item.fileName)
+                        ) {
+                            item.thumbnailPath?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
+                        } else {
+                            null
+                        }
                         if (rawVirtualPath.isEmpty()) {
                             if (itemPath.isNotEmpty()) {
                                 val top = itemPath.substringBefore('/')
                                 childCounts[top] = (childCounts[top] ?: 0) + 1
+                                if (candidateThumb != null) {
+                                    val list = childThumbs.getOrPut(top) { ArrayList(4) }
+                                    if (list.size < 4) list.add(candidateThumb)
+                                }
                             }
                         } else if (itemPath.startsWith("$rawVirtualPath/")) {
                             val rest = itemPath.removePrefix("$rawVirtualPath/")
                             val directChild = rest.substringBefore('/')
                             if (directChild.isNotEmpty()) {
                                 childCounts[directChild] = (childCounts[directChild] ?: 0) + 1
+                                if (candidateThumb != null) {
+                                    val list = childThumbs.getOrPut(directChild) { ArrayList(4) }
+                                    if (list.size < 4) list.add(candidateThumb)
+                                }
                             }
                         }
                         itemPath == rawVirtualPath
                     }
                 } else {
+                    for (item in unlockedItems) {
+                        val itemPath = normalizeVirtualPath(item.virtualPath)
+                        if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
+                    }
                     unlockedItems
+                }
+                if (inVirtualMode) {
+                    for (cv in customForChat) {
+                        val normCv = normalizeVirtualPath(cv)
+                        if (normCv.isEmpty()) continue
+                        if (rawVirtualPath.isEmpty()) {
+                            val top = normCv.substringBefore('/')
+                            if (top.isNotEmpty() && top !in childCounts) {
+                                childCounts[top] = 0
+                            }
+                        } else if (normCv.startsWith("$rawVirtualPath/")) {
+                            val directChild = normCv.removePrefix("$rawVirtualPath/").substringBefore('/')
+                            if (directChild.isNotEmpty() && directChild !in childCounts) {
+                                childCounts[directChild] = 0
+                            }
+                        }
+                    }
                 }
                 val childFolders = childCounts.entries
                     .sortedBy { it.key.lowercase() }
@@ -318,6 +396,9 @@ class FolderViewModel
                     batchDecryptProgress = batchProgress,
                     currentVirtualPath = rawVirtualPath,
                     childVirtualFolders = childFolders,
+                    childVirtualFolderThumbs = childThumbs,
+                    allVirtualPaths = allVPaths.sorted(),
+                    decryptedThumbs = if (prefs.showEncryptedPreviewsWhenUnlocked) auxTail.decryptedThumbs else emptyMap(),
                 )
             }.flowOn(dispatchers.default)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
@@ -819,9 +900,15 @@ class FolderViewModel
         fun confirmFileReview(action: FileReviewAction) {
             val chatId = currentChatId ?: return
             _pendingReviewFiles.value = emptyList()
+            val activeVPath = normalizeVirtualPath(_virtualPath.value)
             when (action) {
                 is FileReviewAction.NormalUpload -> {
-                    uploadManager.enqueueFiles(chatId, action.files, action.options)
+                    val opts = if (activeVPath.isNotEmpty() && action.options.virtualPath.isEmpty()) {
+                        action.options.copy(virtualPath = activeVPath)
+                    } else {
+                        action.options
+                    }
+                    uploadManager.enqueueFiles(chatId, action.files, opts)
                 }
                 is FileReviewAction.PackAsZip -> {
                     val encEnabled = action.options.useVaultKey || !action.options.password.isNullOrBlank()
@@ -839,6 +926,7 @@ class FolderViewModel
                                 customPassphrase = action.options.password,
                             ),
                             wifiOnly = action.options.wifiOnly,
+                            virtualPath = activeVPath,
                         ),
                     )
                 }
@@ -850,7 +938,13 @@ class FolderViewModel
             options: NormalUploadOptions,
         ) {
             val chatId = currentChatId ?: return
-            uploadManager.enqueueFolderAsNormalFiles(chatId, treeUri, options)
+            val activeVPath = normalizeVirtualPath(_virtualPath.value)
+            val opts = if (activeVPath.isNotEmpty() && options.virtualPath.isEmpty()) {
+                options.copy(virtualPath = activeVPath)
+            } else {
+                options
+            }
+            uploadManager.enqueueFolderAsNormalFiles(chatId, treeUri, opts)
         }
 
         fun onZipFolderPicked(
@@ -903,6 +997,7 @@ class FolderViewModel
         fun confirmZipFolderUpload(options: ZipUploadOptions) {
             val treeUri = _pendingZipFolder.value.first ?: return
             val chatId = currentChatId ?: return
+            val activeVPath = normalizeVirtualPath(_virtualPath.value)
             dismissZipDialog()
             val encEnabled = options.useVaultKey || !options.password.isNullOrBlank()
             uploadManager.enqueueFolderAsZip(
@@ -919,6 +1014,7 @@ class FolderViewModel
                         customPassphrase = options.password,
                     ),
                     wifiOnly = options.wifiOnly,
+                    virtualPath = activeVPath,
                 ),
             )
         }
@@ -1033,6 +1129,8 @@ class FolderViewModel
                         originalDisplayName = current.item.fileName,
                         passphrase = passphrase,
                         saveToDownloads = saveToDownloads,
+                        chatId = current.item.chatId,
+                        messageId = current.item.messageId,
                     )
                 ) {
                     is DecryptOutcome.Success -> {
@@ -1091,6 +1189,8 @@ class FolderViewModel
                             originalDisplayName = item.fileName,
                             passphrase = passphrase,
                             saveToDownloads = true,
+                            chatId = item.chatId,
+                            messageId = item.messageId,
                         )
                         if (outcome is DecryptOutcome.Success) {
                             succeeded++
@@ -1174,6 +1274,153 @@ class FolderViewModel
 
         private fun normalizeVirtualPath(raw: String): String =
             raw.trim().trim('/').replace('\\', '/')
+
+        fun createVirtualFolder(rawName: String) {
+            val chatId = currentChatId ?: return
+            val cleanSeg = rawName.trim().replace('\\', '/').trim('/').replace('/', '_')
+            if (cleanSeg.isEmpty()) return
+            val cur = normalizeVirtualPath(_virtualPath.value)
+            val fullPath = if (cur.isEmpty()) cleanSeg else "$cur/$cleanSeg"
+            _createdVirtualFolders.update { map ->
+                val curSet = map[chatId].orEmpty()
+                map + (chatId to (curSet + fullPath))
+            }
+            showSnackbar("Created subfolder: $cleanSeg")
+        }
+
+        fun moveSelectedToVirtualPath(targetVirtualPath: String) {
+            val chatId = currentChatId ?: return
+            val ids = _selected.value.toList()
+            if (ids.isEmpty()) return
+            val cleanTarget = normalizeVirtualPath(targetVirtualPath)
+            viewModelScope.launch(dispatchers.io) {
+                for (id in ids) {
+                    runCatching {
+                        fileCacheDao.updateVirtualPath(chatId, id, cleanTarget)
+                        cloudSyncManager.noteVirtualPathChanged(chatId, id, cleanTarget)
+                    }
+                }
+                _selected.value = emptySet()
+                val label = cleanTarget.ifEmpty { "Root" }
+                showSnackbar("Moved ${ids.size} file(s) to $label")
+            }
+        }
+
+        fun exportSelectedAsLocalZip() {
+            val chatId = currentChatId ?: return
+            val targets = _items.value.filter { it.messageId in _selected.value }
+            if (targets.isEmpty()) return
+            viewModelScope.launch(dispatchers.io) {
+                val stageDir = File(appContext.cacheDir, "zip_export_${System.currentTimeMillis()}").apply { mkdirs() }
+                try {
+                    showSnackbar("Preparing ${targets.size} file(s) for ZIP export…")
+                    val readyFiles = ArrayList<File>(targets.size)
+                    for (item in targets) {
+                        var localPath = getLocalPath(item.messageId)
+                        if (localPath == null && item.remoteId.isNotEmpty()) {
+                            downloadFile(item)
+                            val terminal = downloadManager.state
+                                .map { st ->
+                                    st.items.find { it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId) }
+                                }
+                                .first { dl ->
+                                    dl == null ||
+                                        dl.status == DownloadStatus.DONE ||
+                                        dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.CANCELLED
+                                }
+                            if (terminal?.status == DownloadStatus.DONE) {
+                                localPath = terminal.localPath
+                            }
+                        }
+                        val src = localPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L } ?: continue
+                        val copy = File(stageDir, item.fileName.replace(Regex("[/\\\\]"), "_"))
+                        src.copyTo(copy, overwrite = true)
+                        readyFiles.add(copy)
+                    }
+                    if (readyFiles.isEmpty()) {
+                        _error.value = "Could not download any selected files for ZIP export"
+                        return@launch
+                    }
+                    val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                        .format(java.util.Date())
+                    val zipName = "TelegramDrive_Export_$ts.zip"
+                    val tempZip = File(stageDir, zipName)
+                    net.lingala.zip4j.ZipFile(tempZip).use { zf ->
+                        zf.addFiles(readyFiles)
+                    }
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        val values = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, zipName)
+                            put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/zip")
+                            put(
+                                android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                                "${android.os.Environment.DIRECTORY_DOWNLOADS}/TelegramDrive",
+                            )
+                            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                        }
+                        val resolver = appContext.contentResolver
+                        val uri = resolver.insert(
+                            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            values,
+                        ) ?: throw IllegalStateException("Could not create Downloads entry")
+                        try {
+                            resolver.openOutputStream(uri)?.use { out ->
+                                tempZip.inputStream().use { it.copyTo(out) }
+                            }
+                            values.clear()
+                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                            resolver.update(uri, values, null, null)
+                        } catch (t: Throwable) {
+                            runCatching { resolver.delete(uri, null, null) }
+                            throw t
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        val dlDir = File(
+                            android.os.Environment.getExternalStoragePublicDirectory(
+                                android.os.Environment.DIRECTORY_DOWNLOADS,
+                            ),
+                            "TelegramDrive",
+                        ).apply { mkdirs() }
+                        tempZip.copyTo(File(dlDir, zipName), overwrite = true)
+                    }
+                    _selected.value = emptySet()
+                    showSnackbar("Saved $zipName (${readyFiles.size} file(s)) to Downloads/TelegramDrive")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("FolderViewModel: exportSelectedAsLocalZip failed", t)
+                    _error.value = t.message ?: "ZIP export failed"
+                } finally {
+                    runCatching { stageDir.deleteRecursively() }
+                }
+            }
+        }
+
+        private fun warmUnlockedEncryptedThumbs(items: List<FileCacheEntity>) {
+            for (entity in items) {
+                val path = entity.thumbnailPath
+                val isEncThumb = path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true
+                val isEncItem = entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)
+                if (!isEncThumb && !isEncItem) continue
+                val key = entity.chatId to entity.messageId
+                val shouldTry = synchronized(attemptedEncryptedThumbKeys) { attemptedEncryptedThumbKeys.add(key) }
+                if (!shouldTry) continue
+                viewModelScope.launch(dispatchers.io) {
+                    encThumbSemaphore.withPermit {
+                        val effectivePath = when {
+                            isEncThumb && path != null && File(path).isFile -> path
+                            else -> mediaThumbnailCache.restoreEncryptedThumbFromCloud(entity.chatId, entity.messageId)
+                        } ?: return@withPermit
+                        val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            _decryptedThumbs.update { cur -> cur + (key to bytes) }
+                        }
+                    }
+                }
+            }
+        }
 
         fun updateUserNote(item: FileCacheEntity, rawNote: String) {
             val cleaned = rawNote.trim().ifEmpty { null }

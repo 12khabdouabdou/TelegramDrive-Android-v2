@@ -631,6 +631,8 @@ class GlobalSearchViewModel
                         originalDisplayName = current.item.fileName,
                         passphrase = passphrase,
                         saveToDownloads = saveToDownloads,
+                        chatId = current.item.chatId,
+                        messageId = current.item.messageId,
                     )
                 ) {
                     is DecryptOutcome.Success -> {

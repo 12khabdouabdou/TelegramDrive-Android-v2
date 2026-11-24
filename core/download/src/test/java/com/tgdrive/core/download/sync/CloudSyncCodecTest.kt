@@ -110,6 +110,9 @@ class CloudSyncCodecTest {
             albumItems = listOf(
                 CloudSyncCodec.CloudAlbumItemRecord("alb-1", 10L, 3L, addedAt = 500L, removed = false),
             ),
+            encryptedThumbs = listOf(
+                CloudSyncCodec.CloudEncryptedThumbRecord(10L, 9L, "thumb-remote-v1", 500L),
+            ),
         )
         val decoded = CloudSyncCodec.decodeMetaGzip(CloudSyncCodec.encodeMetaGzip(snap))
         assertThat(decoded).isNotNull()
@@ -118,6 +121,7 @@ class CloudSyncCodecTest {
         assertThat(decoded.notes.single().note).contains("Tax deductible")
         assertThat(decoded.albums.single().name).isEqualTo("Trip")
         assertThat(decoded.albumItems.single().albumId).isEqualTo("alb-1")
+        assertThat(decoded.encryptedThumbs.single().thumbRemoteId).isEqualTo("thumb-remote-v1")
 
         val newer = snap.copy(
             updatedAtMs = 2000L,
@@ -136,6 +140,9 @@ class CloudSyncCodecTest {
             albumItems = listOf(
                 CloudSyncCodec.CloudAlbumItemRecord("alb-1", 10L, 3L, addedAt = 900L, removed = true),
             ),
+            encryptedThumbs = listOf(
+                CloudSyncCodec.CloudEncryptedThumbRecord(10L, 9L, "thumb-remote-v2", 900L),
+            ),
         )
         val mergedMeta = CloudSyncCodec.mergeMeta(snap, newer)
         assertThat(mergedMeta.virtualPaths.single().virtualPath).isEqualTo("Work/Archive")
@@ -143,6 +150,7 @@ class CloudSyncCodecTest {
         assertThat(mergedMeta.notes.single().note).isEqualTo("Updated note")
         assertThat(mergedMeta.albums.single().deleted).isTrue()
         assertThat(mergedMeta.albumItems.single().removed).isTrue()
+        assertThat(mergedMeta.encryptedThumbs.single().thumbRemoteId).isEqualTo("thumb-remote-v2")
 
         val aiLocal = CloudSyncCodec.CloudSearchIndexSnapshot(
             updatedAtMs = 100L,

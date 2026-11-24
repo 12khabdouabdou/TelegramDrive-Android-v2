@@ -178,6 +178,21 @@ class MediaAiIndexer @Inject constructor(
         updated
     }
 
+    suspend fun recognizeBitmapText(bitmap: Bitmap): String = withContext(dispatchers.io) {
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        try {
+            val input = InputImage.fromBitmap(bitmap, 0)
+            recognizer.process(input).awaitResult().text.trim()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("MediaAiIndexer: recognizeBitmapText failed", t)
+            ""
+        } finally {
+            runCatching { recognizer.close() }
+        }
+    }
+
     private suspend fun findIndexableCandidates(excludedChatIds: Set<Long>): List<FileCacheEntity> {
         val unlocked = runCatching { fileCacheDao.getAllUnlocked() }.getOrDefault(emptyList())
         return unlocked.filter { entity ->

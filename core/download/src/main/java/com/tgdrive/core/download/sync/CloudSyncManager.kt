@@ -82,6 +82,8 @@ class CloudSyncManager @Inject constructor(
         ConcurrentHashMap<Triple<String, Long, Long>, CloudSyncCodec.CloudAlbumItemRecord>()
     private val localAiTimestamps =
         ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
+    private val localEncryptedThumbTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudEncryptedThumbRecord>()
 
     private val syncDir: File
         get() = File(ctx.cacheDir, "cloud_sync").apply { mkdirs() }
@@ -207,6 +209,82 @@ class CloudSyncManager @Inject constructor(
         schedulePushSearchIndex()
     }
 
+    fun noteEncryptedThumbChanged(chatId: Long, messageId: Long, thumbRemoteId: String) {
+        if (thumbRemoteId.isBlank()) return
+        localEncryptedThumbTimestamps[chatId to messageId] = CloudSyncCodec.CloudEncryptedThumbRecord(
+            chatId = chatId,
+            messageId = messageId,
+            thumbRemoteId = thumbRemoteId,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushMetadata()
+    }
+
+    fun getCloudEncryptedThumbRemoteId(chatId: Long, messageId: Long): String? =
+        localEncryptedThumbTimestamps[chatId to messageId]?.thumbRemoteId
+
+    fun getAllCloudEncryptedThumbs(): List<CloudSyncCodec.CloudEncryptedThumbRecord> =
+        localEncryptedThumbTimestamps.values.toList()
+
+    /**
+     * Uploads an encrypted `.tgethumb` blob to `"TelegramDrive System"` and indexes its
+     * `remoteId` in the LWW metadata snapshot so thumbnails follow across installs/devices.
+     */
+    suspend fun uploadEncryptedThumbBytes(
+        chatId: Long,
+        messageId: Long,
+        bytes: ByteArray,
+    ): String? = withContext(dispatchers.io) {
+        if (bytes.isEmpty()) return@withContext null
+        val systemChatId = runCatching { telegramClient.getOrCreateSystemChannel() }.getOrNull()
+            ?: return@withContext null
+        val fileName = "${chatId}_${messageId}.tgethumb"
+        val tmpFile = File(syncDir, "up_$fileName")
+        try {
+            tmpFile.writeBytes(bytes)
+            val res = telegramClient.uploadFile(
+                chatId = systemChatId,
+                localPath = tmpFile.absolutePath,
+                fileName = fileName,
+                mimeType = "application/octet-stream",
+            ) { _, _ -> }
+            if (res.remoteId.isNotBlank()) {
+                noteEncryptedThumbChanged(chatId, messageId, res.remoteId)
+                res.remoteId
+            } else {
+                null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("CloudSyncManager: uploadEncryptedThumbBytes failed for ${chatId}_$messageId", t)
+            null
+        } finally {
+            runCatching { tmpFile.delete() }
+        }
+    }
+
+    /**
+     * Downloads an encrypted `.tgethumb` blob from `"TelegramDrive System"` if registered in metadata.
+     */
+    suspend fun restoreEncryptedThumbBytes(chatId: Long, messageId: Long): ByteArray? = withContext(dispatchers.io) {
+        val remoteId = getCloudEncryptedThumbRemoteId(chatId, messageId)?.takeIf { it.isNotBlank() }
+            ?: return@withContext null
+        try {
+            val terminal = telegramClient.downloadFile(remoteId, "")
+                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                .first()
+            if (terminal !is DownloadUpdate.Done) return@withContext null
+            val f = File(terminal.localPath)
+            if (f.isFile && f.length() > 0L) f.readBytes() else null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("CloudSyncManager: restoreEncryptedThumbBytes failed for ${chatId}_$messageId", t)
+            null
+        }
+    }
+
     fun schedulePushMetadata() {
         pushMetaJob?.cancel()
         pushMetaJob = scope.launch {
@@ -228,6 +306,12 @@ class CloudSyncManager @Inject constructor(
                     if (t is CancellationException) throw t
                     Log.w("CloudSyncManager: debounced search push failed", t)
                 }
+        }
+    }
+
+    suspend fun purgeExpiredTrashNow() = withContext(dispatchers.io) {
+        mutex.withLock {
+            purgeExpiredTrashLocked()
         }
     }
 
@@ -523,6 +607,7 @@ class CloudSyncManager @Inject constructor(
             notes = notes.values.toList(),
             albums = albumsMap.values.toList(),
             albumItems = albumItemsMap.values.toList(),
+            encryptedThumbs = localEncryptedThumbTimestamps.values.toList(),
         )
     }
 
@@ -704,6 +789,10 @@ class CloudSyncManager @Inject constructor(
                     )
                 }
             }
+        }
+
+        merged.encryptedThumbs.forEach { rec ->
+            localEncryptedThumbTimestamps[rec.chatId to rec.messageId] = rec
         }
     }
 

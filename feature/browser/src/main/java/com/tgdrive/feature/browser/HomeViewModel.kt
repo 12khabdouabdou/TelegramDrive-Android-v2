@@ -46,13 +46,18 @@ import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
 
+enum class FolderListSort { DEFAULT, NAME_ASC, SIZE_DESC, FILES_DESC }
+
 data class HomeUiState(
     val folders: List<FolderEntity> = emptyList(),
+    val pinnedFolderChatIds: Set<Long> = emptySet(),
     val savedMessagesChatId: Long = 0L,
     val loading: Boolean = false,
     val error: String? = null,
     val viewMode: FileViewMode = FileViewMode.GRID,
+    val folderSort: FolderListSort = FolderListSort.DEFAULT,
     val folderSizes: Map<Long, Long> = emptyMap(),
+    val folderFileCounts: Map<Long, Int> = emptyMap(),
     val totalBytes: Long = 0L,
     val totalFiles: Int = 0,
     val categoryCounts: Map<FileFilter, Int> = emptyMap(),
@@ -68,6 +73,7 @@ data class HomeUiState(
 
 private data class HomeDashboardStats(
     val folderSizes: Map<Long, Long> = emptyMap(),
+    val folderFileCounts: Map<Long, Int> = emptyMap(),
     val totalBytes: Long = 0L,
     val totalFiles: Int = 0,
     val categoryCounts: Map<FileFilter, Int> = emptyMap(),
@@ -103,6 +109,7 @@ class HomeViewModel
         val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
         private val _savedChatId = MutableStateFlow(0L)
         private val _dashboard = MutableStateFlow(HomeDashboardStats())
+        private val _folderSort = MutableStateFlow(FolderListSort.DEFAULT)
         private val _pendingReviewFiles = MutableStateFlow<Pair<Long, List<UploadFileItem>>?>(null)
         val pendingReviewFiles: StateFlow<Pair<Long, List<UploadFileItem>>?> = _pendingReviewFiles.asStateFlow()
         private val _pendingZipFolder = MutableStateFlow<Triple<Long, Uri, String?>?>(null)
@@ -117,22 +124,46 @@ class HomeViewModel
         val state: StateFlow<HomeUiState> =
             combine(
                 combine(folderDao.observeAll(), preferences.data) { folders, prefs -> folders to prefs },
-                combine(_loading, _error, _savedChatId, _dashboard) { loading, error, savedId, dash ->
-                    Triple(loading to error, savedId, dash)
+                combine(_loading, _error, _savedChatId, _dashboard, _folderSort) { loading, error, savedId, dash, sort ->
+                    listOf(loading, error, savedId, dash, sort)
                 },
                 combine(
                     trashEntryDao.observeCount(),
                     fileCacheDao.observeEncryptedVaultCount(),
                     cloudSyncManager.syncing,
                 ) { trash, vaultCount, syncing -> Triple(trash, vaultCount, syncing) },
-            ) { (folders, prefs), (loadErr, savedId, dash), (trashCount, vaultCount, syncing) ->
+            ) { (folders, prefs), mid, (trashCount, vaultCount, syncing) ->
+                val loading = mid[0] as Boolean
+                val error = mid[1] as String?
+                val savedId = mid[2] as Long
+                val dash = mid[3] as HomeDashboardStats
+                val sort = mid[4] as FolderListSort
+                val pinned = prefs.pinnedFolderChatIds
+                val sortedFolders = folders.sortedWith(
+                    Comparator { a, b ->
+                        val pinCmp = (if (b.channelId in pinned) 1 else 0)
+                            .compareTo(if (a.channelId in pinned) 1 else 0)
+                        if (pinCmp != 0) return@Comparator pinCmp
+                        when (sort) {
+                            FolderListSort.DEFAULT -> b.createdAt.compareTo(a.createdAt)
+                            FolderListSort.NAME_ASC -> a.title.compareTo(b.title, ignoreCase = true)
+                            FolderListSort.SIZE_DESC ->
+                                (dash.folderSizes[b.channelId] ?: 0L).compareTo(dash.folderSizes[a.channelId] ?: 0L)
+                            FolderListSort.FILES_DESC ->
+                                (dash.folderFileCounts[b.channelId] ?: 0).compareTo(dash.folderFileCounts[a.channelId] ?: 0)
+                        }
+                    },
+                )
                 HomeUiState(
-                    folders = folders,
+                    folders = sortedFolders,
+                    pinnedFolderChatIds = pinned,
                     savedMessagesChatId = savedId,
-                    loading = loadErr.first,
-                    error = loadErr.second,
+                    loading = loading,
+                    error = error,
                     viewMode = prefs.fileViewMode,
+                    folderSort = sort,
                     folderSizes = dash.folderSizes,
+                    folderFileCounts = dash.folderFileCounts,
                     totalBytes = dash.totalBytes,
                     totalFiles = dash.totalFiles,
                     categoryCounts = dash.categoryCounts,
@@ -169,6 +200,7 @@ class HomeViewModel
                 try {
                     val aggregates = fileCacheDao.perChatAggregates()
                     val folderSizes = aggregates.associate { it.chatId to it.totalBytes }
+                    val folderFileCounts = aggregates.associate { it.chatId to it.fileCount }
                     val grand = fileCacheDao.grandTotal()
                     val recent = fileCacheDao.getRecent()
                     val starred = fileCacheDao.getStarred()
@@ -200,6 +232,7 @@ class HomeViewModel
 
                     _dashboard.value = HomeDashboardStats(
                         folderSizes = folderSizes,
+                        folderFileCounts = folderFileCounts,
                         totalBytes = grand.totalBytes,
                         totalFiles = grand.fileCount,
                         categoryCounts = counts,
@@ -414,6 +447,16 @@ class HomeViewModel
                     _error.value = t.message ?: "Failed to rename folder"
                 }
             }
+        }
+
+        fun togglePinFolder(channelId: Long) {
+            viewModelScope.launch(dispatchers.io) {
+                preferences.update { it.withToggledPinnedFolder(channelId) }
+            }
+        }
+
+        fun setFolderSort(sort: FolderListSort) {
+            _folderSort.value = sort
         }
 
         fun setFolderColor(

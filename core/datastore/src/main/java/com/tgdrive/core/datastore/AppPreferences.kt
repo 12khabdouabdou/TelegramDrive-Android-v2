@@ -97,7 +97,21 @@ data class AppPreferencesData(
     val decryptedTempTtlMinutes: Int = 30,
     val manualUploadWifiOnly: Boolean = false,
     val photosColumns: Int = 3,
+    val biometricTimeoutSeconds: Int = 60,
+    val blockScreenshotsEverywhere: Boolean = false,
+    val downloadConcurrency: Int = 2,
+    val downloadWifiOnly: Boolean = false,
+    val autoSaveDownloadsToPublic: Boolean = false,
+    val pinnedFolderChatIds: Set<String> = emptySet(),
+    val showEncryptedPreviewsWhenUnlocked: Boolean = false,
 ) {
+    fun isFolderPinned(chatId: Long): Boolean = chatId.toString() in pinnedFolderChatIds
+
+    fun withToggledPinnedFolder(chatId: Long): AppPreferencesData {
+        val k = chatId.toString()
+        val next = if (k in pinnedFolderChatIds) pinnedFolderChatIds - k else pinnedFolderChatIds + k
+        return copy(pinnedFolderChatIds = next)
+    }
     fun isFolderEncrypted(folderUri: String): Boolean =
         backupEncryptAll || (folderUri in backupEncryptedFolderUris)
 
@@ -239,6 +253,13 @@ class AppPreferences @Inject constructor(
         val DECRYPTED_TEMP_TTL_MINUTES = intPreferencesKey("decrypted_temp_ttl_minutes")
         val MANUAL_UPLOAD_WIFI_ONLY = booleanPreferencesKey("manual_upload_wifi_only")
         val PHOTOS_COLUMNS = intPreferencesKey("photos_columns")
+        val BIOMETRIC_TIMEOUT_SECONDS = intPreferencesKey("biometric_timeout_seconds")
+        val BLOCK_SCREENSHOTS_EVERYWHERE = booleanPreferencesKey("block_screenshots_everywhere")
+        val DOWNLOAD_CONCURRENCY = intPreferencesKey("download_concurrency")
+        val DOWNLOAD_WIFI_ONLY = booleanPreferencesKey("download_wifi_only")
+        val AUTO_SAVE_DOWNLOADS_TO_PUBLIC = booleanPreferencesKey("auto_save_downloads_to_public")
+        val PINNED_FOLDER_CHAT_IDS = stringSetPreferencesKey("pinned_folder_chat_ids")
+        val SHOW_ENCRYPTED_PREVIEWS_UNLOCKED = booleanPreferencesKey("show_encrypted_previews_unlocked")
     }
 
     /**
@@ -324,6 +345,13 @@ class AppPreferences @Inject constructor(
             decryptedTempTtlMinutes = get(Keys.DECRYPTED_TEMP_TTL_MINUTES) ?: 30,
             manualUploadWifiOnly = get(Keys.MANUAL_UPLOAD_WIFI_ONLY) ?: false,
             photosColumns = (get(Keys.PHOTOS_COLUMNS) ?: 3).coerceIn(2, 5),
+            biometricTimeoutSeconds = (get(Keys.BIOMETRIC_TIMEOUT_SECONDS) ?: 60).coerceIn(0, 3600),
+            blockScreenshotsEverywhere = get(Keys.BLOCK_SCREENSHOTS_EVERYWHERE) ?: false,
+            downloadConcurrency = (get(Keys.DOWNLOAD_CONCURRENCY) ?: 2).coerceIn(1, 4),
+            downloadWifiOnly = get(Keys.DOWNLOAD_WIFI_ONLY) ?: false,
+            autoSaveDownloadsToPublic = get(Keys.AUTO_SAVE_DOWNLOADS_TO_PUBLIC) ?: false,
+            pinnedFolderChatIds = get(Keys.PINNED_FOLDER_CHAT_IDS) ?: emptySet(),
+            showEncryptedPreviewsWhenUnlocked = get(Keys.SHOW_ENCRYPTED_PREVIEWS_UNLOCKED) ?: false,
         )
     }
 
@@ -378,5 +406,12 @@ class AppPreferences @Inject constructor(
         this[Keys.DECRYPTED_TEMP_TTL_MINUTES] = d.decryptedTempTtlMinutes
         this[Keys.MANUAL_UPLOAD_WIFI_ONLY] = d.manualUploadWifiOnly
         this[Keys.PHOTOS_COLUMNS] = d.photosColumns.coerceIn(2, 5)
+        this[Keys.BIOMETRIC_TIMEOUT_SECONDS] = d.biometricTimeoutSeconds.coerceIn(0, 3600)
+        this[Keys.BLOCK_SCREENSHOTS_EVERYWHERE] = d.blockScreenshotsEverywhere
+        this[Keys.DOWNLOAD_CONCURRENCY] = d.downloadConcurrency.coerceIn(1, 4)
+        this[Keys.DOWNLOAD_WIFI_ONLY] = d.downloadWifiOnly
+        this[Keys.AUTO_SAVE_DOWNLOADS_TO_PUBLIC] = d.autoSaveDownloadsToPublic
+        this[Keys.PINNED_FOLDER_CHAT_IDS] = d.pinnedFolderChatIds
+        this[Keys.SHOW_ENCRYPTED_PREVIEWS_UNLOCKED] = d.showEncryptedPreviewsWhenUnlocked
     }
 }

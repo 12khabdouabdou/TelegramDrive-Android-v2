@@ -207,6 +207,10 @@ fun FolderScreen(
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
     var showBatchDecryptDialog by remember { mutableStateOf(false) }
     var showScannerDialog by remember { mutableStateOf(false) }
+    var showNewSubfolderDialog by remember { mutableStateOf(false) }
+    var renameFileTarget by remember { mutableStateOf<FileCacheEntity?>(null) }
+    var showMoveChoiceDialog by remember { mutableStateOf(false) }
+    var showSubfolderMovePicker by remember { mutableStateOf(false) }
 
     LaunchedEffect(snackbarEvent?.id) {
         val ev = snackbarEvent ?: return@LaunchedEffect
@@ -427,9 +431,16 @@ fun FolderScreen(
                                 )
                             }
                         }
+                        IconButton(onClick = { vm.exportSelectedAsLocalZip() }) {
+                            Icon(
+                                Icons.Filled.FolderZip,
+                                contentDescription = stringResource(R.string.browser_export_zip),
+                                tint = MaterialTheme.colorScheme.secondary,
+                            )
+                        }
                         IconButton(onClick = {
                             moveFromDetails = false
-                            showMovePicker = true
+                            showMoveChoiceDialog = true
                         }) {
                             Icon(
                                 Icons.Filled.DriveFileMove,
@@ -551,6 +562,14 @@ fun FolderScreen(
                             },
                             leadingIcon = { Icon(Icons.Filled.FolderZip, contentDescription = null) },
                         )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.browser_new_subfolder)) },
+                            onClick = {
+                                showUploadMenu = false
+                                showNewSubfolderDialog = true
+                            },
+                            leadingIcon = { Icon(Icons.Filled.CreateNewFolder, contentDescription = null) },
+                        )
                     }
                 }
             }
@@ -643,6 +662,7 @@ fun FolderScreen(
                 VirtualSubfoldersRow(
                     currentVirtualPath = state.currentVirtualPath,
                     subfolders = state.childVirtualFolders,
+                    thumbPathsByFolder = state.childVirtualFolderThumbs,
                     onOpenSubfolder = vm::openVirtualFolder,
                 )
             }
@@ -686,6 +706,7 @@ fun FolderScreen(
                             FileGrid(
                                 items = state.items,
                                 pdfThumbnails = state.pdfThumbnails,
+                                decryptedThumbs = state.decryptedThumbs,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -719,6 +740,7 @@ fun FolderScreen(
                             FileList(
                                 items = state.items,
                                 pdfThumbnails = state.pdfThumbnails,
+                                decryptedThumbs = state.decryptedThumbs,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -864,7 +886,216 @@ fun FolderScreen(
             onDecrypt = if (isEncryptedTgenc) ({ vm.startDecryptFlow(item) }) else null,
             onSaveNote = { note -> vm.updateUserNote(item, note) },
             onToggleLock = { vm.setItemLocked(item, !item.isLocked) },
+            onRename = { renameFileTarget = item },
+            onMoveSubfolder = {
+                vm.clearSelection()
+                vm.toggleSelection(item.messageId)
+                moveFromDetails = true
+                showSubfolderMovePicker = true
+            },
             onDismiss = { detailsItem = null },
+        )
+    }
+
+    if (showMoveChoiceDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showMoveChoiceDialog = false
+                if (moveFromDetails) {
+                    vm.clearSelection()
+                    moveFromDetails = false
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.browser_move_target_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            showMoveChoiceDialog = false
+                            showSubfolderMovePicker = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            stringResource(R.string.browser_move_to_subfolder),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            showMoveChoiceDialog = false
+                            showMovePicker = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            stringResource(R.string.browser_move_to_telegram_folder),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = {
+                    showMoveChoiceDialog = false
+                    if (moveFromDetails) {
+                        vm.clearSelection()
+                        moveFromDetails = false
+                    }
+                }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
+        )
+    }
+
+    if (showSubfolderMovePicker) {
+        var customPath by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = {
+                showSubfolderMovePicker = false
+                if (moveFromDetails) {
+                    vm.clearSelection()
+                    moveFromDetails = false
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.details_move_subfolder)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = customPath,
+                        onValueChange = { customPath = it },
+                        label = { Text(stringResource(R.string.browser_new_subfolder_hint)) },
+                        placeholder = { Text("Photos/2026") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        TextButton(
+                            onClick = {
+                                showSubfolderMovePicker = false
+                                moveFromDetails = false
+                                vm.moveSelectedToVirtualPath("")
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                stringResource(R.string.browser_root_folder),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        for (vp in state.allVirtualPaths) {
+                            TextButton(
+                                onClick = {
+                                    showSubfolderMovePicker = false
+                                    moveFromDetails = false
+                                    vm.moveSelectedToVirtualPath(vp)
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(vp, modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = customPath.isNotBlank(),
+                    onClick = {
+                        showSubfolderMovePicker = false
+                        moveFromDetails = false
+                        vm.moveSelectedToVirtualPath(customPath)
+                    },
+                ) {
+                    Text(stringResource(R.string.browser_action_move))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showSubfolderMovePicker = false
+                    if (moveFromDetails) {
+                        vm.clearSelection()
+                        moveFromDetails = false
+                    }
+                }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
+        )
+    }
+
+    if (showNewSubfolderDialog) {
+        var folderNameDraft by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showNewSubfolderDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.browser_new_subfolder)) },
+            text = {
+                OutlinedTextField(
+                    value = folderNameDraft,
+                    onValueChange = { folderNameDraft = it },
+                    label = { Text(stringResource(R.string.browser_new_subfolder_hint)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = folderNameDraft.isNotBlank(),
+                    onClick = {
+                        vm.createVirtualFolder(folderNameDraft)
+                        showNewSubfolderDialog = false
+                    },
+                ) {
+                    Text(stringResource(R.string.folders_create_action))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewSubfolderDialog = false }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
+        )
+    }
+
+    renameFileTarget?.let { target ->
+        var draft by remember(target.messageId) { mutableStateOf(target.fileName) }
+        val trimmed = draft.trim()
+        AlertDialog(
+            onDismissRequest = { renameFileTarget = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.details_rename_title)) },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = trimmed.isNotEmpty() && trimmed != target.fileName,
+                    onClick = {
+                        vm.renameFile(target.messageId, trimmed)
+                        renameFileTarget = null
+                    },
+                ) {
+                    Text(stringResource(R.string.folders_rename))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameFileTarget = null }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
         )
     }
 
@@ -1274,6 +1505,7 @@ private val PART_ZIP_REGEX = Regex("_part(\\d+)\\.zip$", RegexOption.IGNORE_CASE
 private fun FileGrid(
     items: List<FileCacheEntity>,
     pdfThumbnails: Map<Long, String>,
+    decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -1307,6 +1539,7 @@ private fun FileGrid(
             FileGridCell(
                 item = item,
                 pdfThumbnailPath = pdfThumbnails[item.messageId],
+                decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -1337,6 +1570,7 @@ private fun FileGrid(
 private fun FileGridCell(
     item: FileCacheEntity,
     pdfThumbnailPath: String? = null,
+    decryptedThumbBytes: ByteArray? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -1385,7 +1619,23 @@ private fun FileGridCell(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                if (thumbFile != null) {
+                if (decryptedThumbBytes != null) {
+                    AsyncImage(
+                        model = decryptedThumbBytes,
+                        contentDescription = item.fileName,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else if (decryptedThumbBytes != null) {
+                AsyncImage(
+                    model = decryptedThumbBytes,
+                    contentDescription = item.fileName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(12.dp)),
+                )
+            } else if (thumbFile != null) {
                     AsyncImage(
                         model = thumbFile,
                         contentDescription = item.fileName,
@@ -1523,6 +1773,7 @@ private fun FileGridCell(
 private fun FileList(
     items: List<FileCacheEntity>,
     pdfThumbnails: Map<Long, String>,
+    decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -1554,6 +1805,7 @@ private fun FileList(
             FileListRow(
                 item = item,
                 pdfThumbnailPath = pdfThumbnails[item.messageId],
+                decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -1584,6 +1836,7 @@ private fun FileList(
 private fun FileListRow(
     item: FileCacheEntity,
     pdfThumbnailPath: String? = null,
+    decryptedThumbBytes: ByteArray? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -1637,6 +1890,15 @@ private fun FileListRow(
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp),
+                )
+            } else if (decryptedThumbBytes != null) {
+                AsyncImage(
+                    model = decryptedThumbBytes,
+                    contentDescription = item.fileName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(12.dp)),
                 )
             } else if (thumbFile != null) {
                 AsyncImage(
@@ -1917,6 +2179,7 @@ private fun VirtualBreadcrumbBar(
 private fun VirtualSubfoldersRow(
     currentVirtualPath: String,
     subfolders: List<Pair<String, Int>>,
+    thumbPathsByFolder: Map<String, List<String>> = emptyMap(),
     onOpenSubfolder: (String) -> Unit,
 ) {
     LazyRow(
@@ -1927,21 +2190,86 @@ private fun VirtualSubfoldersRow(
     ) {
         items(subfolders, key = { it.first }) { (name, count) ->
             val target = if (currentVirtualPath.isEmpty()) name else "$currentVirtualPath/$name"
+            val thumbPaths = thumbPathsByFolder[name].orEmpty()
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(14.dp))
                     .background(MaterialTheme.colorScheme.surfaceContainer)
                     .clickable { onOpenSubfolder(target) }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(
-                    Icons.Filled.Folder,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(18.dp),
-                )
+                if (thumbPaths.size >= 2) {
+                    Column(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+                        verticalArrangement = Arrangement.spacedBy(1.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(1.dp),
+                        ) {
+                            thumbPaths.getOrNull(0)?.let { p ->
+                                AsyncImage(
+                                    model = File(p),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.weight(1f).fillMaxSize(),
+                                )
+                            }
+                            thumbPaths.getOrNull(1)?.let { p ->
+                                AsyncImage(
+                                    model = File(p),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.weight(1f).fillMaxSize(),
+                                )
+                            }
+                        }
+                        if (thumbPaths.size > 2) {
+                            Row(
+                                modifier = Modifier.weight(1f).fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(1.dp),
+                            ) {
+                                thumbPaths.getOrNull(2)?.let { p ->
+                                    AsyncImage(
+                                        model = File(p),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.weight(1f).fillMaxSize(),
+                                    )
+                                }
+                                thumbPaths.getOrNull(3)?.let { p ->
+                                    AsyncImage(
+                                        model = File(p),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.weight(1f).fillMaxSize(),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else if (thumbPaths.size == 1) {
+                    AsyncImage(
+                        model = File(thumbPaths[0]),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(8.dp)),
+                    )
+                } else {
+                    Icon(
+                        Icons.Filled.Folder,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
                 Column {
                     Text(
                         text = name,

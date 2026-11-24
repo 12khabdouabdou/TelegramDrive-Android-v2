@@ -21,6 +21,11 @@
     <string name="transfers_status_failed">Failed</string>
     <string name="transfers_status_cancelled">Cancelled</string>
     <string name="transfers_cancel">Cancel download</string>
+    <string name="transfers_pause_download">Pause download</string>
+    <string name="transfers_resume_download">Resume download</string>
+    <string name="transfers_save_downloads">Save to Downloads</string>
+    <string name="transfers_share_file">Share file</string>
+    <string name="transfers_saved_to_downloads">Saved to Downloads/TelegramDrive</string>
     <string name="transfers_cancel_upload">Stop upload</string>
     <string name="transfers_pause_upload">Pause upload</string>
     <string name="transfers_resume_upload">Resume upload</string>

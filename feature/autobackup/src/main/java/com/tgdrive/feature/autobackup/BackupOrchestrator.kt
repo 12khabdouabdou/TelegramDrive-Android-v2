@@ -645,7 +645,19 @@ class BackupOrchestrator @Inject constructor(
                                 fallbackLastModified = file.lastModified,
                             )
                             val generatedThumb = if (staged.wasEncrypted) {
-                                null
+                                try {
+                                    mediaThumbnailCache.generateAndSyncEncryptedThumb(
+                                        chatId = fileTargetChatId,
+                                        messageId = msgId,
+                                        localPath = file.absolutePath,
+                                        mimeType = file.mimeType,
+                                        originalFileName = file.name,
+                                    )
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Throwable) {
+                                    null
+                                }
                             } else {
                                 try {
                                     mediaThumbnailCache.generateFromLocalFile(
@@ -1056,7 +1068,20 @@ class BackupOrchestrator @Inject constructor(
                     }
 
                     val zipThumb = if (encryptZip) {
-                        null
+                        try {
+                            mediaThumbnailCache.generateAndSyncEncryptedThumb(
+                                chatId = destChatId,
+                                messageId = uploadResult.messageId,
+                                localPath = part.partFile.absolutePath,
+                                mimeType = "application/zip",
+                                originalFileName = partName,
+                                zipPassword = zipPassword,
+                            )
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                            null
+                        }
                     } else {
                         try {
                             mediaThumbnailCache.generateFromLocalFile(

@@ -21,8 +21,10 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -32,12 +34,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PlayArrow
@@ -159,14 +163,17 @@ fun ZipBrowserScreen(
         )
     }
     var searchQuery by remember { mutableStateOf("") }
+    var isGridView by remember { mutableStateOf(false) }
     var passwordInput by remember { mutableStateOf("") }
     var showPasswordDialog by remember { mutableStateOf<String?>(null) }
     var passwordForExtractAll by remember { mutableStateOf(false) }
-    var imageViewerPath by remember { mutableStateOf<String?>(null) }
+    var passwordForPreviewsOnly by remember { mutableStateOf(false) }
+    var imageViewerPaths by remember { mutableStateOf<List<String>>(emptyList()) }
+    var imageViewerInitialIndex by remember { mutableStateOf(0) }
 
     val noViewerMsg = stringResource(R.string.zip_browser_no_viewer)
 
-    BackHandler(enabled = (searchQuery.isNotEmpty() || currentPath.isNotEmpty()) && imageViewerPath == null) {
+    BackHandler(enabled = (searchQuery.isNotEmpty() || currentPath.isNotEmpty()) && imageViewerPaths.isEmpty()) {
         if (searchQuery.isNotEmpty()) {
             searchQuery = ""
         } else {
@@ -209,7 +216,10 @@ fun ZipBrowserScreen(
         vm.clearExtractedPath()
         val file = File(path)
         when (val route = routeForExtractedFile(file.name, path)) {
-            is ExtractedFileRoute.ImageView -> imageViewerPath = route.localPath
+            is ExtractedFileRoute.ImageView -> {
+                imageViewerPaths = listOf(route.localPath)
+                imageViewerInitialIndex = 0
+            }
             is ExtractedFileRoute.VideoView -> onOpenLocalVideo(route.localPath)
             is ExtractedFileRoute.AudioPlay -> onPlayLocalAudio(route.localPath, route.fileName)
             is ExtractedFileRoute.PdfView -> onOpenLocalPdf(route.localPath, route.fileName)
@@ -220,6 +230,13 @@ fun ZipBrowserScreen(
                 }
             }
         }
+    }
+
+    LaunchedEffect(state.imageViewerData) {
+        val data = state.imageViewerData ?: return@LaunchedEffect
+        vm.clearImageViewerData()
+        imageViewerPaths = data.paths
+        imageViewerInitialIndex = data.initialIndex
     }
 
     val visibleItems =
@@ -297,6 +314,15 @@ fun ZipBrowserScreen(
                         )
                     }
                     if (state.zipReady && state.entries.isNotEmpty()) {
+                        IconButton(onClick = { isGridView = !isGridView }) {
+                            Icon(
+                                imageVector = if (isGridView) Icons.AutoMirrored.Filled.ViewList else Icons.Filled.GridView,
+                                contentDescription = stringResource(
+                                    if (isGridView) R.string.zip_browser_toggle_list else R.string.zip_browser_toggle_grid,
+                                ),
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
+                        }
                         if (state.extractingAll) {
                             CircularProgressIndicator(
                                 modifier = Modifier.padding(end = 8.dp).size(22.dp),
@@ -345,6 +371,54 @@ fun ZipBrowserScreen(
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp, vertical = 4.dp),
                     )
+                }
+
+                // Unlock previews banner for password-protected archives
+                if (state.zipReady && state.passwordRequired && state.unlockedPassword == null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.72f))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Filled.Lock,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                            Text(
+                                text = stringResource(R.string.zip_unlock_previews_title),
+                                style = TgTypography.Display.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            )
+                            Text(
+                                text = stringResource(R.string.zip_unlock_previews_desc),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.85f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        TextButton(onClick = { vm.unlockPreviewsWithVault() }) {
+                            Text(
+                                stringResource(R.string.zip_unlock_previews_vault),
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        TextButton(onClick = {
+                            passwordForExtractAll = false
+                            passwordForPreviewsOnly = true
+                            showPasswordDialog = downloadItem?.fileName ?: "archive.zip"
+                        }) {
+                            Text(stringResource(R.string.zip_unlock_previews_password))
+                        }
+                    }
                 }
 
                 // Multi-part split archive banner (.z01/.z02/.. + .zip)
@@ -438,27 +512,46 @@ fun ZipBrowserScreen(
                     visibleItems.isEmpty() && state.zipReady ->
                         ArchiveEmptyState(stringResource(R.string.zip_browser_folder_empty))
                     else ->
-                        EntriesList(
+                        EntriesContent(
                             items = visibleItems,
+                            allEntries = state.entries,
+                            isGridView = isGridView,
                             extractingEntry = state.extractingEntry,
                             zipPath = localPath,
                             unlockedPassword = state.unlockedPassword,
+                            backupCrypto = vm.backupCrypto,
                             onFolderClick = { folder -> currentPath = folder.fullPrefix },
                             onFileClick = { fileNode ->
                                 val entry = fileNode.entry
                                 passwordForExtractAll = false
-                                vm.openOrPromptEntry(entry) {
-                                    showPasswordDialog = entry.name
+                                passwordForPreviewsOnly = false
+                                val ext = entry.name.substringAfterLast('.', "").lowercase()
+                                if (ext in setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif")) {
+                                    val siblingImages = visibleItems
+                                        .filterIsInstance<ZipBrowserItem.FileNode>()
+                                        .map { it.entry }
+                                        .filter {
+                                            it.name.substringAfterLast('.', "").lowercase() in
+                                                setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif")
+                                        }
+                                    vm.openImageEntryWithSiblings(entry, siblingImages) {
+                                        showPasswordDialog = entry.name
+                                    }
+                                } else {
+                                    vm.openOrPromptEntry(entry) {
+                                        showPasswordDialog = entry.name
+                                    }
                                 }
                             },
                         )
                 }
             }
 
-            imageViewerPath?.let { path ->
+            if (imageViewerPaths.isNotEmpty()) {
                 com.tgdrive.feature.player.ImageViewer(
-                    imagePaths = listOf(path),
-                    onDismiss = { imageViewerPath = null },
+                    imagePaths = imageViewerPaths,
+                    initialPage = imageViewerInitialIndex,
+                    onDismiss = { imageViewerPaths = emptyList() },
                 )
             }
 
@@ -471,7 +564,10 @@ fun ZipBrowserScreen(
                     onUnlockWithVaultKey = {
                         showPasswordDialog = null
                         passwordInput = ""
-                        if (passwordForExtractAll) {
+                        if (passwordForPreviewsOnly) {
+                            passwordForPreviewsOnly = false
+                            vm.unlockPreviewsWithVault(useSavedBackupPassphrase = false)
+                        } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
                             vm.unlockWithVaultKey(entryName = null)
                         } else {
@@ -481,7 +577,10 @@ fun ZipBrowserScreen(
                     onUnlockWithSavedPassphrase = {
                         showPasswordDialog = null
                         passwordInput = ""
-                        if (passwordForExtractAll) {
+                        if (passwordForPreviewsOnly) {
+                            passwordForPreviewsOnly = false
+                            vm.unlockPreviewsWithVault(useSavedBackupPassphrase = true)
+                        } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
                             vm.unlockWithVaultKey(entryName = null, useSavedBackupPassphrase = true)
                         } else {
@@ -492,7 +591,10 @@ fun ZipBrowserScreen(
                         val pwd = passwordInput.ifBlank { null }
                         passwordInput = ""
                         showPasswordDialog = null
-                        if (passwordForExtractAll) {
+                        if (passwordForPreviewsOnly) {
+                            passwordForPreviewsOnly = false
+                            if (pwd != null) vm.unlockPreviews(pwd)
+                        } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
                             vm.extractAllToDownloads(pwd)
                         } else {
@@ -502,6 +604,7 @@ fun ZipBrowserScreen(
                     onDismiss = {
                         passwordInput = ""
                         passwordForExtractAll = false
+                        passwordForPreviewsOnly = false
                         showPasswordDialog = null
                     },
                 )
@@ -770,51 +873,121 @@ private fun ArchiveEmptyState(message: String) {
 }
 
 @Composable
-private fun EntriesList(
+private fun EntriesContent(
     items: List<ZipBrowserItem>,
+    allEntries: List<ZipEntryInfo>,
+    isGridView: Boolean,
     extractingEntry: String?,
     zipPath: String?,
     unlockedPassword: String?,
+    backupCrypto: com.tgdrive.core.security.BackupCrypto,
     onFolderClick: (ZipBrowserItem.FolderNode) -> Unit,
     onFileClick: (ZipBrowserItem.FileNode) -> Unit,
 ) {
     val context = LocalContext.current
-    val thumbnailGenerator = remember(context) { ZipThumbnailGenerator(cacheDir = context.cacheDir) }
+    val thumbnailGenerator = remember(context, backupCrypto) {
+        ZipThumbnailGenerator(
+            cacheDir = context.cacheDir,
+            diskCacheDir = File(context.cacheDir, "zip_thumbs"),
+            backupCrypto = backupCrypto,
+        )
+    }
     val thumbSemaphore = remember { Semaphore(3) }
     val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val childEntryNamesByPrefix = remember(allEntries) {
+        val map = LinkedHashMap<String, MutableList<String>>()
+        for (e in allEntries) {
+            if (e.isDirectory) continue
+            val norm = e.name.replace('\\', '/').trimStart('/')
+            var slash = norm.indexOf('/')
+            while (slash > 0) {
+                val pref = norm.substring(0, slash + 1)
+                map.getOrPut(pref) { ArrayList() }.add(e.name)
+                slash = norm.indexOf('/', slash + 1)
+            }
+        }
+        map
+    }
     DisposableEffect(thumbnailGenerator) {
         onDispose { thumbnailGenerator.clear() }
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = bottomNavPad + 24.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items(items, key = { item ->
-            when (item) {
-                is ZipBrowserItem.FolderNode -> "dir:${item.fullPrefix}"
-                is ZipBrowserItem.FileNode -> "file:${item.entry.name}"
+    if (isGridView) {
+        LazyVerticalGrid(
+            columns = GridCells.Adaptive(112.dp),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = bottomNavPad + 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            gridItems(items, key = { item ->
+                when (item) {
+                    is ZipBrowserItem.FolderNode -> "dir:${item.fullPrefix}"
+                    is ZipBrowserItem.FileNode -> "file:${item.entry.name}"
+                }
+            }) { item ->
+                when (item) {
+                    is ZipBrowserItem.FolderNode ->
+                        ZipFolderGridTile(
+                            folder = item,
+                            zipPath = zipPath,
+                            childEntryNames = childEntryNamesByPrefix[item.fullPrefix].orEmpty(),
+                            password = unlockedPassword,
+                            thumbnailGenerator = thumbnailGenerator,
+                            thumbSemaphore = thumbSemaphore,
+                            onClick = { onFolderClick(item) },
+                        )
+                    is ZipBrowserItem.FileNode ->
+                        ZipEntryGridTile(
+                            displayName = item.displayName,
+                            entry = item.entry,
+                            isExtracting = extractingEntry == item.entry.name,
+                            zipPath = zipPath,
+                            password = unlockedPassword,
+                            showThumbnail = !item.entry.isEncrypted || unlockedPassword != null,
+                            thumbnailGenerator = thumbnailGenerator,
+                            thumbSemaphore = thumbSemaphore,
+                            onClick = { onFileClick(item) },
+                        )
+                }
             }
-        }) { item ->
-            when (item) {
-                is ZipBrowserItem.FolderNode ->
-                    ZipFolderRow(
-                        folder = item,
-                        onClick = { onFolderClick(item) },
-                    )
-                is ZipBrowserItem.FileNode ->
-                    ZipEntryRow(
-                        displayName = item.displayName,
-                        entry = item.entry,
-                        isExtracting = extractingEntry == item.entry.name,
-                        zipPath = zipPath,
-                        password = unlockedPassword,
-                        showThumbnail = !item.entry.isEncrypted || unlockedPassword != null,
-                        thumbnailGenerator = thumbnailGenerator,
-                        thumbSemaphore = thumbSemaphore,
-                        onClick = { onFileClick(item) },
-                    )
+        }
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = bottomNavPad + 24.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(items, key = { item ->
+                when (item) {
+                    is ZipBrowserItem.FolderNode -> "dir:${item.fullPrefix}"
+                    is ZipBrowserItem.FileNode -> "file:${item.entry.name}"
+                }
+            }) { item ->
+                when (item) {
+                    is ZipBrowserItem.FolderNode ->
+                        ZipFolderRow(
+                            folder = item,
+                            zipPath = zipPath,
+                            childEntryNames = childEntryNamesByPrefix[item.fullPrefix].orEmpty(),
+                            password = unlockedPassword,
+                            thumbnailGenerator = thumbnailGenerator,
+                            thumbSemaphore = thumbSemaphore,
+                            onClick = { onFolderClick(item) },
+                        )
+                    is ZipBrowserItem.FileNode ->
+                        ZipEntryRow(
+                            displayName = item.displayName,
+                            entry = item.entry,
+                            isExtracting = extractingEntry == item.entry.name,
+                            zipPath = zipPath,
+                            password = unlockedPassword,
+                            showThumbnail = !item.entry.isEncrypted || unlockedPassword != null,
+                            thumbnailGenerator = thumbnailGenerator,
+                            thumbSemaphore = thumbSemaphore,
+                            onClick = { onFileClick(item) },
+                        )
+                }
             }
         }
     }
@@ -823,8 +996,26 @@ private fun EntriesList(
 @Composable
 private fun ZipFolderRow(
     folder: ZipBrowserItem.FolderNode,
+    zipPath: String?,
+    childEntryNames: List<String>,
+    password: String?,
+    thumbnailGenerator: ZipThumbnailGenerator,
+    thumbSemaphore: Semaphore,
     onClick: () -> Unit,
 ) {
+    var collage by remember(folder.fullPrefix, zipPath, password) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    val canPreview = !folder.encrypted || password != null
+    LaunchedEffect(folder.fullPrefix, zipPath, password, canPreview) {
+        if (!canPreview || zipPath == null || childEntryNames.isEmpty()) return@LaunchedEffect
+        collage = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                thumbSemaphore.withPermit {
+                    thumbnailGenerator.getFolderCollage(zipPath, folder.fullPrefix, childEntryNames, password)
+                }
+            }.getOrNull()
+        }
+    }
+
     GlassPanel(
         modifier = Modifier
             .fillMaxWidth()
@@ -837,16 +1028,26 @@ private fun ZipFolderRow(
         ) {
             Box(
                 modifier = Modifier
-                    .size(44.dp)
+                    .size(48.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .background(MaterialTheme.colorScheme.secondaryContainer),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    Icons.Filled.Folder,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.secondary,
-                )
+                val bmp = collage
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Icon(
+                        Icons.Filled.Folder,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                    )
+                }
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -876,6 +1077,194 @@ private fun ZipFolderRow(
                 Icons.Filled.ChevronRight,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ZipFolderGridTile(
+    folder: ZipBrowserItem.FolderNode,
+    zipPath: String?,
+    childEntryNames: List<String>,
+    password: String?,
+    thumbnailGenerator: ZipThumbnailGenerator,
+    thumbSemaphore: Semaphore,
+    onClick: () -> Unit,
+) {
+    var collage by remember(folder.fullPrefix, zipPath, password) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    val canPreview = !folder.encrypted || password != null
+    LaunchedEffect(folder.fullPrefix, zipPath, password, canPreview) {
+        if (!canPreview || zipPath == null || childEntryNames.isEmpty()) return@LaunchedEffect
+        collage = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                thumbSemaphore.withPermit {
+                    thumbnailGenerator.getFolderCollage(zipPath, folder.fullPrefix, childEntryNames, password)
+                }
+            }.getOrNull()
+        }
+    }
+
+    GlassPanel(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(92.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.secondaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                val bmp = collage
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Icon(
+                        Icons.Filled.Folder,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(32.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = folder.name,
+                style = TgTypography.Caption,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = stringResource(R.string.zip_browser_folder_items, folder.descendantCount),
+                style = TgTypography.Caption,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ZipEntryGridTile(
+    displayName: String,
+    entry: ZipEntryInfo,
+    isExtracting: Boolean,
+    zipPath: String?,
+    password: String?,
+    showThumbnail: Boolean,
+    thumbnailGenerator: ZipThumbnailGenerator,
+    thumbSemaphore: Semaphore,
+    onClick: () -> Unit,
+) {
+    var thumbnail by remember(entry.name, zipPath, password) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var thumbnailTried by remember(entry.name, zipPath, password) { mutableStateOf(false) }
+
+    LaunchedEffect(entry.name, zipPath, showThumbnail, password) {
+        if (!showThumbnail || zipPath == null || thumbnailTried) return@LaunchedEffect
+        thumbnailTried = true
+        thumbnail = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                thumbSemaphore.withPermit {
+                    thumbnailGenerator.getThumbnail(zipPath, entry.name, password)
+                }
+            }.getOrNull()
+        }
+    }
+
+    val ext = remember(entry.name) { entry.name.substringAfterLast('.', "").lowercase() }
+    val isVideo = ext in ZipThumbnailGenerator.VIDEO_EXTS
+    val isPdf = ext in ZipThumbnailGenerator.PDF_EXTS
+
+    GlassPanel(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(92.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                contentAlignment = Alignment.Center,
+            ) {
+                val bmp = thumbnail
+                if (bmp != null) {
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Icon(
+                        Icons.AutoMirrored.Filled.InsertDriveFile,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                if (isVideo && bmp != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                } else if (isPdf && bmp != null) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(4.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(MaterialTheme.colorScheme.errorContainer)
+                            .padding(horizontal = 4.dp, vertical = 1.dp),
+                    ) {
+                        Text(
+                            text = "PDF",
+                            style = TgTypography.Caption,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+                if (isExtracting) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = displayName,
+                style = TgTypography.Caption,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = entry.uncompressedSize.toHumanSize(),
+                style = TgTypography.Caption,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
             )
         }
     }
@@ -985,9 +1374,11 @@ private fun EntryLeading(
         thumbnail = bmp
     }
 
-    val isVideo = remember(entry.name) {
-        entry.name.substringAfterLast('.', "").lowercase() in ZipThumbnailGenerator.VIDEO_EXTS
+    val ext = remember(entry.name) {
+        entry.name.substringAfterLast('.', "").lowercase()
     }
+    val isVideo = ext in ZipThumbnailGenerator.VIDEO_EXTS
+    val isPdf = ext in ZipThumbnailGenerator.PDF_EXTS
 
     Box(
         modifier = Modifier
@@ -1018,6 +1409,22 @@ private fun EntryLeading(
                             contentDescription = null,
                             tint = Color.White,
                             modifier = Modifier.size(14.dp),
+                        )
+                    }
+                } else if (isPdf) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(2.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(MaterialTheme.colorScheme.errorContainer)
+                            .padding(horizontal = 3.dp, vertical = 1.dp),
+                    ) {
+                        Text(
+                            text = "PDF",
+                            style = TgTypography.Caption,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
                         )
                     }
                 }

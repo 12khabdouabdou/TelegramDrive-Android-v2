@@ -60,6 +60,12 @@ data class SettingsUiState(
     val vaultKeyFingerprint: String = "",
     val decryptedTempTtlMinutes: Int = 30,
     val manualUploadWifiOnly: Boolean = false,
+    val biometricTimeoutSeconds: Int = 0,
+    val blockScreenshotsEverywhere: Boolean = false,
+    val showEncryptedPreviewsWhenUnlocked: Boolean = true,
+    val downloadConcurrency: Int = 2,
+    val downloadWifiOnly: Boolean = false,
+    val autoSaveDownloadsToPublic: Boolean = false,
     val tempDecryptedCount: Int = 0,
     val tempDecryptedBytes: Long = 0L,
     val cloudVaultBusy: Boolean = false,
@@ -124,6 +130,12 @@ class SettingsViewModel @Inject constructor(
             vaultKeyFingerprint = fingerprint,
             decryptedTempTtlMinutes = p.decryptedTempTtlMinutes,
             manualUploadWifiOnly = p.manualUploadWifiOnly,
+            biometricTimeoutSeconds = p.biometricTimeoutSeconds,
+            blockScreenshotsEverywhere = p.blockScreenshotsEverywhere,
+            showEncryptedPreviewsWhenUnlocked = p.showEncryptedPreviewsWhenUnlocked,
+            downloadConcurrency = p.downloadConcurrency,
+            downloadWifiOnly = p.downloadWifiOnly,
+            autoSaveDownloadsToPublic = p.autoSaveDownloadsToPublic,
             tempDecryptedCount = tempCount,
             tempDecryptedBytes = tempBytes,
             cloudVaultBusy = busy,
@@ -224,6 +236,42 @@ class SettingsViewModel @Inject constructor(
     fun setManualUploadWifiOnly(enabled: Boolean) {
         viewModelScope.launch(dispatchers.io) {
             preferences.update { it.copy(manualUploadWifiOnly = enabled) }
+        }
+    }
+
+    fun setBiometricTimeoutSeconds(seconds: Int) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(biometricTimeoutSeconds = seconds.coerceAtLeast(0)) }
+        }
+    }
+
+    fun setBlockScreenshotsEverywhere(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(blockScreenshotsEverywhere = enabled) }
+        }
+    }
+
+    fun setShowEncryptedPreviewsWhenUnlocked(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(showEncryptedPreviewsWhenUnlocked = enabled) }
+        }
+    }
+
+    fun setDownloadConcurrency(concurrency: Int) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(downloadConcurrency = concurrency.coerceIn(1, 4)) }
+        }
+    }
+
+    fun setDownloadWifiOnly(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(downloadWifiOnly = enabled) }
+        }
+    }
+
+    fun setAutoSaveDownloadsToPublic(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(autoSaveDownloadsToPublic = enabled) }
         }
     }
 
@@ -337,6 +385,12 @@ class SettingsViewModel @Inject constructor(
                             lastCloudSyncMs = 0L,
                             decryptedTempTtlMinutes = 30,
                             manualUploadWifiOnly = false,
+                            biometricTimeoutSeconds = 0,
+                            blockScreenshotsEverywhere = false,
+                            showEncryptedPreviewsWhenUnlocked = true,
+                            downloadConcurrency = 2,
+                            downloadWifiOnly = false,
+                            autoSaveDownloadsToPublic = false,
                         )
                     }
                 } catch (t: Throwable) {

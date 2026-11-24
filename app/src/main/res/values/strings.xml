@@ -74,4 +74,22 @@
     <string name="share">Share</string>
     <string name="retry">Retry</string>
     <string name="error_generic">Something went wrong</string>
+
+    <!-- App Shortcuts -->
+    <string name="shortcut_search_short">Search</string>
+    <string name="shortcut_search_long">Search Telegram Drive</string>
+    <string name="shortcut_vault_short">Vault</string>
+    <string name="shortcut_vault_long">Open Private Vault</string>
+    <string name="shortcut_transfers_short">Transfers</string>
+    <string name="shortcut_transfers_long">Open Transfers</string>
+    <string name="shortcut_folders_short">Folders</string>
+    <string name="shortcut_folders_long">Browse Folders</string>
+
+    <!-- Home Screen Widget -->
+    <string name="widget_title">Telegram Drive</string>
+    <string name="widget_subtitle">Quick access</string>
+    <string name="widget_action_search">Search</string>
+    <string name="widget_action_vault">Vault</string>
+    <string name="widget_action_folders">Folders</string>
+    <string name="widget_action_backup">Backup</string>
 </resources>
