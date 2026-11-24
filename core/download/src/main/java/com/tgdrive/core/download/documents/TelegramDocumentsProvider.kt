@@ -247,7 +247,7 @@ class TelegramDocumentsProvider : DocumentsProvider() {
                 ?: return@runBlocking null
             val trashedIds = ep.trashEntryDao().getAll()
                 .mapTo(HashSet()) { it.chatId to it.messageId }
-            val vaultChatIds = ep.folderDao().allSync()
+            val vaultChatIds = ep.folderDao().getAll()
                 .filter { it.isVault }
                 .mapTo(HashSet()) { it.channelId }
             if (SafVisibilityFilter.isHiddenFile(candidate, trashedIds, vaultChatIds)) {
