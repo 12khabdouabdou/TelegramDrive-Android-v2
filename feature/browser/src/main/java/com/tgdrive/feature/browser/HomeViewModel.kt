@@ -138,7 +138,7 @@ class HomeViewModel
                 val savedId = mid[2] as Long
                 val dash = mid[3] as HomeDashboardStats
                 val sort = mid[4] as FolderListSort
-                val pinned = prefs.pinnedFolderChatIds
+                val pinned = prefs.pinnedFolderChatIds.mapNotNull { it.toLongOrNull() }.toSet()
                 val sortedFolders = folders.sortedWith(
                     Comparator { a, b ->
                         val pinCmp = (if (b.channelId in pinned) 1 else 0)
