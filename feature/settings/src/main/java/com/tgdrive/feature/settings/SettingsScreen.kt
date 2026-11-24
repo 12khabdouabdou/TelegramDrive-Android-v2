@@ -824,6 +824,7 @@ fun SettingsScreen(
                 )
             }
             val verifyExportTitle = stringResource(R.string.settings_passvault_verify_export)
+            val verifyExportSubtitle = stringResource(R.string.settings_biometric_confirm_subtitle)
             Spacer(Modifier.height(6.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -837,7 +838,7 @@ fun SettingsScreen(
                                 vm.authenticateForBiometricToggle(
                                     activity = activity,
                                     title = verifyExportTitle,
-                                    subtitle = confirmSubtitle,
+                                    subtitle = verifyExportSubtitle,
                                     onSuccess = { exportedVaultKey = vm.exportVaultKey() },
                                     onError = { err -> passvaultNotice = err },
                                 )
