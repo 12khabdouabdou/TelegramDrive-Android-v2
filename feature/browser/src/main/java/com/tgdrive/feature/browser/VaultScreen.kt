@@ -125,7 +125,7 @@ fun VaultScreen(
 
     val bioTitle = stringResource(R.string.vault_biometric_title)
     val bioSubtitle = stringResource(R.string.vault_biometric_subtitle)
-    val noAppMsg = stringResource(R.string.browser_no_app)
+    val noAppMsg = stringResource(R.string.browser_no_app_error)
 
     DisposableEffect(context) {
         val window = context.findActivity()?.window
