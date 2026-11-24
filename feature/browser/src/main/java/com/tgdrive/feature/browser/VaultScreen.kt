@@ -106,6 +106,10 @@ import java.io.File
 fun VaultScreen(
     onBack: () -> Unit,
     onOpenZip: (Long) -> Unit = {},
+    onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
+    onOpenImage: (Long, Long) -> Unit = { _, _ -> },
+    onOpenPdf: (Long) -> Unit = {},
+    onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenLocalVideo: (String) -> Unit = {},
     onOpenLocalPdf: (String, String) -> Unit = { _, _ -> },
     onOpenLocalText: (String, String) -> Unit = { _, _ -> },
@@ -250,6 +254,18 @@ fun VaultScreen(
                                     tint = MaterialTheme.colorScheme.onSurface,
                                 )
                             }
+                            val hasLocked = state.items.any {
+                                it.messageId in state.selectedIds && it.isLocked
+                            }
+                            if (hasLocked) {
+                                IconButton(onClick = vm::unhideSelected) {
+                                    Icon(
+                                        Icons.Filled.Visibility,
+                                        contentDescription = stringResource(R.string.vault_unhide_selected),
+                                        tint = MaterialTheme.colorScheme.secondary,
+                                    )
+                                }
+                            }
                             val hasTgenc = state.items.any {
                                 it.messageId in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
                             }
@@ -346,12 +362,15 @@ fun VaultScreen(
                                 onClick = {
                                     if (selectionMode) {
                                         vm.toggleSelection(item.messageId)
-                                    } else if (item.fileName.endsWith(".zip", ignoreCase = true) &&
-                                        !BackupCrypto.isEncryptedFileName(item.fileName)
-                                    ) {
-                                        onOpenZip(item.messageId)
                                     } else {
-                                        vm.startDecryptFlow(item)
+                                        vm.openUnlockedVaultItem(
+                                            item = item,
+                                            onOpenZip = onOpenZip,
+                                            onOpenVideo = onOpenVideo,
+                                            onOpenImage = onOpenImage,
+                                            onOpenPdf = onOpenPdf,
+                                            onOpenText = onOpenText,
+                                        )
                                     }
                                 },
                                 onLongClick = {
@@ -504,9 +523,22 @@ private fun VaultGridCard(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
+                val plainThumbFile = remember(item.thumbnailPath) {
+                    item.thumbnailPath
+                        ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
+                        ?.let(::File)
+                        ?.takeIf { it.isFile && it.length() > 0L }
+                }
                 if (decryptedThumbBytes != null) {
                     AsyncImage(
                         model = decryptedThumbBytes,
+                        contentDescription = innerName,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else if (plainThumbFile != null) {
+                    AsyncImage(
+                        model = plainThumbFile,
                         contentDescription = innerName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
@@ -521,6 +553,17 @@ private fun VaultGridCard(
                     ) {
                         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(26.dp))
                     }
+                }
+                if (item.isLocked && !item.isEncryptedVault && !BackupCrypto.isEncryptedFileName(item.fileName)) {
+                    Icon(
+                        Icons.Filled.VisibilityOff,
+                        contentDescription = stringResource(R.string.vault_hidden_badge),
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(6.dp)
+                            .size(16.dp),
+                    )
                 }
                 Box(
                     modifier = Modifier

@@ -418,6 +418,61 @@ class TgDriveDatabaseTest {
             assertThat(logRow?.failedCount).isEqualTo(1)
             assertThat(logRow?.bytesUploaded).isEqualTo(12_345L)
             assertThat(logRow?.failedDetailsJson).contains("big.mov")
+
+            // Verify media privacy exclusions, album join queries, and vault locked inclusion
+            migrated.fileCacheDao().upsertAll(
+                listOf(
+                    FileCacheEntity(
+                        messageId = 801L,
+                        chatId = 10L,
+                        fileName = "public_photo.avif",
+                        fileSize = 512L,
+                        mimeType = "image/avif",
+                        thumbnailPath = null,
+                        date = 900L,
+                        exifLat = 37.7749,
+                        exifLng = -122.4194,
+                    ),
+                    FileCacheEntity(
+                        messageId = 802L,
+                        chatId = 10L,
+                        fileName = "locked_photo.jpg",
+                        fileSize = 512L,
+                        mimeType = "image/jpeg",
+                        thumbnailPath = null,
+                        date = 901L,
+                        isLocked = true,
+                    ),
+                    FileCacheEntity(
+                        messageId = 803L,
+                        chatId = 10L,
+                        fileName = "vault_video.mp4",
+                        fileSize = 512L,
+                        mimeType = "video/mp4",
+                        thumbnailPath = null,
+                        date = 902L,
+                        isEncryptedVault = true,
+                    ),
+                ),
+            )
+            assertThat(migrated.fileCacheDao().getUnlockedMediaItems().map { it.messageId })
+                .containsExactly(801L, 77L)
+                .inOrder()
+            assertThat(migrated.fileCacheDao().observeGeotaggedMedia().first().map { it.messageId })
+                .containsExactly(801L)
+            assertThat(migrated.fileCacheDao().observeEncryptedVaultCount().first()).isEqualTo(3)
+
+            migrated.albumDao().upsert(
+                AlbumEntity(id = "alb2", name = "PublicAlbum", createdAt = 1L, updatedAt = 1L),
+            )
+            migrated.albumDao().addItems(
+                listOf(
+                    AlbumItemEntity(albumId = "alb2", chatId = 10L, messageId = 801L, addedAt = 1L),
+                    AlbumItemEntity(albumId = "alb2", chatId = 10L, messageId = 802L, addedAt = 2L),
+                ),
+            )
+            assertThat(migrated.fileCacheDao().getMediaItemsForAlbum("alb2").map { it.messageId })
+                .containsExactly(801L)
         } finally {
             migrated.close()
             dbFile.delete()

@@ -347,6 +347,55 @@ fun ZipBrowserScreen(
                     )
                 }
 
+                // Multi-part split archive banner (.z01/.z02/.. + .zip)
+                if (state.zipReady && state.splitPartsTotal > 1 && state.splitMergedPath == null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (state.reassemblingSplit) {
+                                    stringResource(
+                                        R.string.zip_split_banner_progress,
+                                        state.splitPartsDownloaded,
+                                        state.splitPartsTotal,
+                                    )
+                                } else {
+                                    stringResource(R.string.zip_split_banner_title, state.splitPartsTotal)
+                                },
+                                style = TgTypography.Display.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            )
+                            if (state.reassemblingSplit && state.splitPartsTotal > 0) {
+                                LinearProgressIndicator(
+                                    progress = {
+                                        (state.splitPartsDownloaded.toFloat() / state.splitPartsTotal.toFloat())
+                                            .coerceIn(0f, 1f)
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 4.dp),
+                                )
+                            }
+                        }
+                        if (!state.reassemblingSplit) {
+                            TextButton(onClick = { vm.downloadAndReassembleSplitArchive() }) {
+                                Text(
+                                    stringResource(R.string.zip_split_banner_action),
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // Breadcrumbs when inside a subfolder (and not searching)
                 if (state.zipReady && currentPath.isNotEmpty() && searchQuery.isBlank()) {
                     BreadcrumbBar(

@@ -59,4 +59,17 @@
     <string name="player_exif_size">File size</string>
     <string name="player_trashed_toast">Moved to Trash</string>
     <string name="player_share_chooser">Share image</string>
+    <string name="player_exif_note_label">Note</string>
+    <string name="player_exif_note_hint">Add a private searchable note…</string>
+    <string name="player_exif_note_save">Save note</string>
+    <string name="player_exif_note_saved">Note saved</string>
+    <string name="player_crop_title">Edit &amp; save copy</string>
+    <string name="player_crop_original">Original</string>
+    <string name="player_crop_save_btn">Save copy</string>
+    <string name="player_crop_saved">Saved copy: %1$s</string>
+    <string name="player_crop_failed">Could not save cropped copy</string>
+    <string name="player_audio_prev">Previous track</string>
+    <string name="player_audio_next">Next track</string>
+    <string name="player_audio_repeat">Repeat all</string>
+    <string name="player_audio_speed">Playback speed</string>
 </resources>

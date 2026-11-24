@@ -16,6 +16,8 @@ datastore = "1.1.1"
 workManager = "2.10.0"
 coil = "2.7.0"
 exoplayer = "1.4.1"
+mlkitTextRecognition = "16.0.1"
+mlkitImageLabeling = "17.0.9"
 tdlight = "3.5.3+td.1.8.65"
 securityCrypto = "1.1.0-alpha06"
 biometric = "1.2.0-alpha05"
@@ -109,6 +111,8 @@ biometric = { group = "androidx.biometric", name = "biometric", version.ref = "b
 documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
 zip4j = { group = "net.lingala.zip4j", name = "zip4j", version.ref = "zip4j" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
+mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+mlkit-image-labeling = { group = "com.google.mlkit", name = "image-labeling", version.ref = "mlkitImageLabeling" }
 
 # Testing
 junit5-jupiter-api = { group = "org.junit.jupiter", name = "junit-jupiter-api", version.ref = "junit5" }

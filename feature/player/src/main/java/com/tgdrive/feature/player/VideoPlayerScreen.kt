@@ -1,13 +1,20 @@
 package com.tgdrive.feature.player
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.AudioManager
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
+import dagger.hilt.android.qualifiers.ApplicationContext
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -132,6 +139,9 @@ data class ImageExifInfo(
     val camera: String? = null,
     val exposure: String? = null,
     val location: String? = null,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val userNote: String = "",
 )
 
 @HiltViewModel
@@ -144,6 +154,7 @@ class VideoPlayerViewModel @Inject constructor(
     private val trashEntryDao: TrashEntryDao,
     private val cloudSyncManager: CloudSyncManager,
     private val dispatchers: DispatchersProvider,
+    @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
     private val persistScope = CoroutineScope(SupervisorJob() + dispatchers.io)
@@ -199,6 +210,95 @@ class VideoPlayerViewModel @Inject constructor(
                     ext in VIDEO_EXTS
             }
         }.getOrDefault(emptyList())
+    }
+
+    suspend fun loadTimelineMedia(): List<FileCacheEntity> =
+        runCatching { fileCacheDao.getUnlockedMediaItems() }.getOrDefault(emptyList())
+
+    suspend fun loadAlbumMedia(albumId: String): List<FileCacheEntity> {
+        if (albumId.isBlank()) return emptyList()
+        return runCatching { fileCacheDao.getMediaItemsForAlbum(albumId) }.getOrDefault(emptyList())
+    }
+
+    suspend fun updateUserNote(chatId: Long, messageId: Long, rawNote: String): String =
+        withContext(dispatchers.io) {
+            val cleaned = rawNote.trim().ifEmpty { null }
+            runCatching {
+                fileCacheDao.updateUserNote(chatId, messageId, cleaned)
+                cloudSyncManager.noteUserNoteChanged(chatId, messageId, cleaned)
+            }
+            cleaned.orEmpty()
+        }
+
+    suspend fun saveCroppedCopyToDownloads(
+        sourcePath: String,
+        originalName: String,
+        rotationDeg: Float,
+        targetAspect: Float?,
+    ): String? = withContext(dispatchers.io) {
+        val decoded = runCatching { BitmapFactory.decodeFile(sourcePath) }.getOrNull() ?: return@withContext null
+        var rotated: Bitmap? = null
+        var cropped: Bitmap? = null
+        try {
+            val normRot = ((rotationDeg % 360f) + 360f) % 360f
+            val base = if (normRot > 0.5f) {
+                val matrix = Matrix().apply { postRotate(normRot) }
+                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
+                    rotated = it
+                }
+            } else {
+                decoded
+            }
+            val resultBmp = if (targetAspect != null && targetAspect > 0f) {
+                val w = base.width
+                val h = base.height
+                val curRatio = w.toFloat() / h.toFloat().coerceAtLeast(1f)
+                val (cropW, cropH) = if (curRatio > targetAspect) {
+                    (h * targetAspect).toInt().coerceIn(1, w) to h
+                } else {
+                    w to (w / targetAspect).toInt().coerceIn(1, h)
+                }
+                val x = ((w - cropW) / 2).coerceAtLeast(0)
+                val y = ((h - cropH) / 2).coerceAtLeast(0)
+                Bitmap.createBitmap(base, x, y, cropW, cropH).also { cropped = it }
+            } else {
+                base
+            }
+
+            val stem = originalName.substringBeforeLast('.', originalName).ifBlank { "photo" }
+            val safeStem = stem.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            val outName = "${safeStem}_edited.jpg"
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, outName)
+                    put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = appContext.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return@withContext null
+                val ok = appContext.contentResolver.openOutputStream(uri)?.use { out ->
+                    resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                } ?: false
+                if (ok) outName else null
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs()
+                val dest = File(dir, outName)
+                val ok = dest.outputStream().use { out ->
+                    resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+                if (ok) outName else null
+            }
+        } catch (t: Throwable) {
+            Log.w("VideoPlayerViewModel: saveCroppedCopy failed", t)
+            null
+        } finally {
+            if (cropped != null && cropped !== rotated && cropped !== decoded) cropped?.recycle()
+            if (rotated != null && rotated !== decoded) rotated?.recycle()
+            decoded.recycle()
+        }
     }
 
     fun savePlaybackPosition(
@@ -356,12 +456,46 @@ class VideoPlayerViewModel @Inject constructor(
                     exposure = parts.joinToString(" · ")
                 }
 
+                var parsedLat = entry?.exifLat
+                var parsedLng = entry?.exifLng
                 val latLong = FloatArray(2)
                 if (exif.getLatLong(latLong)) {
-                    location = "${String.format(Locale.US, "%.5f", latLong[0])}, ${String.format(Locale.US, "%.5f", latLong[1])}"
+                    parsedLat = latLong[0].toDouble()
+                    parsedLng = latLong[1].toDouble()
+                    if (entry != null && entry.exifLat == null && !entry.isLocked && !entry.isEncryptedVault) {
+                        runCatching {
+                            fileCacheDao.updateExifLocation(entry.chatId, entry.messageId, parsedLat, parsedLng)
+                            cloudSyncManager.noteAiIndexChanged(
+                                chatId = entry.chatId,
+                                messageId = entry.messageId,
+                                ocrText = entry.ocrText,
+                                aiTags = entry.aiTags,
+                                exifLat = parsedLat,
+                                exifLng = parsedLng,
+                            )
+                        }
+                    }
+                }
+                if (parsedLat != null && parsedLng != null) {
+                    location = "${String.format(Locale.US, "%.5f", parsedLat)}, ${String.format(Locale.US, "%.5f", parsedLng)}"
                 }
             }
+        } else if (entry?.exifLat != null && entry.exifLng != null) {
+            location = "${String.format(Locale.US, "%.5f", entry.exifLat)}, ${String.format(Locale.US, "%.5f", entry.exifLng)}"
         }
+
+        val finalLat = runCatching {
+            localPath?.takeIf { File(it).isFile }?.let { p ->
+                val arr = FloatArray(2)
+                if (ExifInterface(p).getLatLong(arr)) arr[0].toDouble() else entry?.exifLat
+            } ?: entry?.exifLat
+        }.getOrNull()
+        val finalLng = runCatching {
+            localPath?.takeIf { File(it).isFile }?.let { p ->
+                val arr = FloatArray(2)
+                if (ExifInterface(p).getLatLong(arr)) arr[1].toDouble() else entry?.exifLng
+            } ?: entry?.exifLng
+        }.getOrNull()
 
         ImageExifInfo(
             fileName = entry?.fileName ?: localPath?.let { File(it).name }.orEmpty(),
@@ -372,6 +506,9 @@ class VideoPlayerViewModel @Inject constructor(
             camera = camera,
             exposure = exposure,
             location = location,
+            latitude = finalLat,
+            longitude = finalLng,
+            userNote = entry?.userNote.orEmpty(),
         )
     }
 

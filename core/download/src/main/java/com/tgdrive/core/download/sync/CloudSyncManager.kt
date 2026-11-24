@@ -4,11 +4,14 @@ import android.content.Context
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
+import com.tgdrive.core.db.dao.AlbumDao
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.dao.ZipEntryDao
+import com.tgdrive.core.db.entity.AlbumEntity
+import com.tgdrive.core.db.entity.AlbumItemEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
@@ -48,6 +51,7 @@ class CloudSyncManager @Inject constructor(
     private val zipEntryDao: ZipEntryDao,
     private val trashEntryDao: TrashEntryDao,
     private val syncedFileDao: SyncedFileDao,
+    private val albumDao: AlbumDao,
     private val preferences: AppPreferences,
     private val dispatchers: DispatchersProvider,
 ) {
@@ -66,6 +70,18 @@ class CloudSyncManager @Inject constructor(
     private val localTrashTombstones = ConcurrentHashMap<Pair<Long, Long>, Long>()
     private val localPlaybackTimestamps =
         ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudPlaybackPositionRecord>()
+    private val localVirtualPathTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudVirtualPathRecord>()
+    private val localLockTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudLockRecord>()
+    private val localNoteTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudNoteRecord>()
+    private val localAlbumTimestamps =
+        ConcurrentHashMap<String, CloudSyncCodec.CloudAlbumRecord>()
+    private val localAlbumItemTimestamps =
+        ConcurrentHashMap<Triple<String, Long, Long>, CloudSyncCodec.CloudAlbumItemRecord>()
+    private val localAiTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
 
     private val syncDir: File
         get() = File(ctx.cacheDir, "cloud_sync").apply { mkdirs() }
@@ -104,6 +120,91 @@ class CloudSyncManager @Inject constructor(
             updatedAtMs = System.currentTimeMillis(),
         )
         schedulePushMetadata()
+    }
+
+    fun noteVirtualPathChanged(chatId: Long, messageId: Long, virtualPath: String) {
+        localVirtualPathTimestamps[chatId to messageId] = CloudSyncCodec.CloudVirtualPathRecord(
+            chatId = chatId,
+            messageId = messageId,
+            virtualPath = virtualPath,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteLockChanged(chatId: Long, messageId: Long, isLocked: Boolean) {
+        localLockTimestamps[chatId to messageId] = CloudSyncCodec.CloudLockRecord(
+            chatId = chatId,
+            messageId = messageId,
+            isLocked = isLocked,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteUserNoteChanged(chatId: Long, messageId: Long, note: String?) {
+        localNoteTimestamps[chatId to messageId] = CloudSyncCodec.CloudNoteRecord(
+            chatId = chatId,
+            messageId = messageId,
+            note = note,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteAlbumUpserted(album: AlbumEntity) {
+        localAlbumTimestamps[album.id] = CloudSyncCodec.CloudAlbumRecord(
+            id = album.id,
+            name = album.name,
+            coverChatId = album.coverChatId,
+            coverMessageId = album.coverMessageId,
+            createdAt = album.createdAt,
+            updatedAtMs = maxOf(album.updatedAt, System.currentTimeMillis()),
+            deleted = false,
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteAlbumDeleted(albumId: String) {
+        localAlbumTimestamps[albumId] = CloudSyncCodec.CloudAlbumRecord(
+            id = albumId,
+            name = "",
+            createdAt = 0L,
+            updatedAtMs = System.currentTimeMillis(),
+            deleted = true,
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteAlbumItemChanged(albumId: String, chatId: Long, messageId: Long, added: Boolean) {
+        localAlbumItemTimestamps[Triple(albumId, chatId, messageId)] = CloudSyncCodec.CloudAlbumItemRecord(
+            albumId = albumId,
+            chatId = chatId,
+            messageId = messageId,
+            addedAt = System.currentTimeMillis(),
+            removed = !added,
+        )
+        schedulePushMetadata()
+    }
+
+    fun noteAiIndexChanged(
+        chatId: Long,
+        messageId: Long,
+        ocrText: String?,
+        aiTags: String?,
+        exifLat: Double?,
+        exifLng: Double?,
+    ) {
+        localAiTimestamps[chatId to messageId] = CloudSyncCodec.CloudAiIndexRecord(
+            chatId = chatId,
+            messageId = messageId,
+            ocrText = ocrText,
+            aiTags = aiTags,
+            exifLat = exifLat,
+            exifLng = exifLng,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushSearchIndex()
     }
 
     fun schedulePushMetadata() {
@@ -361,6 +462,53 @@ class CloudSyncManager @Inject constructor(
             playbackPositions[key] = rec
         }
 
+        val virtualPaths = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudVirtualPathRecord>()
+        files.filter { it.virtualPath.isNotEmpty() }.forEach { f ->
+            val key = f.chatId to f.messageId
+            virtualPaths[key] = localVirtualPathTimestamps[key]
+                ?: CloudSyncCodec.CloudVirtualPathRecord(f.chatId, f.messageId, f.virtualPath, f.date)
+        }
+        localVirtualPathTimestamps.forEach { (key, rec) -> virtualPaths[key] = rec }
+
+        val lockedFlags = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudLockRecord>()
+        files.filter { it.isLocked }.forEach { f ->
+            val key = f.chatId to f.messageId
+            lockedFlags[key] = localLockTimestamps[key]
+                ?: CloudSyncCodec.CloudLockRecord(f.chatId, f.messageId, true, f.date)
+        }
+        localLockTimestamps.forEach { (key, rec) -> lockedFlags[key] = rec }
+
+        val notes = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudNoteRecord>()
+        files.filter { !it.userNote.isNullOrBlank() }.forEach { f ->
+            val key = f.chatId to f.messageId
+            notes[key] = localNoteTimestamps[key]
+                ?: CloudSyncCodec.CloudNoteRecord(f.chatId, f.messageId, f.userNote, f.date)
+        }
+        localNoteTimestamps.forEach { (key, rec) -> notes[key] = rec }
+
+        val albumsMap = LinkedHashMap<String, CloudSyncCodec.CloudAlbumRecord>()
+        albumDao.getAll().forEach { a ->
+            albumsMap[a.id] = localAlbumTimestamps[a.id]
+                ?: CloudSyncCodec.CloudAlbumRecord(
+                    id = a.id,
+                    name = a.name,
+                    coverChatId = a.coverChatId,
+                    coverMessageId = a.coverMessageId,
+                    createdAt = a.createdAt,
+                    updatedAtMs = a.updatedAt,
+                    deleted = false,
+                )
+        }
+        localAlbumTimestamps.forEach { (id, rec) -> albumsMap[id] = rec }
+
+        val albumItemsMap = LinkedHashMap<Triple<String, Long, Long>, CloudSyncCodec.CloudAlbumItemRecord>()
+        albumDao.getAllItems().forEach { itx ->
+            val key = Triple(itx.albumId, itx.chatId, itx.messageId)
+            albumItemsMap[key] = localAlbumItemTimestamps[key]
+                ?: CloudSyncCodec.CloudAlbumItemRecord(itx.albumId, itx.chatId, itx.messageId, itx.addedAt, false)
+        }
+        localAlbumItemTimestamps.forEach { (key, rec) -> albumItemsMap[key] = rec }
+
         return CloudSyncCodec.CloudMetaSnapshot(
             version = 1,
             updatedAtMs = now,
@@ -370,6 +518,11 @@ class CloudSyncManager @Inject constructor(
             trash = trash,
             syncedFiles = synced,
             playbackPositions = playbackPositions.values.toList(),
+            virtualPaths = virtualPaths.values.toList(),
+            lockedFlags = lockedFlags.values.toList(),
+            notes = notes.values.toList(),
+            albums = albumsMap.values.toList(),
+            albumItems = albumItemsMap.values.toList(),
         )
     }
 
@@ -386,10 +539,28 @@ class CloudSyncManager @Inject constructor(
                 indexedAt = e.indexedAt,
             )
         }
+        val aiEntries = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
+        fileCacheDao.getAll().forEach { f ->
+            if (f.ocrText != null || f.aiTags != null || f.exifLat != null || f.exifLng != null) {
+                val key = f.chatId to f.messageId
+                aiEntries[key] = localAiTimestamps[key]
+                    ?: CloudSyncCodec.CloudAiIndexRecord(
+                        chatId = f.chatId,
+                        messageId = f.messageId,
+                        ocrText = f.ocrText,
+                        aiTags = f.aiTags,
+                        exifLat = f.exifLat,
+                        exifLng = f.exifLng,
+                        updatedAtMs = maxOf(f.date, f.lastAccessed),
+                    )
+            }
+        }
+        localAiTimestamps.forEach { (key, rec) -> aiEntries[key] = rec }
         return CloudSyncCodec.CloudSearchIndexSnapshot(
             version = 1,
             updatedAtMs = System.currentTimeMillis(),
             zipEntries = entries,
+            aiEntries = aiEntries.values.toList(),
         )
     }
 
@@ -470,24 +641,106 @@ class CloudSyncManager @Inject constructor(
                 runCatching { fileCacheDao.updatePlaybackPosition(pos.chatId, pos.messageId, pos.positionMs) }
             }
         }
+
+        merged.virtualPaths.forEach { vp ->
+            localVirtualPathTimestamps[vp.chatId to vp.messageId] = vp
+            val local = existingByKey[vp.chatId to vp.messageId]
+            if (local != null && local.virtualPath != vp.virtualPath) {
+                runCatching { fileCacheDao.updateVirtualPath(vp.chatId, vp.messageId, vp.virtualPath) }
+            }
+        }
+
+        merged.lockedFlags.forEach { lk ->
+            localLockTimestamps[lk.chatId to lk.messageId] = lk
+            val local = existingByKey[lk.chatId to lk.messageId]
+            if (local != null && local.isLocked != lk.isLocked) {
+                runCatching { fileCacheDao.setLocked(lk.chatId, lk.messageId, lk.isLocked) }
+            }
+        }
+
+        merged.notes.forEach { nt ->
+            localNoteTimestamps[nt.chatId to nt.messageId] = nt
+            val local = existingByKey[nt.chatId to nt.messageId]
+            if (local != null && local.userNote != nt.note) {
+                runCatching { fileCacheDao.updateUserNote(nt.chatId, nt.messageId, nt.note) }
+            }
+        }
+
+        val activeAlbumIds = HashSet<String>()
+        merged.albums.forEach { al ->
+            localAlbumTimestamps[al.id] = al
+            if (al.deleted) {
+                runCatching { albumDao.deleteById(al.id) }
+            } else {
+                activeAlbumIds += al.id
+                runCatching {
+                    albumDao.upsert(
+                        AlbumEntity(
+                            id = al.id,
+                            name = al.name,
+                            coverChatId = al.coverChatId,
+                            coverMessageId = al.coverMessageId,
+                            createdAt = al.createdAt,
+                            updatedAt = al.updatedAtMs,
+                        ),
+                    )
+                }
+            }
+        }
+
+        merged.albumItems.forEach { item ->
+            localAlbumItemTimestamps[Triple(item.albumId, item.chatId, item.messageId)] = item
+            if (item.removed) {
+                runCatching { albumDao.removeItem(item.albumId, item.chatId, item.messageId) }
+            } else if (item.albumId in activeAlbumIds || albumDao.getById(item.albumId) != null) {
+                runCatching {
+                    albumDao.addItem(
+                        AlbumItemEntity(
+                            albumId = item.albumId,
+                            chatId = item.chatId,
+                            messageId = item.messageId,
+                            addedAt = item.addedAt,
+                        ),
+                    )
+                }
+            }
+        }
     }
 
     private suspend fun applyMergedSearchIndex(merged: CloudSyncCodec.CloudSearchIndexSnapshot) {
-        if (merged.zipEntries.isEmpty()) return
-        val entities = merged.zipEntries.map { e ->
-            ZipEntryEntity(
-                chatId = e.chatId,
-                zipMessageId = e.zipMessageId,
-                zipFileName = e.zipFileName,
-                entryPath = e.entryPath,
-                entryName = e.entryName,
-                entrySize = e.entrySize,
-                isEncrypted = e.isEncrypted,
-                indexedAt = e.indexedAt,
-            )
+        if (merged.zipEntries.isNotEmpty()) {
+            val entities = merged.zipEntries.map { e ->
+                ZipEntryEntity(
+                    chatId = e.chatId,
+                    zipMessageId = e.zipMessageId,
+                    zipFileName = e.zipFileName,
+                    entryPath = e.entryPath,
+                    entryName = e.entryName,
+                    entrySize = e.entrySize,
+                    isEncrypted = e.isEncrypted,
+                    indexedAt = e.indexedAt,
+                )
+            }
+            entities.chunked(250).forEach { batch ->
+                runCatching { zipEntryDao.upsertAll(batch) }
+            }
         }
-        entities.chunked(250).forEach { batch ->
-            runCatching { zipEntryDao.upsertAll(batch) }
+        if (merged.aiEntries.isNotEmpty()) {
+            val existingByKey = fileCacheDao.getAll().associateBy { it.chatId to it.messageId }
+            merged.aiEntries.forEach { ai ->
+                localAiTimestamps[ai.chatId to ai.messageId] = ai
+                val local = existingByKey[ai.chatId to ai.messageId]
+                if (local != null) {
+                    if (local.ocrText != ai.ocrText || local.aiTags != ai.aiTags) {
+                        runCatching { fileCacheDao.updateAiIndex(ai.chatId, ai.messageId, ai.ocrText, ai.aiTags) }
+                    }
+                    if ((ai.exifLat != null && ai.exifLng != null) &&
+                        (local.exifLat != ai.exifLat || local.exifLng != ai.exifLng)
+                    ) {
+                        runCatching { fileCacheDao.updateExifLocation(ai.chatId, ai.messageId, ai.exifLat, ai.exifLng) }
+                    }
+                }
+            }
         }
     }
 

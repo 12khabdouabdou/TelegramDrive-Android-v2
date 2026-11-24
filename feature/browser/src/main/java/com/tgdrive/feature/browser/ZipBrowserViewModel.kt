@@ -10,8 +10,10 @@ import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.index.ZipIndexService
@@ -25,6 +27,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -49,6 +53,10 @@ data class ZipBrowserUiState(
     val extractingAll: Boolean = false,
     val statusMessage: String? = null,
     val hasSavedBackupPassphrase: Boolean = false,
+    val splitPartsTotal: Int = 0,
+    val splitPartsDownloaded: Int = 0,
+    val reassemblingSplit: Boolean = false,
+    val splitMergedPath: String? = null,
 )
 
 @HiltViewModel
@@ -74,27 +82,51 @@ class ZipBrowserViewModel
 
         private var currentZipPath: String? = null
         private var currentZipName: String = ""
+        private var currentChatId: Long = 0L
+        private var currentMessageId: Long = 0L
+        private var detectedSplitSiblings: List<FileCacheEntity> = emptyList()
         private var cachedPassword: String? = null
         private var isVaultHinted: Boolean = false
 
         fun hasCachedPassword(): Boolean = cachedPassword != null
 
         fun ensureArchiveQueued(chatId: Long, messageId: Long) {
+            currentChatId = chatId
+            currentMessageId = messageId
             if (chatId != 0L) {
                 val pinned = offlinePinStore.getPinnedFilePathSync(chatId, messageId)
                     ?.takeIf { File(it).isFile }
                 if (pinned != null) {
                     _state.update { it.copy(resolvedLocalPath = pinned) }
+                    viewModelScope.launch(dispatchers.io) {
+                        val cached = runCatching { fileCacheDao.getById(chatId, messageId) }.getOrNull()
+                        if (cached != null) refreshSplitPartsState(cached.chatId, cached.fileName)
+                    }
                     return
                 }
             }
-            if (downloadManager.findItem(chatId, messageId) != null) return
+            if (downloadManager.findItem(chatId, messageId) != null) {
+                viewModelScope.launch(dispatchers.io) {
+                    val cached = if (chatId != 0L) {
+                        runCatching { fileCacheDao.getById(chatId, messageId) }.getOrNull()
+                    } else {
+                        runCatching { fileCacheDao.getAllZips().firstOrNull { it.messageId == messageId } }.getOrNull()
+                    }
+                    if (cached != null) {
+                        currentChatId = cached.chatId
+                        refreshSplitPartsState(cached.chatId, cached.fileName)
+                    }
+                }
+                return
+            }
             viewModelScope.launch(dispatchers.io) {
                 val cached = if (chatId != 0L) {
                     runCatching { fileCacheDao.getById(chatId, messageId) }.getOrNull()
                 } else {
                     runCatching { fileCacheDao.getAllZips().firstOrNull { it.messageId == messageId } }.getOrNull()
                 } ?: return@launch
+                currentChatId = cached.chatId
+                refreshSplitPartsState(cached.chatId, cached.fileName)
                 offlinePinStore.getPinnedFilePathSync(cached.chatId, cached.messageId)
                     ?.takeIf { File(it).isFile }
                     ?.let { pinned ->
@@ -127,17 +159,32 @@ class ZipBrowserViewModel
             }
             currentZipPath = zipPath
             currentZipName = zipFileName.ifBlank { File(zipPath).name }
+            if (chatId != 0L) currentChatId = chatId
+            if (messageId != 0L) currentMessageId = messageId
             viewModelScope.launch(dispatchers.io) {
                 _state.update { it.copy(loading = true, error = null) }
                 try {
                     val entries = zipLister.listEntries(zipPath)
-                    if (chatId != 0L && messageId != 0L) {
-                        val cachedRow = runCatching { fileCacheDao.getById(chatId, messageId) }.getOrNull()
+                    val resolvedChatId = if (chatId != 0L) {
+                        chatId
+                    } else if (messageId != 0L) {
+                        runCatching {
+                            fileCacheDao.getAllZips().firstOrNull { it.messageId == messageId }?.chatId
+                        }.getOrNull() ?: 0L
+                    } else {
+                        0L
+                    }
+                    if (resolvedChatId != 0L) {
+                        currentChatId = resolvedChatId
+                        refreshSplitPartsState(resolvedChatId, currentZipName)
+                    }
+                    if (resolvedChatId != 0L && messageId != 0L) {
+                        val cachedRow = runCatching { fileCacheDao.getById(resolvedChatId, messageId) }.getOrNull()
                         isVaultHinted = cachedRow?.isEncryptedVault == true
                         if (entries.isNotEmpty()) {
                             val safeTitle = zipFileName.ifBlank { File(zipPath).name }
                             runCatching {
-                                zipIndexService.indexLocalEntries(chatId, messageId, safeTitle, entries)
+                                zipIndexService.indexLocalEntries(resolvedChatId, messageId, safeTitle, entries)
                             }
                         }
                     }
@@ -156,6 +203,183 @@ class ZipBrowserViewModel
                 } catch (t: Throwable) {
                     Log.w("ZipBrowser: load failed", t)
                     _state.update { it.copy(loading = false, error = t.message ?: "Failed to read ZIP") }
+                }
+            }
+        }
+
+        private suspend fun refreshSplitPartsState(chatId: Long, zipFileName: String) {
+            if (chatId == 0L || !zipFileName.endsWith(".zip", ignoreCase = true)) {
+                detectedSplitSiblings = emptyList()
+                _state.update { it.copy(splitPartsTotal = 0, splitPartsDownloaded = 0) }
+                return
+            }
+            val stem = zipFileName.substringBeforeLast('.')
+            val volumeRegex = Regex("^${Regex.escape(stem)}\\.z(\\d+)$", RegexOption.IGNORE_CASE)
+            val siblings = runCatching { fileCacheDao.forChat(chatId) }
+                .getOrDefault(emptyList())
+                .mapNotNull { entity ->
+                    val match = volumeRegex.matchEntire(entity.fileName) ?: return@mapNotNull null
+                    val partNum = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+                    partNum to entity
+                }
+                .sortedBy { it.first }
+                .map { it.second }
+            detectedSplitSiblings = siblings
+            if (siblings.isEmpty()) {
+                _state.update { it.copy(splitPartsTotal = 0, splitPartsDownloaded = 0) }
+                return
+            }
+            val readySiblings = siblings.count { resolveReadyLocalFile(it.chatId, it.messageId) != null }
+            val mainReady = currentZipPath?.let { File(it).isFile } == true ||
+                (currentMessageId != 0L && resolveReadyLocalFile(chatId, currentMessageId) != null)
+            _state.update {
+                it.copy(
+                    splitPartsTotal = siblings.size + 1,
+                    splitPartsDownloaded = readySiblings + if (mainReady) 1 else 0,
+                )
+            }
+        }
+
+        private fun resolveReadyLocalFile(chatId: Long, messageId: Long): File? {
+            if (chatId != 0L) {
+                offlinePinStore.getPinnedFilePathSync(chatId, messageId)?.let { pinned ->
+                    val f = File(pinned)
+                    if (f.isFile && f.length() > 0L) return f
+                }
+            }
+            return downloadManager.findItem(chatId, messageId)
+                ?.takeIf { it.status == DownloadStatus.DONE }
+                ?.localPath
+                ?.let(::File)
+                ?.takeIf { it.isFile && it.length() > 0L }
+        }
+
+        fun downloadAndReassembleSplitArchive(password: String? = null) {
+            val zipPath = currentZipPath ?: return
+            val siblings = detectedSplitSiblings
+            if (siblings.isEmpty() || _state.value.reassemblingSplit) return
+
+            viewModelScope.launch(dispatchers.io) {
+                val totalParts = siblings.size + 1
+                _state.update {
+                    it.copy(
+                        reassemblingSplit = true,
+                        splitPartsTotal = totalParts,
+                        error = null,
+                    )
+                }
+                val stem = currentZipName.substringBeforeLast('.', currentZipName)
+                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    .ifBlank { "archive" }
+                val stageDir = File(appContext.cacheDir, "split_stage/$stem").apply {
+                    deleteRecursively()
+                    mkdirs()
+                }
+                try {
+                    val mainZipFile = File(zipPath)
+                    if (!mainZipFile.isFile) {
+                        _state.update { it.copy(reassemblingSplit = false, error = "Entry ZIP file not downloaded yet") }
+                        return@launch
+                    }
+
+                    val readyVolumes = ArrayList<Pair<FileCacheEntity, File>>(siblings.size)
+                    for ((idx, part) in siblings.withIndex()) {
+                        var localPart = resolveReadyLocalFile(part.chatId, part.messageId)
+                        if (localPart == null && part.remoteId.isNotEmpty()) {
+                            downloadManager.enqueue(
+                                DownloadItem(
+                                    id = part.messageId,
+                                    chatId = part.chatId,
+                                    remoteId = part.remoteId,
+                                    fileName = part.fileName,
+                                    totalBytes = part.fileSize,
+                                ),
+                            )
+                            val terminal = downloadManager.state
+                                .map { st ->
+                                    st.items.find {
+                                        it.id == part.messageId && (it.chatId == 0L || it.chatId == part.chatId)
+                                    }
+                                }
+                                .first { dl ->
+                                    dl == null ||
+                                        dl.status == DownloadStatus.DONE ||
+                                        dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.CANCELLED
+                                }
+                            if (terminal?.status == DownloadStatus.DONE) {
+                                localPart = terminal.localPath?.let(::File)?.takeIf { it.isFile }
+                            }
+                        }
+                        if (localPart == null) {
+                            _state.update {
+                                it.copy(
+                                    reassemblingSplit = false,
+                                    error = "Missing volume ${part.fileName}",
+                                )
+                            }
+                            return@launch
+                        }
+                        readyVolumes.add(part to localPart)
+                        _state.update { it.copy(splitPartsDownloaded = idx + 2) }
+                    }
+
+                    for ((part, file) in readyVolumes) {
+                        file.copyTo(File(stageDir, part.fileName), overwrite = true)
+                    }
+                    val stagedEntryName = currentZipName.ifBlank { mainZipFile.name }
+                    val stagedEntryZip = File(stageDir, stagedEntryName)
+                    mainZipFile.copyTo(stagedEntryZip, overwrite = true)
+
+                    val mergedDir = File(appContext.cacheDir, "split_merged").apply { mkdirs() }
+                    val mergedOut = File(mergedDir, "merged_$stagedEntryName")
+                    val ok = ZipUploader.mergeSplitZip(stagedEntryZip, mergedOut, password ?: cachedPassword)
+                    if (!ok || !mergedOut.isFile) {
+                        _state.update {
+                            it.copy(
+                                reassemblingSplit = false,
+                                error = "Could not merge split archive volumes",
+                            )
+                        }
+                        return@launch
+                    }
+
+                    val mergedEntries = zipLister.listEntries(mergedOut.absolutePath)
+                    currentZipPath = mergedOut.absolutePath
+                    if (currentChatId != 0L && currentMessageId != 0L && mergedEntries.isNotEmpty()) {
+                        runCatching {
+                            zipIndexService.indexLocalEntries(
+                                currentChatId,
+                                currentMessageId,
+                                stagedEntryName,
+                                mergedEntries,
+                            )
+                        }
+                    }
+                    _state.update {
+                        it.copy(
+                            entries = mergedEntries,
+                            zipReady = true,
+                            reassemblingSplit = false,
+                            splitMergedPath = mergedOut.absolutePath,
+                            resolvedLocalPath = mergedOut.absolutePath,
+                            passwordRequired = mergedEntries.any { e -> e.isEncrypted },
+                            statusMessage = appContext.getString(R.string.zip_split_merged_done, totalParts),
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    _state.update { it.copy(reassemblingSplit = false) }
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("ZipBrowserVM: split merge failed", t)
+                    _state.update {
+                        it.copy(
+                            reassemblingSplit = false,
+                            error = t.message ?: "Failed to merge split archive",
+                        )
+                    }
+                } finally {
+                    runCatching { stageDir.deleteRecursively() }
                 }
             }
         }
@@ -486,6 +710,8 @@ class ZipBrowserViewModel
             super.onCleared()
             try {
                 File(appContext.cacheDir, "zip_extracts").deleteRecursively()
+                File(appContext.cacheDir, "split_stage").deleteRecursively()
+                File(appContext.cacheDir, "split_merged").deleteRecursively()
             } catch (_: Throwable) {}
         }
     }

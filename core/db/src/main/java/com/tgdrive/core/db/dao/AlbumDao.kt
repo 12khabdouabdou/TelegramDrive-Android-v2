@@ -33,6 +33,9 @@ interface AlbumDao {
     fun observeItems(albumId: String): Flow<List<AlbumItemEntity>>
 
     @Query("SELECT * FROM album_items ORDER BY added_at DESC")
+    fun observeAllItems(): Flow<List<AlbumItemEntity>>
+
+    @Query("SELECT * FROM album_items ORDER BY added_at DESC")
     suspend fun getAllItems(): List<AlbumItemEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

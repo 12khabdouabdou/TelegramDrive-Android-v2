@@ -90,4 +90,79 @@ class CloudSyncCodecTest {
         assertThat(updated.entrySize).isEqualTo(20L)
         assertThat(updated.isEncrypted).isTrue()
     }
+
+    @Test
+    fun `wave2 metadata and ai search index round trip and merge by LWW`() {
+        val snap = CloudSyncCodec.CloudMetaSnapshot(
+            updatedAtMs = 1000L,
+            virtualPaths = listOf(
+                CloudSyncCodec.CloudVirtualPathRecord(10L, 1L, "Work/Receipts", 500L),
+            ),
+            lockedFlags = listOf(
+                CloudSyncCodec.CloudLockRecord(10L, 2L, isLocked = true, updatedAtMs = 500L),
+            ),
+            notes = listOf(
+                CloudSyncCodec.CloudNoteRecord(10L, 1L, "Tax deductible \"2026\"\ncheck", 500L),
+            ),
+            albums = listOf(
+                CloudSyncCodec.CloudAlbumRecord("alb-1", "Trip", 10L, 3L, createdAt = 400L, updatedAtMs = 500L, deleted = false),
+            ),
+            albumItems = listOf(
+                CloudSyncCodec.CloudAlbumItemRecord("alb-1", 10L, 3L, addedAt = 500L, removed = false),
+            ),
+        )
+        val decoded = CloudSyncCodec.decodeMetaGzip(CloudSyncCodec.encodeMetaGzip(snap))
+        assertThat(decoded).isNotNull()
+        assertThat(decoded!!.virtualPaths.single().virtualPath).isEqualTo("Work/Receipts")
+        assertThat(decoded.lockedFlags.single().isLocked).isTrue()
+        assertThat(decoded.notes.single().note).contains("Tax deductible")
+        assertThat(decoded.albums.single().name).isEqualTo("Trip")
+        assertThat(decoded.albumItems.single().albumId).isEqualTo("alb-1")
+
+        val newer = snap.copy(
+            updatedAtMs = 2000L,
+            virtualPaths = listOf(
+                CloudSyncCodec.CloudVirtualPathRecord(10L, 1L, "Work/Archive", 900L),
+            ),
+            lockedFlags = listOf(
+                CloudSyncCodec.CloudLockRecord(10L, 2L, isLocked = false, updatedAtMs = 900L),
+            ),
+            notes = listOf(
+                CloudSyncCodec.CloudNoteRecord(10L, 1L, "Updated note", 900L),
+            ),
+            albums = listOf(
+                CloudSyncCodec.CloudAlbumRecord("alb-1", "Trip", 10L, 3L, createdAt = 400L, updatedAtMs = 900L, deleted = true),
+            ),
+            albumItems = listOf(
+                CloudSyncCodec.CloudAlbumItemRecord("alb-1", 10L, 3L, addedAt = 900L, removed = true),
+            ),
+        )
+        val mergedMeta = CloudSyncCodec.mergeMeta(snap, newer)
+        assertThat(mergedMeta.virtualPaths.single().virtualPath).isEqualTo("Work/Archive")
+        assertThat(mergedMeta.lockedFlags.single().isLocked).isFalse()
+        assertThat(mergedMeta.notes.single().note).isEqualTo("Updated note")
+        assertThat(mergedMeta.albums.single().deleted).isTrue()
+        assertThat(mergedMeta.albumItems.single().removed).isTrue()
+
+        val aiLocal = CloudSyncCodec.CloudSearchIndexSnapshot(
+            updatedAtMs = 100L,
+            aiEntries = listOf(
+                CloudSyncCodec.CloudAiIndexRecord(10L, 1L, "INVOICE TOTAL $42", "Document, Paper", 36.75, 3.05, 100L),
+            ),
+        )
+        val aiRemote = CloudSyncCodec.CloudSearchIndexSnapshot(
+            updatedAtMs = 200L,
+            aiEntries = listOf(
+                CloudSyncCodec.CloudAiIndexRecord(10L, 1L, "INVOICE TOTAL $99", "Document, Receipt", 36.75, 3.05, 250L),
+                CloudSyncCodec.CloudAiIndexRecord(10L, 5L, null, "Beach, Ocean", 41.38, 2.17, 250L),
+            ),
+        )
+        val decodedSearch = CloudSyncCodec.decodeSearchIndexGzip(CloudSyncCodec.encodeSearchIndexGzip(aiRemote))
+        assertThat(decodedSearch?.aiEntries).hasSize(2)
+        val mergedSearch = CloudSyncCodec.mergeSearchIndex(aiLocal, aiRemote)
+        assertThat(mergedSearch.aiEntries).hasSize(2)
+        val updatedAi = mergedSearch.aiEntries.first { it.messageId == 1L }
+        assertThat(updatedAi.ocrText).contains("$99")
+        assertThat(updatedAi.exifLat).isWithin(0.001).of(36.75)
+    }
 }

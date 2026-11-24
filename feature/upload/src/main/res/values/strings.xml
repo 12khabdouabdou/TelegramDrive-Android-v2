@@ -55,4 +55,23 @@
     <string name="decrypt_action_save">Save to Downloads</string>
     <string name="upload_wifi_only_title">Upload over Wi-Fi only</string>
     <string name="upload_wifi_only_desc">Pause on mobile data and auto-resume on Wi-Fi</string>
+    <string name="upload_crop_title">Crop &amp; rotate image</string>
+    <string name="upload_crop_action">Edit image</string>
+    <string name="upload_crop_rotate_left">Rotate -90°</string>
+    <string name="upload_crop_rotate_right">Rotate +90°</string>
+    <string name="upload_crop_original">Original</string>
+    <string name="upload_crop_apply">Apply</string>
+    <string name="upload_crop_saving">Saving…</string>
+    <string name="upload_scan_title">Scan document to PDF</string>
+    <string name="upload_scan_camera">Camera page</string>
+    <string name="upload_scan_gallery">From gallery</string>
+    <string name="upload_scan_enhance">High-contrast B&amp;W scan filter</string>
+    <string name="upload_scan_enhance_desc">Boost ink sharpness and remove paper shadows</string>
+    <string name="upload_scan_name_label">PDF file name</string>
+    <string name="upload_scan_pages_empty">Capture with camera or add images to build a multi-page PDF.</string>
+    <string name="upload_scan_page_label">Page %1$d</string>
+    <string name="upload_scan_create">Create PDF</string>
+    <string name="upload_scan_creating">Building PDF…</string>
+    <string name="upload_scan_no_camera">No camera app available on this device</string>
+    <string name="upload_scan_failed">Could not generate PDF</string>
 </resources>

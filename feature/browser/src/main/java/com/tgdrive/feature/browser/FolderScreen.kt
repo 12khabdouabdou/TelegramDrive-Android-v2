@@ -9,6 +9,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -45,11 +46,14 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Image
@@ -150,6 +154,7 @@ import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.upload.DecryptFileDialog
+import com.tgdrive.feature.upload.DocumentScannerDialog
 import com.tgdrive.feature.upload.FileUploadReviewDialog
 import com.tgdrive.feature.upload.ZipUploadOptionsDialog
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -201,6 +206,7 @@ fun FolderScreen(
     var zipPartCapDraft by remember { mutableStateOf<Long?>(null) }
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
     var showBatchDecryptDialog by remember { mutableStateOf(false) }
+    var showScannerDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(snackbarEvent?.id) {
         val ev = snackbarEvent ?: return@LaunchedEffect
@@ -258,12 +264,15 @@ fun FolderScreen(
         }
     }
 
-    BackHandler(enabled = selectionMode || searchOpen) {
+    BackHandler(enabled = selectionMode || searchOpen || state.currentVirtualPath.isNotEmpty()) {
         when {
             selectionMode -> vm.clearSelection()
             searchOpen -> {
                 searchOpen = false
                 vm.setSearch("")
+            }
+            state.currentVirtualPath.isNotEmpty() -> {
+                vm.navigateUpVirtualFolder()
             }
         }
     }
@@ -519,6 +528,14 @@ fun FolderScreen(
                             leadingIcon = { Icon(Icons.Filled.InsertDriveFile, contentDescription = null) },
                         )
                         DropdownMenuItem(
+                            text = { Text(stringResource(R.string.browser_scan_document)) },
+                            onClick = {
+                                showUploadMenu = false
+                                showScannerDialog = true
+                            },
+                            leadingIcon = { Icon(Icons.Filled.DocumentScanner, contentDescription = null) },
+                        )
+                        DropdownMenuItem(
                             text = { Text(stringResource(R.string.browser_upload_folder)) },
                             onClick = {
                                 showUploadMenu = false
@@ -615,12 +632,27 @@ fun FolderScreen(
                 FilterChipsRow(current = state.fileFilter, onPick = vm::setFileFilter)
             }
 
+            if (state.currentVirtualPath.isNotEmpty()) {
+                VirtualBreadcrumbBar(
+                    virtualPath = state.currentVirtualPath,
+                    onNavigate = vm::openVirtualFolder,
+                )
+            }
+
+            if (state.childVirtualFolders.isNotEmpty()) {
+                VirtualSubfoldersRow(
+                    currentVirtualPath = state.currentVirtualPath,
+                    subfolders = state.childVirtualFolders,
+                    onOpenSubfolder = vm::openVirtualFolder,
+                )
+            }
+
             PullToRefreshBox(
                 isRefreshing = state.refreshing,
                 onRefresh = { vm.refresh() },
                 modifier = Modifier.weight(1f),
             ) {
-                if (state.items.isEmpty() && !state.refreshing) {
+                if (state.items.isEmpty() && state.childVirtualFolders.isEmpty() && !state.refreshing) {
                     val hasFilter = state.search.isNotBlank() || state.fileFilter != FileFilter.ALL
                     Box(
                         modifier = Modifier
@@ -722,6 +754,16 @@ fun FolderScreen(
         }
     }
 
+    if (showScannerDialog) {
+        DocumentScannerDialog(
+            onDismiss = { showScannerDialog = false },
+            onPdfReady = { pdfUri ->
+                showScannerDialog = false
+                vm.prepareFileUploadReview(listOf(pdfUri))
+            },
+        )
+    }
+
     if (state.pendingReviewFiles.isNotEmpty()) {
         FileUploadReviewDialog(
             initialFiles = state.pendingReviewFiles,
@@ -820,6 +862,8 @@ fun FolderScreen(
             onTogglePinOffline = { vm.togglePinOffline(item) },
             onShareLink = if (isSavedMessages) null else ({ vm.shareLink(item) }),
             onDecrypt = if (isEncryptedTgenc) ({ vm.startDecryptFlow(item) }) else null,
+            onSaveNote = { note -> vm.updateUserNote(item, note) },
+            onToggleLock = { vm.setItemLocked(item, !item.isLocked) },
             onDismiss = { detailsItem = null },
         )
     }
@@ -1748,11 +1792,7 @@ private fun handleFileTap(
             onOpenText(item.chatId, messageId)
         }
         bucket == FileBucket.AUDIO -> {
-            if (localPath == null) {
-                vm.downloadAndPlayAudio(item)
-            } else {
-                vm.audioPlayerController.playAudio(localPath, item.fileName)
-            }
+            vm.playAudioFromFolder(item)
         }
         localPath != null -> {
             try {
@@ -1825,6 +1865,99 @@ private fun FilterChipsRow(
                 ),
                 border = null,
             )
+        }
+    }
+}
+
+@Composable
+private fun VirtualBreadcrumbBar(
+    virtualPath: String,
+    onNavigate: (String) -> Unit,
+) {
+    val segments = virtualPath.split('/').filter { it.isNotEmpty() }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        TextButton(
+            onClick = { onNavigate("") },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            Text(stringResource(R.string.browser_root_folder), fontWeight = FontWeight.SemiBold)
+        }
+        var cumulative = ""
+        for ((idx, seg) in segments.withIndex()) {
+            cumulative = if (cumulative.isEmpty()) seg else "$cumulative/$seg"
+            val targetPath = cumulative
+            val isLast = idx == segments.lastIndex
+            Icon(
+                Icons.Filled.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+            TextButton(
+                onClick = { if (!isLast) onNavigate(targetPath) },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = seg,
+                    fontWeight = if (isLast) FontWeight.Bold else FontWeight.Medium,
+                    color = if (isLast) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VirtualSubfoldersRow(
+    currentVirtualPath: String,
+    subfolders: List<Pair<String, Int>>,
+    onOpenSubfolder: (String) -> Unit,
+) {
+    LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        items(subfolders, key = { it.first }) { (name, count) ->
+            val target = if (currentVirtualPath.isEmpty()) name else "$currentVirtualPath/$name"
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    .clickable { onOpenSubfolder(target) }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Folder,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(18.dp),
+                )
+                Column {
+                    Text(
+                        text = name,
+                        style = TgTypography.Display.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = stringResource(R.string.browser_subfolder_items, count),
+                        style = TgTypography.Caption,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }

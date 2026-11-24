@@ -121,6 +121,10 @@ fun RootNavHost(
                     onOpenLocalText = openLocalText,
                     onPlayLocalAudio = playLocalAudio,
                     onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
+                    onOpenTimelineImage = { chatId, msgId, albumId ->
+                        val encodedAlbum = albumId?.let { Uri.encode(it) }.orEmpty()
+                        nav.navigate("image/$msgId?chatId=$chatId&timeline=true&albumId=$encodedAlbum")
+                    },
                     onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
                     onOpenZipEntry = { chatId, zipMsgId, entryPath ->
@@ -261,6 +265,10 @@ fun RootNavHost(
                 VaultScreen(
                     onBack = { nav.popBackStack() },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
+                    onOpenVideo = { chatId, msgId -> nav.navigate("video/$msgId?chatId=$chatId") },
+                    onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
+                    onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
+                    onOpenText = { chatId, msgId -> nav.navigate("text/$msgId?chatId=$chatId") },
                     onOpenLocalVideo = openLocalVideo,
                     onOpenLocalPdf = openLocalPdf,
                     onOpenLocalText = openLocalText,
@@ -277,20 +285,32 @@ fun RootNavHost(
             }
 
             composable(
-                "image/{msgId}?chatId={chatId}",
+                "image/{msgId}?chatId={chatId}&timeline={timeline}&albumId={albumId}",
                 arguments = listOf(
                     navArgument("msgId") { type = NavType.LongType },
                     navArgument("chatId") {
                         type = NavType.LongType
                         defaultValue = 0L
                     },
+                    navArgument("timeline") {
+                        type = NavType.BoolType
+                        defaultValue = false
+                    },
+                    navArgument("albumId") {
+                        type = NavType.StringType
+                        defaultValue = ""
+                    },
                 ),
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
                 val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                val timeline = entry.arguments?.getBoolean("timeline") ?: false
+                val albumId = Uri.decode(entry.arguments?.getString("albumId").orEmpty())
                 ImagePlayerScreen(
                     messageId = msgId,
                     chatId = chatId,
+                    timeline = timeline,
+                    albumId = albumId,
                     onOpenVideo = { vChatId, vMsgId -> nav.navigate("video/$vMsgId?chatId=$vChatId") },
                     onBack = { nav.popBackStack() },
                 )

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.OfflinePin
@@ -33,13 +34,19 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -72,6 +79,8 @@ fun FileDetailsSheet(
     onTogglePinOffline: (() -> Unit)? = null,
     onShareLink: (() -> Unit)? = null,
     onDecrypt: (() -> Unit)? = null,
+    onSaveNote: ((String) -> Unit)? = null,
+    onToggleLock: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -162,6 +171,35 @@ fun FileDetailsSheet(
                     value = item.remoteId.take(16) + "…",
                 )
             }
+            if (item.virtualPath.isNotBlank()) {
+                EditorialKeyValueRow(
+                    label = stringResource(R.string.details_virtual_folder),
+                    value = item.virtualPath,
+                )
+            }
+
+            if (onSaveNote != null) {
+                var noteDraft by remember(item.chatId, item.messageId, item.userNote) {
+                    mutableStateOf(item.userNote.orEmpty())
+                }
+                OutlinedTextField(
+                    value = noteDraft,
+                    onValueChange = { noteDraft = it },
+                    label = { Text(stringResource(R.string.details_note_label)) },
+                    placeholder = { Text(stringResource(R.string.details_note_hint)) },
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = {
+                        onSaveNote(noteDraft)
+                        onDismiss()
+                    },
+                    modifier = Modifier.align(Alignment.End),
+                ) {
+                    Text(stringResource(R.string.details_note_save))
+                }
+            }
 
             Spacer(Modifier.height(8.dp))
 
@@ -233,6 +271,18 @@ fun FileDetailsSheet(
                     tint = MaterialTheme.colorScheme.secondary,
                 ) {
                     onShareLink()
+                    onDismiss()
+                }
+            }
+            if (onToggleLock != null) {
+                ActionRow(
+                    icon = if (item.isLocked) Icons.Filled.LockOpen else Icons.Filled.Lock,
+                    label = stringResource(
+                        if (item.isLocked) R.string.details_unlock_unhide else R.string.details_lock_hide,
+                    ),
+                    tint = MaterialTheme.colorScheme.tertiary,
+                ) {
+                    onToggleLock()
                     onDismiss()
                 }
             }

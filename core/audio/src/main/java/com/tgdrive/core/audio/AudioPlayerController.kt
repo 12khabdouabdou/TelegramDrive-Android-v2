@@ -15,21 +15,85 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.abs
 
 /**
- * Immutable snapshot of the audio player's state.
+ * Single audio item inside the playback queue.
+ */
+data class AudioTrack(
+    val title: String,
+    val path: String,
+    val chatId: Long = 0L,
+    val messageId: Long = 0L,
+)
+
+/**
+ * Immutable snapshot of the audio player's state, including queue and playback speed.
  */
 data class AudioState(
     val title: String? = null,
     val isPlaying: Boolean = false,
     val path: String? = null,
+    val queue: List<AudioTrack> = emptyList(),
+    val currentIndex: Int = 0,
+    val playbackSpeed: Float = 1.0f,
+    val repeatAll: Boolean = false,
 )
 
 /**
+ * Pure queue, speed, and repeat logic shared with unit tests.
+ */
+object AudioQueueLogic {
+    val SPEED_STEPS: List<Float> = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+
+    fun normalizeSpeed(speed: Float): Float = speed.coerceIn(0.5f, 2.5f)
+
+    fun nextSpeed(current: Float): Float {
+        return SPEED_STEPS.firstOrNull { it > current + 0.01f } ?: SPEED_STEPS.first()
+    }
+
+    fun deduplicateQueue(tracks: List<AudioTrack>, startIndex: Int): Pair<List<AudioTrack>, Int> {
+        val valid = tracks.filter { it.path.isNotBlank() }
+        if (valid.isEmpty()) return emptyList<AudioTrack>() to 0
+        val clampedStart = startIndex.coerceIn(0, valid.lastIndex)
+        val targetPath = valid[clampedStart].path
+        val distinct = valid.distinctBy { it.path }
+        val mappedIndex = distinct.indexOfFirst { it.path == targetPath }.coerceAtLeast(0)
+        return distinct to mappedIndex
+    }
+
+    fun nextIndex(currentIndex: Int, size: Int, repeatAll: Boolean): Int? {
+        if (size <= 0) return null
+        return when {
+            currentIndex + 1 < size -> currentIndex + 1
+            repeatAll -> 0
+            else -> null
+        }
+    }
+
+    fun previousIndex(currentIndex: Int, size: Int, repeatAll: Boolean): Int? {
+        if (size <= 0) return null
+        return when {
+            currentIndex - 1 >= 0 -> currentIndex - 1
+            repeatAll -> size - 1
+            else -> null
+        }
+    }
+
+    fun formatSpeedLabel(speed: Float): String {
+        val rounded = SPEED_STEPS.firstOrNull { abs(it - speed) < 0.01f }
+        val v = rounded ?: speed
+        return if (v % 1.0f == 0.0f) "${v.toInt()}x" else "${v}x"
+    }
+}
+
+/**
  * Process-wide audio player controller backed by Media3 [ExoPlayer] with
- * automatic audio focus management and noisy (headphone-unplug) handling.
+ * queue support, speed control, repeat-all, lock-screen [AudioMediaNotification],
+ * audio focus management, and noisy (headphone-unplug) handling.
  */
 @Singleton
 class AudioPlayerController @Inject constructor(
@@ -41,6 +105,7 @@ class AudioPlayerController @Inject constructor(
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var exoPlayer: ExoPlayer? = null
+    private var mediaNotification: AudioMediaNotification? = null
 
     @Volatile
     private var cachedPositionMs: Long = 0L
@@ -54,6 +119,21 @@ class AudioPlayerController @Inject constructor(
         } else {
             mainHandler.post(block)
         }
+    }
+
+    private fun ensureNotification(): AudioMediaNotification {
+        mediaNotification?.let { return it }
+        return AudioMediaNotification(
+            appContext = appContext,
+            onPlayPause = ::togglePlayPause,
+            onNext = ::playNext,
+            onPrevious = ::playPrevious,
+            onStop = ::release,
+        ).also { mediaNotification = it }
+    }
+
+    private fun syncNotification() {
+        ensureNotification().update(_state.value, cachedPositionMs, cachedDurationMs)
     }
 
     private fun ensurePlayer(): ExoPlayer {
@@ -76,6 +156,7 @@ class AudioPlayerController @Inject constructor(
                 _state.update { cur ->
                     if (cur.path != null) cur.copy(isPlaying = isPlaying) else cur
                 }
+                syncNotification()
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -84,8 +165,15 @@ class AudioPlayerController @Inject constructor(
                     cachedDurationMs = dur
                 }
                 if (playbackState == Player.STATE_ENDED) {
-                    cachedPositionMs = cachedDurationMs
-                    _state.update { cur -> cur.copy(isPlaying = false) }
+                    val cur = _state.value
+                    val next = AudioQueueLogic.nextIndex(cur.currentIndex, cur.queue.size, cur.repeatAll)
+                    if (next != null) {
+                        playTrackAtIndex(next)
+                    } else {
+                        cachedPositionMs = cachedDurationMs
+                        _state.update { it.copy(isPlaying = false) }
+                        syncNotification()
+                    }
                 }
             }
 
@@ -93,30 +181,108 @@ class AudioPlayerController @Inject constructor(
                 Log.w("AudioPlayerController: ExoPlayer error", error)
                 cachedPositionMs = 0L
                 cachedDurationMs = 1L
-                _state.value = AudioState()
+                _state.update { AudioState(playbackSpeed = it.playbackSpeed, repeatAll = it.repeatAll) }
+                mediaNotification?.dismiss()
             }
         })
         exoPlayer = created
         return created
     }
 
-    /** Play an audio file. Stops any current playback first. */
+    /** Play a single audio file. Replaces any active queue. */
     fun playAudio(localPath: String, fileName: String) {
-        _state.value = AudioState(title = fileName, isPlaying = false, path = localPath)
+        playQueue(listOf(AudioTrack(title = fileName, path = localPath)), 0)
+    }
+
+    /** Play an ordered queue of [tracks] beginning at [startIndex]. */
+    fun playQueue(tracks: List<AudioTrack>, startIndex: Int = 0) {
+        val (deduped, mappedIndex) = AudioQueueLogic.deduplicateQueue(tracks, startIndex)
+        if (deduped.isEmpty()) return
+        val speed = _state.value.playbackSpeed
+        val repeat = _state.value.repeatAll
+        val current = deduped[mappedIndex]
+        _state.value = AudioState(
+            title = current.title,
+            isPlaying = false,
+            path = current.path,
+            queue = deduped,
+            currentIndex = mappedIndex,
+            playbackSpeed = speed,
+            repeatAll = repeat,
+        )
+        loadAndStartTrack(current, speed)
+    }
+
+    /** Skip to the next track in the queue (or wrap around if repeat-all is enabled). */
+    fun playNext() {
+        val cur = _state.value
+        val next = AudioQueueLogic.nextIndex(cur.currentIndex, cur.queue.size, cur.repeatAll) ?: return
+        playTrackAtIndex(next)
+    }
+
+    /** Skip to previous track, or restart current track if > 3s into playback. */
+    fun playPrevious() {
+        if (currentPosition() > 3_000 && _state.value.path != null) {
+            seekTo(0)
+            return
+        }
+        val cur = _state.value
+        val prev = AudioQueueLogic.previousIndex(cur.currentIndex, cur.queue.size, cur.repeatAll) ?: return
+        playTrackAtIndex(prev)
+    }
+
+    private fun playTrackAtIndex(index: Int) {
+        val cur = _state.value
+        val target = cur.queue.getOrNull(index) ?: return
+        _state.update {
+            it.copy(
+                title = target.title,
+                path = target.path,
+                currentIndex = index,
+                isPlaying = false,
+            )
+        }
+        loadAndStartTrack(target, cur.playbackSpeed)
+    }
+
+    private fun loadAndStartTrack(track: AudioTrack, speed: Float) {
         cachedPositionMs = 0L
         cachedDurationMs = 1L
         runOnMain {
             try {
                 val player = ensurePlayer()
-                val mediaItem = MediaItem.fromUri(android.net.Uri.fromFile(java.io.File(localPath)))
+                val mediaItem = MediaItem.fromUri(android.net.Uri.fromFile(File(track.path)))
                 player.setMediaItem(mediaItem)
+                player.setPlaybackSpeed(speed)
                 player.prepare()
                 player.play()
+                syncNotification()
             } catch (t: Throwable) {
                 Log.w("playAudio failed", t)
-                _state.value = AudioState()
+                _state.update { AudioState(playbackSpeed = it.playbackSpeed, repeatAll = it.repeatAll) }
+                mediaNotification?.dismiss()
             }
         }
+    }
+
+    /** Set playback speed multiplier clamped to [0.5f, 2.5f]. */
+    fun setPlaybackSpeed(speed: Float) {
+        val safe = AudioQueueLogic.normalizeSpeed(speed)
+        _state.update { it.copy(playbackSpeed = safe) }
+        runOnMain {
+            runCatching { exoPlayer?.setPlaybackSpeed(safe) }
+            syncNotification()
+        }
+    }
+
+    /** Cycle playback speed through 0.75x -> 1x -> 1.25x -> 1.5x -> 2x. */
+    fun cyclePlaybackSpeed() {
+        setPlaybackSpeed(AudioQueueLogic.nextSpeed(_state.value.playbackSpeed))
+    }
+
+    /** Toggle repeat-all mode for the active queue. */
+    fun toggleRepeatAll() {
+        _state.update { it.copy(repeatAll = !it.repeatAll) }
     }
 
     /** Toggle play/pause. No-op if nothing is loaded. */
@@ -170,11 +336,12 @@ class AudioPlayerController @Inject constructor(
         runOnMain {
             try {
                 exoPlayer?.seekTo(safeMs)
+                syncNotification()
             } catch (_: Throwable) {}
         }
     }
 
-    /** Stop and release the ExoPlayer instance. */
+    /** Stop and release the ExoPlayer instance and notification. */
     fun release() {
         cachedPositionMs = 0L
         cachedDurationMs = 1L
@@ -184,6 +351,8 @@ class AudioPlayerController @Inject constructor(
                 exoPlayer?.release()
             } catch (_: Throwable) {}
             exoPlayer = null
+            mediaNotification?.release()
+            mediaNotification = null
         }
     }
 }

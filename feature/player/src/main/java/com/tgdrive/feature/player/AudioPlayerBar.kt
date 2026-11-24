@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,12 +27,16 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -54,6 +59,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.audio.AudioPlayerController
+import com.tgdrive.core.audio.AudioQueueLogic
 import com.tgdrive.designsystem.theme.TgTypography
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.delay
@@ -70,9 +76,8 @@ class AudioPlayerViewModel @Inject constructor(
 ) : ViewModel()
 
 /**
- * Persistent mini audio player sitting below the active navigation host.
- * Consumes bottom navigation bar insets on the hosted content when visible
- * so double bottom padding does not occur.
+ * Persistent mini audio player sitting below the active navigation host with queue
+ * skip controls, playback speed cycling, repeat-all toggle, and seek scrubber.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -102,6 +107,7 @@ fun AudioPlayerScaffold(
     }
 
     val isVisible = state.path != null
+    val hasQueue = state.queue.size > 1
 
     Column(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -135,12 +141,12 @@ fun AudioPlayerScaffold(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 12.dp, top = 8.dp, end = 4.dp),
+                        .padding(start = 10.dp, top = 6.dp, end = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(38.dp)
+                            .size(36.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
                         contentAlignment = Alignment.Center,
@@ -149,13 +155,13 @@ fun AudioPlayerScaffold(
                             Icons.Filled.MusicNote,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier.size(19.dp),
                         )
                     }
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .padding(horizontal = 12.dp),
+                            .padding(horizontal = 10.dp),
                     ) {
                         Text(
                             text = state.title ?: "",
@@ -169,8 +175,13 @@ fun AudioPlayerScaffold(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
+                            val subtitle = if (hasQueue) {
+                                "${state.currentIndex + 1} / ${state.queue.size}"
+                            } else {
+                                stringResource(R.string.player_audio_now_playing)
+                            }
                             Text(
-                                text = stringResource(R.string.player_audio_now_playing),
+                                text = subtitle,
                                 style = TgTypography.Caption,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -184,7 +195,58 @@ fun AudioPlayerScaffold(
                             )
                         }
                     }
-                    IconButton(onClick = { controller.togglePlayPause() }) {
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(
+                                onClickLabel = stringResource(R.string.player_audio_speed),
+                            ) { controller.cyclePlaybackSpeed() },
+                    ) {
+                        Text(
+                            text = AudioQueueLogic.formatSpeedLabel(state.playbackSpeed),
+                            style = TgTypography.Mono,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                        )
+                    }
+
+                    if (hasQueue) {
+                        IconButton(
+                            onClick = { controller.toggleRepeatAll() },
+                            modifier = Modifier.size(34.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.Repeat,
+                                contentDescription = stringResource(R.string.player_audio_repeat),
+                                tint = if (state.repeatAll) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        IconButton(
+                            onClick = { controller.playPrevious() },
+                            modifier = Modifier.size(34.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipPrevious,
+                                contentDescription = stringResource(R.string.player_audio_prev),
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = { controller.togglePlayPause() },
+                        modifier = Modifier.size(38.dp),
+                    ) {
                         Icon(
                             imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                             contentDescription = stringResource(
@@ -193,11 +255,30 @@ fun AudioPlayerScaffold(
                             tint = MaterialTheme.colorScheme.primary,
                         )
                     }
-                    IconButton(onClick = { controller.release() }) {
+
+                    if (hasQueue) {
+                        IconButton(
+                            onClick = { controller.playNext() },
+                            modifier = Modifier.size(34.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.SkipNext,
+                                contentDescription = stringResource(R.string.player_audio_next),
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = { controller.release() },
+                        modifier = Modifier.size(34.dp),
+                    ) {
                         Icon(
                             Icons.Filled.Close,
                             contentDescription = stringResource(R.string.player_audio_stop),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp),
                         )
                     }
                 }
@@ -219,7 +300,7 @@ fun AudioPlayerScaffold(
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(28.dp)
+                        .height(26.dp)
                         .padding(horizontal = 12.dp, vertical = 0.dp)
                         .semantics { contentDescription = seekDesc },
                 )

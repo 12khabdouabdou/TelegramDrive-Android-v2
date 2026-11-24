@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Visibility
@@ -90,6 +91,7 @@ fun FileUploadReviewDialog(
     }
     var editingIndex by remember { mutableIntStateOf(-1) }
     var renameDraft by remember { mutableStateOf("") }
+    var cropTargetIndex by remember { mutableIntStateOf(-1) }
 
     var packAsZip by remember { mutableStateOf(false) }
     var zipName by remember {
@@ -202,6 +204,22 @@ fun FileUploadReviewDialog(
                                             style = TgTypography.Caption,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
+                                    }
+                                    val isImageItem = item.mimeType.startsWith("image/", ignoreCase = true) ||
+                                        item.displayName.substringAfterLast('.', "").lowercase() in
+                                        setOf("jpg", "jpeg", "png", "webp", "bmp", "heic", "heif")
+                                    if (isImageItem) {
+                                        IconButton(
+                                            onClick = { cropTargetIndex = idx },
+                                            modifier = Modifier.size(32.dp),
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.Crop,
+                                                contentDescription = stringResource(R.string.upload_crop_action),
+                                                modifier = Modifier.size(16.dp),
+                                                tint = MaterialTheme.colorScheme.primary,
+                                            )
+                                        }
                                     }
                                     IconButton(
                                         onClick = {
@@ -599,4 +617,32 @@ fun FileUploadReviewDialog(
             }
         },
     )
+
+    val cropItem = files.getOrNull(cropTargetIndex)
+    if (cropItem != null) {
+        ImageCropRotateDialog(
+            sourceUri = cropItem.uri,
+            displayName = cropItem.displayName,
+            onDismiss = { cropTargetIndex = -1 },
+            onResult = { editedUri, newSize ->
+                val targetIdx = cropTargetIndex
+                cropTargetIndex = -1
+                if (targetIdx in files.indices) {
+                    val renamed = if (files[targetIdx].displayName.endsWith(".jpg", ignoreCase = true) ||
+                        files[targetIdx].displayName.endsWith(".jpeg", ignoreCase = true)
+                    ) {
+                        files[targetIdx].displayName
+                    } else {
+                        files[targetIdx].displayName.substringBeforeLast('.') + ".jpg"
+                    }
+                    files[targetIdx] = files[targetIdx].copy(
+                        uri = editedUri,
+                        displayName = renamed,
+                        mimeType = "image/jpeg",
+                        sizeBytes = newSize,
+                    )
+                }
+            },
+        )
+    }
 }

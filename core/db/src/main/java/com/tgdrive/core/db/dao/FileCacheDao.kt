@@ -85,10 +85,10 @@ interface FileCacheDao {
     @Query("DELETE FROM file_cache")
     suspend fun clear()
 
-    @Query("SELECT * FROM file_cache WHERE is_starred = 1 ORDER BY date DESC LIMIT 100")
+    @Query("SELECT * FROM file_cache WHERE is_starred = 1 AND is_locked = 0 ORDER BY date DESC LIMIT 100")
     suspend fun getStarred(): List<FileCacheEntity>
 
-    @Query("SELECT * FROM file_cache WHERE last_accessed > 0 ORDER BY last_accessed DESC LIMIT 50")
+    @Query("SELECT * FROM file_cache WHERE last_accessed > 0 AND is_locked = 0 ORDER BY last_accessed DESC LIMIT 50")
     suspend fun getRecent(): List<FileCacheEntity>
 
     @Query("UPDATE file_cache SET is_starred = :starred WHERE message_id = :messageId AND chat_id = :chatId")
@@ -121,23 +121,100 @@ interface FileCacheDao {
     @Query(
         """
         SELECT * FROM file_cache
-        WHERE mime_type LIKE 'image/%'
-           OR mime_type LIKE 'video/%'
-           OR lower(file_name) LIKE '%.jpg'
-           OR lower(file_name) LIKE '%.jpeg'
-           OR lower(file_name) LIKE '%.png'
-           OR lower(file_name) LIKE '%.webp'
-           OR lower(file_name) LIKE '%.gif'
-           OR lower(file_name) LIKE '%.heic'
-           OR lower(file_name) LIKE '%.heif'
-           OR lower(file_name) LIKE '%.mp4'
-           OR lower(file_name) LIKE '%.mkv'
-           OR lower(file_name) LIKE '%.mov'
-           OR lower(file_name) LIKE '%.webm'
+        WHERE is_locked = 0
+          AND is_encrypted_vault = 0
+          AND lower(file_name) NOT LIKE '%.tgenc'
+          AND (
+              mime_type LIKE 'image/%'
+              OR mime_type LIKE 'video/%'
+              OR lower(file_name) LIKE '%.jpg'
+              OR lower(file_name) LIKE '%.jpeg'
+              OR lower(file_name) LIKE '%.png'
+              OR lower(file_name) LIKE '%.webp'
+              OR lower(file_name) LIKE '%.gif'
+              OR lower(file_name) LIKE '%.heic'
+              OR lower(file_name) LIKE '%.heif'
+              OR lower(file_name) LIKE '%.avif'
+              OR lower(file_name) LIKE '%.bmp'
+              OR lower(file_name) LIKE '%.mp4'
+              OR lower(file_name) LIKE '%.mkv'
+              OR lower(file_name) LIKE '%.mov'
+              OR lower(file_name) LIKE '%.webm'
+              OR lower(file_name) LIKE '%.avi'
+              OR lower(file_name) LIKE '%.3gp'
+          )
         ORDER BY date DESC
         """,
     )
     fun observeMediaItems(): Flow<List<FileCacheEntity>>
+
+    @Query(
+        """
+        SELECT * FROM file_cache
+        WHERE is_locked = 0
+          AND is_encrypted_vault = 0
+          AND lower(file_name) NOT LIKE '%.tgenc'
+          AND (
+              mime_type LIKE 'image/%'
+              OR mime_type LIKE 'video/%'
+              OR lower(file_name) LIKE '%.jpg'
+              OR lower(file_name) LIKE '%.jpeg'
+              OR lower(file_name) LIKE '%.png'
+              OR lower(file_name) LIKE '%.webp'
+              OR lower(file_name) LIKE '%.gif'
+              OR lower(file_name) LIKE '%.heic'
+              OR lower(file_name) LIKE '%.heif'
+              OR lower(file_name) LIKE '%.avif'
+              OR lower(file_name) LIKE '%.bmp'
+              OR lower(file_name) LIKE '%.mp4'
+              OR lower(file_name) LIKE '%.mkv'
+              OR lower(file_name) LIKE '%.mov'
+              OR lower(file_name) LIKE '%.webm'
+              OR lower(file_name) LIKE '%.avi'
+              OR lower(file_name) LIKE '%.3gp'
+          )
+        ORDER BY date DESC
+        """,
+    )
+    suspend fun getUnlockedMediaItems(): List<FileCacheEntity>
+
+    @Query(
+        """
+        SELECT fc.* FROM file_cache fc
+        INNER JOIN album_items ai
+          ON ai.chat_id = fc.chat_id AND ai.message_id = fc.message_id
+        WHERE ai.album_id = :albumId
+          AND fc.is_locked = 0
+          AND fc.is_encrypted_vault = 0
+        ORDER BY fc.date DESC
+        """,
+    )
+    fun observeMediaItemsForAlbum(albumId: String): Flow<List<FileCacheEntity>>
+
+    @Query(
+        """
+        SELECT fc.* FROM file_cache fc
+        INNER JOIN album_items ai
+          ON ai.chat_id = fc.chat_id AND ai.message_id = fc.message_id
+        WHERE ai.album_id = :albumId
+          AND fc.is_locked = 0
+          AND fc.is_encrypted_vault = 0
+        ORDER BY fc.date DESC
+        """,
+    )
+    suspend fun getMediaItemsForAlbum(albumId: String): List<FileCacheEntity>
+
+    @Query(
+        """
+        SELECT * FROM file_cache
+        WHERE is_locked = 0
+          AND is_encrypted_vault = 0
+          AND exif_lat IS NOT NULL
+          AND exif_lng IS NOT NULL
+        ORDER BY date DESC
+        """,
+    )
+    fun observeGeotaggedMedia(): Flow<List<FileCacheEntity>>
 
     @Query("SELECT * FROM file_cache WHERE lower(file_name) LIKE '%.zip' ORDER BY date DESC")
     suspend fun getAllZips(): List<FileCacheEntity>
@@ -261,12 +338,12 @@ interface FileCacheDao {
     suspend fun getAllUnlocked(): List<FileCacheEntity>
 
     @Query(
-        "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",
+        "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",
     )
     fun observeEncryptedVaultFiles(): Flow<List<FileCacheEntity>>
 
     @Query(
-        "SELECT COUNT(*) FROM file_cache WHERE is_encrypted_vault = 1 OR lower(file_name) LIKE '%.tgenc'",
+        "SELECT COUNT(*) FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc'",
     )
     fun observeEncryptedVaultCount(): Flow<Int>
 }

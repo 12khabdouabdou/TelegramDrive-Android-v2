@@ -31,6 +31,8 @@ dependencies {
     implementation(libs.work.runtime.ktx)
     implementation(libs.hilt.work)
     implementation(libs.documentfile)
+    implementation(libs.mlkit.text.recognition)
+    implementation(libs.mlkit.image.labeling)
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)

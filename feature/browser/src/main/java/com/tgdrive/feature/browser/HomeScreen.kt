@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
@@ -104,6 +105,7 @@ import com.tgdrive.designsystem.components.TintedGlassPanel
 import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.folders.CreateFolderSheet
+import com.tgdrive.feature.upload.DocumentScannerDialog
 import com.tgdrive.feature.upload.FileUploadReviewDialog
 import com.tgdrive.feature.upload.ZipUploadOptionsDialog
 import java.io.File
@@ -138,6 +140,7 @@ fun HomeScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     var showQuickCreate by remember { mutableStateOf(false) }
     var showCreateFolder by remember { mutableStateOf(false) }
+    var showScannerDialog by remember { mutableStateOf(false) }
     var selectedTargetChatId by remember { mutableLongStateOf(0L) }
     var zipExcludesDraft by remember { mutableStateOf("") }
     var zipPartCapDraft by remember { mutableStateOf<Long?>(null) }
@@ -572,6 +575,15 @@ fun HomeScreen(
                     },
                 )
                 QuickSheetActionRow(
+                    icon = Icons.Filled.DocumentScanner,
+                    title = stringResource(R.string.home_quick_scan_pdf),
+                    subtitle = stringResource(R.string.home_quick_scan_pdf_desc),
+                    onClick = {
+                        showQuickCreate = false
+                        showScannerDialog = true
+                    },
+                )
+                QuickSheetActionRow(
                     icon = Icons.Filled.FolderZip,
                     title = stringResource(R.string.home_quick_upload_zip),
                     subtitle = stringResource(R.string.home_quick_upload_zip_desc_direct),
@@ -599,6 +611,17 @@ fun HomeScreen(
             onDismiss = {
                 showCreateFolder = false
                 vm.refreshFolders()
+            },
+        )
+    }
+
+    if (showScannerDialog) {
+        DocumentScannerDialog(
+            onDismiss = { showScannerDialog = false },
+            onPdfReady = { pdfUri ->
+                showScannerDialog = false
+                val target = selectedTargetChatId.takeIf { it != 0L } ?: state.savedMessagesChatId
+                vm.prepareFileReview(target, listOf(pdfUri))
             },
         )
     }

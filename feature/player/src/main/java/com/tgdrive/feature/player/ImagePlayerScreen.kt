@@ -1,6 +1,7 @@
 package com.tgdrive.feature.player
 
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -26,10 +27,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RotateRight
@@ -37,16 +40,20 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.OfflinePin
 import androidx.compose.material.icons.outlined.StarOutline
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -103,6 +110,8 @@ fun ImagePlayerScreen(
     messageId: Long,
     onBack: () -> Unit,
     chatId: Long = 0L,
+    timeline: Boolean = false,
+    albumId: String = "",
     onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
@@ -110,31 +119,43 @@ fun ImagePlayerScreen(
     val haptics = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
-    var siblings by remember(chatId, messageId) { mutableStateOf<List<GalleryItemRef>>(emptyList()) }
-    var rotations by remember(chatId, messageId) { mutableStateOf<Map<Long, Float>>(emptyMap()) }
+    var siblings by remember(chatId, messageId, timeline, albumId) { mutableStateOf<List<GalleryItemRef>>(emptyList()) }
+    var rotations by remember(chatId, messageId, timeline, albumId) { mutableStateOf<Map<Long, Float>>(emptyMap()) }
     var showChrome by remember(chatId, messageId) { mutableStateOf(true) }
     var isCurrentZoomed by remember { mutableStateOf(false) }
     var showExifSheet by remember { mutableStateOf(false) }
+    var showCropDialog by remember { mutableStateOf(false) }
     var exifInfo by remember { mutableStateOf<ImageExifInfo?>(null) }
     var dragOffsetY by remember { mutableFloatStateOf(0f) }
 
-    LaunchedEffect(chatId, messageId) {
+    LaunchedEffect(chatId, messageId, timeline, albumId) {
         val target = vm.getCachedEntry(chatId, messageId)
-        val loaded = if (chatId != 0L) {
-            vm.loadSiblingMedia(chatId, includeLocked = target?.isLocked == true)
-        } else {
-            emptyList()
+        val loaded = when {
+            albumId.isNotBlank() -> vm.loadAlbumMedia(albumId)
+            timeline -> vm.loadTimelineMedia()
+            chatId != 0L -> vm.loadSiblingMedia(chatId, includeLocked = target?.isLocked == true)
+            else -> emptyList()
         }
-        siblings = if (loaded.any { it.messageId == messageId }) {
+        val matchesTarget = loaded.any {
+            if (chatId != 0L) it.chatId == chatId && it.messageId == messageId else it.messageId == messageId
+        }
+        siblings = if (matchesTarget) {
             loaded.map { GalleryItemRef(it.chatId, it.messageId, it) }
         } else {
-            listOf(GalleryItemRef(chatId, messageId, target))
+            val combined = if (target != null) listOf(target) + loaded else loaded
+            if (combined.isNotEmpty()) {
+                combined.distinctBy { it.chatId to it.messageId }.map { GalleryItemRef(it.chatId, it.messageId, it) }
+            } else {
+                listOf(GalleryItemRef(chatId, messageId, null))
+            }
         }
     }
 
     val pages = siblings.ifEmpty { listOf(GalleryItemRef(chatId, messageId, null)) }
-    val targetIdx = remember(pages, messageId) {
-        pages.indexOfFirst { it.messageId == messageId }.coerceAtLeast(0)
+    val targetIdx = remember(pages, chatId, messageId) {
+        pages.indexOfFirst {
+            if (chatId != 0L) it.chatId == chatId && it.messageId == messageId else it.messageId == messageId
+        }.coerceAtLeast(0)
     }
     val pagerState = rememberPagerState(initialPage = targetIdx) { pages.size }
 
@@ -399,6 +420,19 @@ fun ImagePlayerScreen(
                 } ?: false
                 if (!activeIsVideo && activePath != null) {
                     IconButton(
+                        onClick = { showCropDialog = true },
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.45f)),
+                    ) {
+                        Icon(
+                            Icons.Filled.Crop,
+                            contentDescription = stringResource(R.string.player_crop_title),
+                            tint = Color.White,
+                        )
+                    }
+                    IconButton(
                         onClick = {
                             val next = (rotations[activeRef.messageId] ?: 0f) + 90f
                             rotations = rotations + (activeRef.messageId to next)
@@ -540,7 +574,77 @@ fun ImagePlayerScreen(
         }
     }
 
+    if (showCropDialog && activePath != null) {
+        var aspectChoice by remember { mutableStateOf<Float?>(null) }
+        var saving by remember { mutableStateOf(false) }
+        val activeRotation = rotations[activeRef.messageId] ?: 0f
+        AlertDialog(
+            onDismissRequest = { if (!saving) showCropDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.player_crop_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "${activeRef.entity?.fileName ?: ""} · ${(activeRotation % 360f).toInt()}°",
+                        style = TgTypography.Mono,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(
+                            null to stringResource(R.string.player_crop_original),
+                            1f to "1:1",
+                            4f / 3f to "4:3",
+                            16f / 9f to "16:9",
+                        ).forEach { (ratio, label) ->
+                            FilterChip(
+                                selected = aspectChoice == ratio,
+                                onClick = { aspectChoice = ratio },
+                                label = { Text(label) },
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !saving,
+                    onClick = {
+                        saving = true
+                        scope.launch {
+                            val outName = vm.saveCroppedCopyToDownloads(
+                                sourcePath = activePath,
+                                originalName = activeRef.entity?.fileName ?: "photo.jpg",
+                                rotationDeg = activeRotation,
+                                targetAspect = aspectChoice,
+                            )
+                            saving = false
+                            showCropDialog = false
+                            val msg = if (outName != null) {
+                                context.getString(R.string.player_crop_saved, outName)
+                            } else {
+                                context.getString(R.string.player_crop_failed)
+                            }
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.player_crop_save_btn))
+                }
+            },
+            dismissButton = {
+                TextButton(enabled = !saving, onClick = { showCropDialog = false }) {
+                    Text(stringResource(R.string.player_back))
+                }
+            },
+        )
+    }
+
     if (showExifSheet) {
+        val currentEntity = activeRef.entity
+        var noteDraft by remember(activeRef.chatId, activeRef.messageId, currentEntity?.userNote) {
+            mutableStateOf(currentEntity?.userNote.orEmpty())
+        }
+        val noteSavedMsg = stringResource(R.string.player_exif_note_saved)
         ModalBottomSheet(
             onDismissRequest = { showExifSheet = false },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -579,7 +683,87 @@ fun ImagePlayerScreen(
                     info.dateTaken?.let { ExifMetaRow(stringResource(R.string.player_exif_date), it) }
                     info.camera?.let { ExifMetaRow(stringResource(R.string.player_exif_camera), it) }
                     info.exposure?.let { ExifMetaRow(stringResource(R.string.player_exif_details), it) }
-                    info.location?.let { ExifMetaRow(stringResource(R.string.player_exif_location), it) }
+                    info.location?.let { locStr ->
+                        val lat = info.latitude
+                        val lng = info.longitude
+                        if (lat != null && lng != null) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        runCatching {
+                                            val uri = Uri.parse(
+                                                "geo:$lat,$lng?q=$lat,$lng(${Uri.encode(info.fileName)})",
+                                            )
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW, uri)
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                            )
+                                        }
+                                    }
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.player_exif_location),
+                                    style = TgTypography.Display.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = locStr,
+                                        style = TgTypography.Mono,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Icon(
+                                        Icons.Filled.Map,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            }
+                        } else {
+                            ExifMetaRow(stringResource(R.string.player_exif_location), locStr)
+                        }
+                    }
+                }
+                if (currentEntity != null) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    OutlinedTextField(
+                        value = noteDraft,
+                        onValueChange = { noteDraft = it },
+                        label = { Text(stringResource(R.string.player_exif_note_label)) },
+                        placeholder = { Text(stringResource(R.string.player_exif_note_hint)) },
+                        maxLines = 3,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                val saved = vm.updateUserNote(currentEntity.chatId, currentEntity.messageId, noteDraft)
+                                siblings = siblings.map { ref ->
+                                    if (ref.chatId == currentEntity.chatId &&
+                                        ref.messageId == currentEntity.messageId &&
+                                        ref.entity != null
+                                    ) {
+                                        ref.copy(entity = ref.entity.copy(userNote = saved.ifEmpty { null }))
+                                    } else {
+                                        ref
+                                    }
+                                }
+                                Toast.makeText(context, noteSavedMsg, Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.align(Alignment.End),
+                    ) {
+                        Text(stringResource(R.string.player_exif_note_save))
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
             }

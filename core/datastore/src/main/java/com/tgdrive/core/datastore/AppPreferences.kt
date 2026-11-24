@@ -96,6 +96,7 @@ data class AppPreferencesData(
     val backupSyncIndexRestored: Boolean = false,
     val decryptedTempTtlMinutes: Int = 30,
     val manualUploadWifiOnly: Boolean = false,
+    val photosColumns: Int = 3,
 ) {
     fun isFolderEncrypted(folderUri: String): Boolean =
         backupEncryptAll || (folderUri in backupEncryptedFolderUris)
@@ -111,6 +112,12 @@ data class AppPreferencesData(
     }
 
     fun clearRecentSearches(): AppPreferencesData = copy(recentSearchQueries = "")
+
+    fun withoutRecentSearch(query: String): AppPreferencesData {
+        val cleaned = query.trim().replace('\n', ' ')
+        val updated = recentSearches().filterNot { it.equals(cleaned, ignoreCase = true) }
+        return copy(recentSearchQueries = updated.joinToString("\n"))
+    }
     fun targetFolderFor(folderUri: String): Long =
         parseFolderTargets()[folderUri] ?: backupTargetFolderId
 
@@ -231,6 +238,7 @@ class AppPreferences @Inject constructor(
         val BACKUP_SYNC_INDEX_RESTORED = booleanPreferencesKey("backup_sync_index_restored")
         val DECRYPTED_TEMP_TTL_MINUTES = intPreferencesKey("decrypted_temp_ttl_minutes")
         val MANUAL_UPLOAD_WIFI_ONLY = booleanPreferencesKey("manual_upload_wifi_only")
+        val PHOTOS_COLUMNS = intPreferencesKey("photos_columns")
     }
 
     /**
@@ -315,6 +323,7 @@ class AppPreferences @Inject constructor(
             backupSyncIndexRestored = get(Keys.BACKUP_SYNC_INDEX_RESTORED) ?: false,
             decryptedTempTtlMinutes = get(Keys.DECRYPTED_TEMP_TTL_MINUTES) ?: 30,
             manualUploadWifiOnly = get(Keys.MANUAL_UPLOAD_WIFI_ONLY) ?: false,
+            photosColumns = (get(Keys.PHOTOS_COLUMNS) ?: 3).coerceIn(2, 5),
         )
     }
 
@@ -368,5 +377,6 @@ class AppPreferences @Inject constructor(
         this[Keys.BACKUP_SYNC_INDEX_RESTORED] = d.backupSyncIndexRestored
         this[Keys.DECRYPTED_TEMP_TTL_MINUTES] = d.decryptedTempTtlMinutes
         this[Keys.MANUAL_UPLOAD_WIFI_ONLY] = d.manualUploadWifiOnly
+        this[Keys.PHOTOS_COLUMNS] = d.photosColumns.coerceIn(2, 5)
     }
 }

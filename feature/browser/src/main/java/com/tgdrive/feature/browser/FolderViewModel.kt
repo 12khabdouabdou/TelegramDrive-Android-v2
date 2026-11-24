@@ -116,6 +116,8 @@ data class FolderUiState(
     val hasSavedBackupPassphrase: Boolean = false,
     val manualUploadWifiOnly: Boolean = false,
     val batchDecryptProgress: Pair<Int, Int>? = null,
+    val currentVirtualPath: String = "",
+    val childVirtualFolders: List<Pair<String, Int>> = emptyList(),
 )
 
 data class FolderSnackbarEvent(
@@ -149,6 +151,7 @@ class FolderViewModel
         private val _refreshing = MutableStateFlow(false)
         private val _error = MutableStateFlow<String?>(null)
         private val _search = MutableStateFlow("")
+        private val _virtualPath = MutableStateFlow("")
         private val _pdfThumbnails = MutableStateFlow<Map<Long, String>>(emptyMap())
         private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
         val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
@@ -225,15 +228,17 @@ class FolderViewModel
                     preferences.data,
                     uploadManager.uploads,
                     _pdfThumbnails,
-                    combine(_boundChatId, _batchDecryptProgress) { b, bp -> b to bp },
+                    combine(_boundChatId, _batchDecryptProgress, _virtualPath) { b, bp, vp ->
+                        Triple(b, bp, vp)
+                    },
                 ) {
                         search,
                         prefs,
                         uploadQueue,
                         pdfThumbs,
-                        boundPair,
+                        boundTriple,
                     ->
-                    listOf(search, prefs, uploadQueue, pdfThumbs, boundPair)
+                    listOf(search, prefs, uploadQueue, pdfThumbs, boundTriple)
                 },
             ) { c, overlays, aux ->
                 val search = aux[0] as String
@@ -242,15 +247,48 @@ class FolderViewModel
                 @Suppress("UNCHECKED_CAST")
                 val pdfThumbs = aux[3] as Map<Long, String>
                 @Suppress("UNCHECKED_CAST")
-                val boundPair = aux[4] as Pair<Long?, Pair<Int, Int>?>
-                val boundId = boundPair.first
-                val batchProgress = boundPair.second
+                val boundTriple = aux[4] as Triple<Long?, Pair<Int, Int>?, String>
+                val boundId = boundTriple.first
+                val batchProgress = boundTriple.second
+                val rawVirtualPath = normalizeVirtualPath(boundTriple.third)
+
+                val unlockedItems = c.items.filterNot { it.isLocked }
+                val inVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
+
+                val childCounts = LinkedHashMap<String, Int>()
+                val folderScoped = if (inVirtualMode) {
+                    unlockedItems.filter { item ->
+                        val itemPath = normalizeVirtualPath(item.virtualPath)
+                        if (rawVirtualPath.isEmpty()) {
+                            if (itemPath.isNotEmpty()) {
+                                val top = itemPath.substringBefore('/')
+                                childCounts[top] = (childCounts[top] ?: 0) + 1
+                            }
+                        } else if (itemPath.startsWith("$rawVirtualPath/")) {
+                            val rest = itemPath.removePrefix("$rawVirtualPath/")
+                            val directChild = rest.substringBefore('/')
+                            if (directChild.isNotEmpty()) {
+                                childCounts[directChild] = (childCounts[directChild] ?: 0) + 1
+                            }
+                        }
+                        itemPath == rawVirtualPath
+                    }
+                } else {
+                    unlockedItems
+                }
+                val childFolders = childCounts.entries
+                    .sortedBy { it.key.lowercase() }
+                    .map { it.key to it.value }
 
                 val searched =
                     if (search.isBlank()) {
-                        c.items
+                        folderScoped
                     } else {
-                        c.items.filter { it.fileName.contains(search, ignoreCase = true) }
+                        folderScoped.filter {
+                            it.fileName.contains(search, ignoreCase = true) ||
+                                it.userNote?.contains(search, ignoreCase = true) == true ||
+                                it.virtualPath.contains(search, ignoreCase = true)
+                        }
                     }
                 val filtered = applyFilter(searched, prefs.fileFilter)
                 val sorted = applySort(filtered, prefs.fileSort)
@@ -278,6 +316,8 @@ class FolderViewModel
                     hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
                     manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                     batchDecryptProgress = batchProgress,
+                    currentVirtualPath = rawVirtualPath,
+                    childVirtualFolders = childFolders,
                 )
             }.flowOn(dispatchers.default)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
@@ -303,6 +343,7 @@ class FolderViewModel
             if (chatId == currentChatId) return
             currentChatId = chatId
             _boundChatId.value = chatId
+            _virtualPath.value = ""
             bindJob?.cancel()
             pdfWatchJob?.cancel()
             refreshJob?.cancel()
@@ -1118,6 +1159,74 @@ class FolderViewModel
             }
         }
 
+        fun openVirtualFolder(path: String) {
+            _virtualPath.value = normalizeVirtualPath(path)
+            _selected.value = emptySet()
+        }
+
+        fun navigateUpVirtualFolder(): Boolean {
+            val cur = normalizeVirtualPath(_virtualPath.value)
+            if (cur.isEmpty()) return false
+            _virtualPath.value = cur.substringBeforeLast('/', "")
+            _selected.value = emptySet()
+            return true
+        }
+
+        private fun normalizeVirtualPath(raw: String): String =
+            raw.trim().trim('/').replace('\\', '/')
+
+        fun updateUserNote(item: FileCacheEntity, rawNote: String) {
+            val cleaned = rawNote.trim().ifEmpty { null }
+            viewModelScope.launch(dispatchers.io) {
+                runCatching {
+                    fileCacheDao.updateUserNote(item.chatId, item.messageId, cleaned)
+                    cloudSyncManager.noteUserNoteChanged(item.chatId, item.messageId, cleaned)
+                    showSnackbar(appContext.getString(R.string.details_note_saved))
+                }
+            }
+        }
+
+        fun setItemLocked(item: FileCacheEntity, locked: Boolean) {
+            viewModelScope.launch(dispatchers.io) {
+                runCatching {
+                    fileCacheDao.setLocked(item.chatId, item.messageId, locked)
+                    cloudSyncManager.noteLockChanged(item.chatId, item.messageId, locked)
+                    if (locked) {
+                        _selected.update { it - item.messageId }
+                        showSnackbar(appContext.getString(R.string.details_locked_hidden))
+                    }
+                }
+            }
+        }
+
+        fun playAudioFromFolder(item: FileCacheEntity) {
+            val localPath = getLocalPath(item.messageId)
+            if (localPath == null) {
+                downloadAndPlayAudio(item)
+                return
+            }
+            val visibleItems = state.value.items
+            val tracks = visibleItems.mapNotNull { entry ->
+                if (classifyFile(entry.mimeType, entry.fileName) != FileBucket.AUDIO) {
+                    null
+                } else {
+                    val p = getLocalPath(entry.messageId) ?: return@mapNotNull null
+                    com.tgdrive.core.audio.AudioTrack(
+                        title = entry.fileName,
+                        path = p,
+                        chatId = entry.chatId,
+                        messageId = entry.messageId,
+                    )
+                }
+            }
+            if (tracks.isEmpty()) {
+                audioPlayerController.playAudio(localPath, item.fileName)
+            } else {
+                val startIdx = tracks.indexOfFirst { it.messageId == item.messageId }.coerceAtLeast(0)
+                audioPlayerController.playQueue(tracks, startIdx)
+            }
+        }
+
         fun downloadAndPlayAudio(item: FileCacheEntity) {
             if (item.remoteId.isEmpty()) {
                 _error.value = "File has no remote ID — can't download"
@@ -1153,7 +1262,7 @@ class FolderViewModel
                             val path = terminal.localPath
                             if (path != null && File(path).exists()) {
                                 withContext(dispatchers.main) {
-                                    audioPlayerController.playAudio(path, item.fileName)
+                                    playAudioFromFolder(item)
                                 }
                             }
                         }

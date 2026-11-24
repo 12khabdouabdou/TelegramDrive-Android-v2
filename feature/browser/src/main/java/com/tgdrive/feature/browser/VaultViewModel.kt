@@ -4,8 +4,12 @@ import android.content.Context
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.tgdrive.core.audio.AudioPlayerController
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
@@ -16,6 +20,7 @@ import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -61,6 +66,8 @@ class VaultViewModel @Inject constructor(
     private val offlinePinStore: OfflinePinStore,
     private val uploadManager: UploadManager,
     private val backupCrypto: BackupCrypto,
+    private val cloudSyncManager: CloudSyncManager,
+    private val audioPlayerController: AudioPlayerController,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
@@ -216,6 +223,78 @@ class VaultViewModel @Inject constructor(
 
     fun clearSelection() {
         _selected.value = emptySet()
+    }
+
+    fun unhideSelected() {
+        val targets = state.value.items.filter { it.messageId in _selected.value && it.isLocked }
+        if (targets.isEmpty()) return
+        viewModelScope.launch(dispatchers.io) {
+            for (item in targets) {
+                runCatching {
+                    fileCacheDao.setLocked(item.chatId, item.messageId, false)
+                    cloudSyncManager.noteLockChanged(item.chatId, item.messageId, false)
+                }
+            }
+            _selected.value = emptySet()
+            _snackbar.value = appContext.getString(R.string.vault_unhidden_count, targets.size)
+        }
+    }
+
+    fun openUnlockedVaultItem(
+        item: FileCacheEntity,
+        onOpenZip: (Long) -> Unit,
+        onOpenVideo: (Long, Long) -> Unit,
+        onOpenImage: (Long, Long) -> Unit,
+        onOpenPdf: (Long) -> Unit,
+        onOpenText: (Long, Long) -> Unit,
+    ) {
+        if (BackupCrypto.isEncryptedFileName(item.fileName)) {
+            startDecryptFlow(item)
+            return
+        }
+        val bucket = classifyFile(item.mimeType, item.fileName)
+        val local = getLocalPath(item.chatId, item.messageId)
+        fun enqueueIfMissing() {
+            if (local == null && item.remoteId.isNotEmpty()) {
+                enqueueDownload(item)
+            }
+        }
+        when {
+            bucket == FileBucket.ARCHIVES && item.fileName.endsWith(".zip", ignoreCase = true) -> {
+                enqueueIfMissing()
+                onOpenZip(item.messageId)
+            }
+            bucket == FileBucket.VIDEOS -> onOpenVideo(item.chatId, item.messageId)
+            bucket == FileBucket.IMAGES -> {
+                enqueueIfMissing()
+                onOpenImage(item.chatId, item.messageId)
+            }
+            bucket == FileBucket.PDF -> {
+                enqueueIfMissing()
+                onOpenPdf(item.messageId)
+            }
+            isTextPreviewable(item.mimeType, item.fileName) -> {
+                enqueueIfMissing()
+                onOpenText(item.chatId, item.messageId)
+            }
+            bucket == FileBucket.AUDIO -> {
+                if (local != null) {
+                    audioPlayerController.playAudio(local, item.fileName)
+                } else {
+                    viewModelScope.launch(dispatchers.io) {
+                        val downloaded = ensureLocalFile(item)
+                        if (downloaded != null) {
+                            withContext(dispatchers.main) {
+                                audioPlayerController.playAudio(downloaded.absolutePath, item.fileName)
+                            }
+                        } else {
+                            _error.value = "Failed to download audio"
+                        }
+                    }
+                }
+            }
+            else -> startDecryptFlow(item)
+        }
     }
 
     fun clearError() {

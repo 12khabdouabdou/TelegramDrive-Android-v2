@@ -64,6 +64,55 @@ object CloudSyncCodec {
         val updatedAtMs: Long,
     )
 
+    data class CloudVirtualPathRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val virtualPath: String,
+        val updatedAtMs: Long,
+    )
+
+    data class CloudLockRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val isLocked: Boolean,
+        val updatedAtMs: Long,
+    )
+
+    data class CloudNoteRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val note: String?,
+        val updatedAtMs: Long,
+    )
+
+    data class CloudAlbumRecord(
+        val id: String,
+        val name: String,
+        val coverChatId: Long? = null,
+        val coverMessageId: Long? = null,
+        val createdAt: Long,
+        val updatedAtMs: Long,
+        val deleted: Boolean = false,
+    )
+
+    data class CloudAlbumItemRecord(
+        val albumId: String,
+        val chatId: Long,
+        val messageId: Long,
+        val addedAt: Long,
+        val removed: Boolean = false,
+    )
+
+    data class CloudAiIndexRecord(
+        val chatId: Long,
+        val messageId: Long,
+        val ocrText: String?,
+        val aiTags: String?,
+        val exifLat: Double? = null,
+        val exifLng: Double? = null,
+        val updatedAtMs: Long,
+    )
+
     data class CloudMetaSnapshot(
         val version: Int = 1,
         val updatedAtMs: Long = 0L,
@@ -73,6 +122,11 @@ object CloudSyncCodec {
         val trash: List<CloudTrashRecord> = emptyList(),
         val syncedFiles: List<CloudSyncedFileRecord> = emptyList(),
         val playbackPositions: List<CloudPlaybackPositionRecord> = emptyList(),
+        val virtualPaths: List<CloudVirtualPathRecord> = emptyList(),
+        val lockedFlags: List<CloudLockRecord> = emptyList(),
+        val notes: List<CloudNoteRecord> = emptyList(),
+        val albums: List<CloudAlbumRecord> = emptyList(),
+        val albumItems: List<CloudAlbumItemRecord> = emptyList(),
     )
 
     data class CloudZipEntryRecord(
@@ -90,6 +144,7 @@ object CloudSyncCodec {
         val version: Int = 1,
         val updatedAtMs: Long = 0L,
         val zipEntries: List<CloudZipEntryRecord> = emptyList(),
+        val aiEntries: List<CloudAiIndexRecord> = emptyList(),
     )
 
     fun encodeMetaGzip(snapshot: CloudMetaSnapshot): ByteArray =
@@ -160,6 +215,55 @@ object CloudSyncCodec {
                 updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
             )
         }
+        val virtualPaths = root.optArray("virtualPaths").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudVirtualPathRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                virtualPath = o.strVal("virtualPath") ?: "",
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
+        val lockedFlags = root.optArray("lockedFlags").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudLockRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                isLocked = o.boolVal("isLocked") ?: false,
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
+        val notes = root.optArray("notes").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudNoteRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                note = o.strVal("note"),
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
+        val albums = root.optArray("albums").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudAlbumRecord(
+                id = o.strVal("id") ?: return@mapNotNull null,
+                name = o.strVal("name") ?: "",
+                coverChatId = o.longVal("coverChatId"),
+                coverMessageId = o.longVal("coverMessageId"),
+                createdAt = o.longVal("createdAt") ?: 0L,
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+                deleted = o.boolVal("deleted") ?: false,
+            )
+        }
+        val albumItems = root.optArray("albumItems").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudAlbumItemRecord(
+                albumId = o.strVal("albumId") ?: return@mapNotNull null,
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                addedAt = o.longVal("addedAt") ?: 0L,
+                removed = o.boolVal("removed") ?: false,
+            )
+        }
         CloudMetaSnapshot(
             version = root.longVal("version")?.toInt() ?: 1,
             updatedAtMs = root.longVal("updatedAtMs") ?: 0L,
@@ -169,6 +273,11 @@ object CloudSyncCodec {
             trash = trash,
             syncedFiles = synced,
             playbackPositions = playbackPositions,
+            virtualPaths = virtualPaths,
+            lockedFlags = lockedFlags,
+            notes = notes,
+            albums = albums,
+            albumItems = albumItems,
         )
     }.getOrNull()
 
@@ -191,10 +300,23 @@ object CloudSyncCodec {
                 indexedAt = o.longVal("indexedAt") ?: 0L,
             )
         }
+        val aiEntries = root.optArray("aiEntries").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudAiIndexRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                ocrText = o.strVal("ocrText"),
+                aiTags = o.strVal("aiTags"),
+                exifLat = o.doubleVal("exifLat"),
+                exifLng = o.doubleVal("exifLng"),
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
         CloudSearchIndexSnapshot(
             version = root.longVal("version")?.toInt() ?: 1,
             updatedAtMs = root.longVal("updatedAtMs") ?: 0L,
             zipEntries = entries,
+            aiEntries = aiEntries,
         )
     }.getOrNull()
 
@@ -242,6 +364,44 @@ object CloudSyncCodec {
             if (cur == null || r.updatedAtMs >= cur.updatedAtMs) playbackMap[key] = r
         }
 
+        val vpathMap = LinkedHashMap<Pair<Long, Long>, CloudVirtualPathRecord>()
+        (local.virtualPaths + remote.virtualPaths).forEach { r ->
+            val key = r.chatId to r.messageId
+            val cur = vpathMap[key]
+            if (cur == null || r.updatedAtMs >= cur.updatedAtMs) vpathMap[key] = r
+        }
+
+        val lockMap = LinkedHashMap<Pair<Long, Long>, CloudLockRecord>()
+        (local.lockedFlags + remote.lockedFlags).forEach { r ->
+            val key = r.chatId to r.messageId
+            val cur = lockMap[key]
+            if (cur == null || r.updatedAtMs >= cur.updatedAtMs) lockMap[key] = r
+        }
+
+        val noteMap = LinkedHashMap<Pair<Long, Long>, CloudNoteRecord>()
+        (local.notes + remote.notes).forEach { r ->
+            val key = r.chatId to r.messageId
+            val cur = noteMap[key]
+            if (cur == null || r.updatedAtMs >= cur.updatedAtMs) noteMap[key] = r
+        }
+
+        val albumMap = LinkedHashMap<String, CloudAlbumRecord>()
+        (local.albums + remote.albums).forEach { r ->
+            val cur = albumMap[r.id]
+            if (cur == null || r.updatedAtMs > cur.updatedAtMs || (r.updatedAtMs == cur.updatedAtMs && r.deleted)) {
+                albumMap[r.id] = r
+            }
+        }
+
+        val albumItemMap = LinkedHashMap<Triple<String, Long, Long>, CloudAlbumItemRecord>()
+        (local.albumItems + remote.albumItems).forEach { r ->
+            val key = Triple(r.albumId, r.chatId, r.messageId)
+            val cur = albumItemMap[key]
+            if (cur == null || r.addedAt > cur.addedAt || (r.addedAt == cur.addedAt && r.removed)) {
+                albumItemMap[key] = r
+            }
+        }
+
         return CloudMetaSnapshot(
             version = 1,
             updatedAtMs = maxOf(local.updatedAtMs, remote.updatedAtMs, System.currentTimeMillis()),
@@ -251,6 +411,11 @@ object CloudSyncCodec {
             trash = trashMap.values.toList(),
             syncedFiles = syncedMap.values.toList(),
             playbackPositions = playbackMap.values.toList(),
+            virtualPaths = vpathMap.values.toList(),
+            lockedFlags = lockMap.values.toList(),
+            notes = noteMap.values.toList(),
+            albums = albumMap.values.toList(),
+            albumItems = albumItemMap.values.toList(),
         )
     }
 
@@ -264,10 +429,17 @@ object CloudSyncCodec {
             val cur = merged[key]
             if (cur == null || e.indexedAt >= cur.indexedAt) merged[key] = e
         }
+        val mergedAi = LinkedHashMap<Pair<Long, Long>, CloudAiIndexRecord>()
+        (local.aiEntries + remote.aiEntries).forEach { a ->
+            val key = a.chatId to a.messageId
+            val cur = mergedAi[key]
+            if (cur == null || a.updatedAtMs >= cur.updatedAtMs) mergedAi[key] = a
+        }
         return CloudSearchIndexSnapshot(
             version = 1,
             updatedAtMs = maxOf(local.updatedAtMs, remote.updatedAtMs, System.currentTimeMillis()),
             zipEntries = merged.values.toList(),
+            aiEntries = mergedAi.values.toList(),
         )
     }
 
@@ -336,6 +508,55 @@ object CloudSyncCodec {
                 .append(",\"positionMs\":").append(r.positionMs)
                 .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
         }
+        append("],\n")
+        append("  \"virtualPaths\": [")
+        s.virtualPaths.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"virtualPath\":").append(jsonStr(r.virtualPath))
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
+        }
+        append("],\n")
+        append("  \"lockedFlags\": [")
+        s.lockedFlags.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"isLocked\":").append(r.isLocked)
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
+        }
+        append("],\n")
+        append("  \"notes\": [")
+        s.notes.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"note\":").append(r.note?.let(::jsonStr) ?: "null")
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs).append("}")
+        }
+        append("],\n")
+        append("  \"albums\": [")
+        s.albums.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"id\":").append(jsonStr(r.id))
+                .append(",\"name\":").append(jsonStr(r.name))
+                .append(",\"coverChatId\":").append(r.coverChatId?.toString() ?: "null")
+                .append(",\"coverMessageId\":").append(r.coverMessageId?.toString() ?: "null")
+                .append(",\"createdAt\":").append(r.createdAt)
+                .append(",\"updatedAtMs\":").append(r.updatedAtMs)
+                .append(",\"deleted\":").append(r.deleted).append("}")
+        }
+        append("],\n")
+        append("  \"albumItems\": [")
+        s.albumItems.forEachIndexed { i, r ->
+            if (i > 0) append(",")
+            append("{\"albumId\":").append(jsonStr(r.albumId))
+                .append(",\"chatId\":").append(r.chatId)
+                .append(",\"messageId\":").append(r.messageId)
+                .append(",\"addedAt\":").append(r.addedAt)
+                .append(",\"removed\":").append(r.removed).append("}")
+        }
         append("]\n}\n")
     }
 
@@ -354,6 +575,18 @@ object CloudSyncCodec {
                 .append(",\"entrySize\":").append(e.entrySize)
                 .append(",\"isEncrypted\":").append(e.isEncrypted)
                 .append(",\"indexedAt\":").append(e.indexedAt).append("}")
+        }
+        append("],\n")
+        append("  \"aiEntries\": [")
+        s.aiEntries.forEachIndexed { i, a ->
+            if (i > 0) append(",")
+            append("{\"chatId\":").append(a.chatId)
+                .append(",\"messageId\":").append(a.messageId)
+                .append(",\"ocrText\":").append(a.ocrText?.let(::jsonStr) ?: "null")
+                .append(",\"aiTags\":").append(a.aiTags?.let(::jsonStr) ?: "null")
+                .append(",\"exifLat\":").append(a.exifLat?.toString() ?: "null")
+                .append(",\"exifLng\":").append(a.exifLng?.toString() ?: "null")
+                .append(",\"updatedAtMs\":").append(a.updatedAtMs).append("}")
         }
         append("]\n}\n")
     }
@@ -384,6 +617,7 @@ object CloudSyncCodec {
         GZIPInputStream(ByteArrayInputStream(compressed)).use { it.readBytes() }
 
     private fun Map<*, *>.longVal(key: String): Long? = (this[key] as? Number)?.toLong()
+    private fun Map<*, *>.doubleVal(key: String): Double? = (this[key] as? Number)?.toDouble()
     private fun Map<*, *>.boolVal(key: String): Boolean? = this[key] as? Boolean
     private fun Map<*, *>.strVal(key: String): String? = this[key] as? String
     private fun Map<*, *>.optArray(key: String): List<Any?> = (this[key] as? List<*>) ?: emptyList()

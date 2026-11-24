@@ -24,6 +24,20 @@ class AppPreferencesDataTest {
         assertThat(d.backupPaused).isFalse()
         assertThat(d.decryptedTempTtlMinutes).isEqualTo(30)
         assertThat(d.manualUploadWifiOnly).isFalse()
+        assertThat(d.photosColumns).isEqualTo(3)
+    }
+
+    @Test
+    fun `recent search helpers add deduplicate remove and clear`() {
+        val prefs = AppPreferencesData()
+            .withRecentSearch("tax 2025")
+            .withRecentSearch("receipts")
+            .withRecentSearch("TAX 2025")
+        assertThat(prefs.recentSearches()).containsExactly("TAX 2025", "receipts").inOrder()
+
+        val afterRemove = prefs.withoutRecentSearch("tax 2025")
+        assertThat(afterRemove.recentSearches()).containsExactly("receipts")
+        assertThat(afterRemove.clearRecentSearches().recentSearches()).isEmpty()
     }
 
     @Test

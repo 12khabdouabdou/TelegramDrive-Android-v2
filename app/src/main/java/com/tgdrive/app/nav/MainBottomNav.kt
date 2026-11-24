@@ -100,6 +100,7 @@ fun MainBottomNav(
     onOpenLocalText: (String, String) -> Unit = { _, _ -> },
     onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
+    onOpenTimelineImage: (Long, Long, String?) -> Unit = { chatId, msgId, _ -> onOpenImage(chatId, msgId) },
     onOpenPdf: (Long) -> Unit = {},
     onOpenZip: (Long) -> Unit = {},
     onOpenZipEntry: (Long, Long, String) -> Unit = { _, msgId, _ -> onOpenZip(msgId) },
@@ -252,6 +253,7 @@ fun MainBottomNav(
                     onOpenVideo = onOpenVideo,
                     onOpenSearch = { nav.navigate("search") },
                     onOpenSettings = onOpenSettings,
+                    onOpenTimelineImage = onOpenTimelineImage,
                 )
             }
             composable(Tab.TRANSFERS.route) {
@@ -300,6 +302,10 @@ fun MainBottomNav(
                     onOpenZip = onOpenZip,
                     onOpenText = onOpenText,
                     onOpenZipEntry = onOpenZipEntry,
+                    onOpenLocalVideo = onOpenLocalVideo,
+                    onOpenLocalPdf = onOpenLocalPdf,
+                    onOpenLocalText = onOpenLocalText,
+                    onPlayLocalAudio = onPlayLocalAudio,
                 )
             }
 
