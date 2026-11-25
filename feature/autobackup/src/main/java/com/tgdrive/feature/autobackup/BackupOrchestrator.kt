@@ -116,8 +116,10 @@ class BackupOrchestrator @Inject constructor(
 
         // --- 2.5. Cancellation & Pause watcher on injected IO dispatcher
         val parentJob = coroutineContext[Job]
-        val watcherJob = parentJob?.let { pj ->
-            CoroutineScope(SupervisorJob(pj) + dispatchers.io).launch {
+        val watcherScopeJob = parentJob?.let { SupervisorJob(it) }
+        val watcherJob = if (parentJob != null && watcherScopeJob != null) {
+            val pj = parentJob
+            CoroutineScope(watcherScopeJob + dispatchers.io).launch {
                 try {
                     val cancelWatcher = launch {
                         registry.cancelRequested.collect { requestedId ->
@@ -141,6 +143,8 @@ class BackupOrchestrator @Inject constructor(
                 } catch (_: CancellationException) {
                 }
             }
+        } else {
+            null
         }
 
         // --- 3. Purge stale staging files older than 1 hour
@@ -905,6 +909,7 @@ class BackupOrchestrator @Inject constructor(
             withContext(NonCancellable) {
                 try {
                     watcherJob?.cancelAndJoin()
+                    watcherScopeJob?.cancelAndJoin()
                 } catch (_: Throwable) {}
             }
         }

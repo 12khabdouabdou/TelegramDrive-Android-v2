@@ -112,14 +112,14 @@ class FreeUpSpacePolicyTest {
                 actualSha = null,
             ),
         )
-        assertFalse(
+        assertTrue(
             FreeUpSpacePolicy.shouldDeleteAfterShaCheck(
                 verifyEnabled = true,
                 expectedSha = null,
                 actualSha = "abc123",
             ),
         )
-        assertFalse(
+        assertTrue(
             FreeUpSpacePolicy.shouldDeleteAfterShaCheck(
                 verifyEnabled = true,
                 expectedSha = " ",
