@@ -1,6 +1,7 @@
 package com.tgdrive.feature.player
 
-import com.google.common.truth.Truth.assertThat
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -14,7 +15,7 @@ class PdfValidationTest {
     fun `isLikelyPdfFile returns true for standard pdf header`() {
         val pdf = File(tempDir, "valid.pdf")
         pdf.writeBytes("%PDF-1.7\n1 0 obj\n".toByteArray(Charsets.ISO_8859_1))
-        assertThat(isLikelyPdfFile(pdf)).isTrue()
+        assertTrue(isLikelyPdfFile(pdf))
     }
 
     @Test
@@ -23,7 +24,7 @@ class PdfValidationTest {
         val bytes = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) +
             "  %PDF-1.4\n".toByteArray(Charsets.ISO_8859_1)
         pdf.writeBytes(bytes)
-        assertThat(isLikelyPdfFile(pdf)).isTrue()
+        assertTrue(isLikelyPdfFile(pdf))
     }
 
     @Test
@@ -32,8 +33,8 @@ class PdfValidationTest {
         val html = File(tempDir, "html.pdf").apply { writeText("<html>error</html>") }
         val missing = File(tempDir, "missing.pdf")
 
-        assertThat(isLikelyPdfFile(empty)).isFalse()
-        assertThat(isLikelyPdfFile(html)).isFalse()
-        assertThat(isLikelyPdfFile(missing)).isFalse()
+        assertFalse(isLikelyPdfFile(empty))
+        assertFalse(isLikelyPdfFile(html))
+        assertFalse(isLikelyPdfFile(missing))
     }
 }
