@@ -595,7 +595,7 @@ class CloudSyncManager @Inject constructor(
 
         return CloudSyncCodec.CloudMetaSnapshot(
             version = 1,
-            updatedAtMs = now,
+            updatedAtMs = System.currentTimeMillis(),
             stars = stars,
             renames = renames,
             folderColors = colors,
