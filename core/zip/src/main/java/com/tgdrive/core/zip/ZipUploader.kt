@@ -816,6 +816,7 @@ object ZipUploader {
                     val leafName = sanitizeZipBaseName(safeRelPath.substringAfterLast('/'))
                     val stagedFile = File(stageDir, leafName)
                     var emittedVolumes: List<File> = emptyList()
+                    var emittedCount = 0
                     try {
                         val opened = entry.openStream()
                         if (opened == null) {
@@ -840,7 +841,6 @@ object ZipUploader {
                             zip.createSplitZipFile(listOf(stagedFile), params, true, splitLen)
                         }
                         emittedVolumes = collectOrderedSplitVolumes(workDir, splitBase, splitOutZip)
-                        var emittedCount = 0
                         emittedVolumes.forEach { vol ->
                             currentCoroutineContext().ensureActive()
                             totalParts++
