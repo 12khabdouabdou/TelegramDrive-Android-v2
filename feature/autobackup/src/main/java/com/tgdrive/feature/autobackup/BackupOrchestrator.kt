@@ -484,6 +484,7 @@ class BackupOrchestrator @Inject constructor(
                     startedAt = startedAt,
                     isManual = isManual,
                     prefs = prefs,
+                    overrideTargetFolderId = overrideTargetFolderId,
                     folderUris = folderUris,
                     folderNameByUri = folderNameByUri,
                     scannedByUri = scannedByUri,
@@ -970,6 +971,7 @@ class BackupOrchestrator @Inject constructor(
         startedAt: Long,
         isManual: Boolean,
         prefs: AppPreferencesData,
+        overrideTargetFolderId: Long? = null,
         folderUris: List<String>,
         folderNameByUri: Map<String, String>,
         scannedByUri: Map<String, List<LocalFile>>,
@@ -1195,6 +1197,7 @@ class BackupOrchestrator @Inject constructor(
                         localPath = mFile.absolutePath,
                         fileName = mFile.name,
                         mimeType = "application/json",
+                        onFloodWait = {},
                     ) { _, _ -> }
                     fileCacheDao.upsertAll(
                         listOf(
