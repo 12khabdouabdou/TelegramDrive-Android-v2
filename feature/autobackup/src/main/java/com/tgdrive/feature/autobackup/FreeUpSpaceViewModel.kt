@@ -11,6 +11,7 @@ import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.SyncedFileDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.feature.autobackup.diff.Sha256Calculator
@@ -50,16 +51,45 @@ data class FreeUpSpaceUiState(
     val selectedIds: Set<Long> = emptySet(),
     val ageFilter: FreeUpAgeFilter = FreeUpAgeFilter.ALL,
     val mediaFilter: FreeUpMediaFilter = FreeUpMediaFilter.ALL,
-    val verifyShaBeforeDelete: Boolean = false,
+    val verifyShaBeforeDelete: Boolean = true,
     val skippedModifiedCount: Int = 0,
     val freedCount: Int = 0,
     val freedBytes: Long = 0L,
     val error: String? = null,
 )
 
+internal object FreeUpSpacePolicy {
+    fun isVerifiedInCloud(
+        folderChannelId: Long?,
+        telegramMessageId: Long,
+        cachedKeys: Set<Pair<Long, Long>>,
+        cachedMsgIdsFallback: Set<Long>,
+        trashedKeys: Set<Pair<Long, Long>>,
+        trashedMsgIdsFallback: Set<Long>,
+    ): Boolean {
+        if (telegramMessageId == 0L || cachedKeys.isEmpty()) return false
+        return if (folderChannelId != null) {
+            val key = folderChannelId to telegramMessageId
+            key in cachedKeys && key !in trashedKeys
+        } else {
+            telegramMessageId in cachedMsgIdsFallback && telegramMessageId !in trashedMsgIdsFallback
+        }
+    }
+
+    fun shouldDeleteAfterShaCheck(
+        verifyEnabled: Boolean,
+        expectedSha: String?,
+        actualSha: String?,
+    ): Boolean {
+        if (!verifyEnabled || expectedSha.isNullOrBlank()) return true
+        return actualSha != null && actualSha.equals(expectedSha, ignoreCase = true)
+    }
+}
+
 @HiltViewModel
 class FreeUpSpaceViewModel @Inject constructor(
     private val syncedFileDao: SyncedFileDao,
+    private val folderDao: FolderDao,
     private val fileCacheDao: FileCacheDao,
     private val trashEntryDao: TrashEntryDao,
     private val sha256Calculator: Sha256Calculator,
@@ -153,20 +183,34 @@ class FreeUpSpaceViewModel @Inject constructor(
     }
 
     private suspend fun findReclaimableItems(): List<ReclaimableFile> {
-        val cachedByMsgId = runCatching {
-            fileCacheDao.getAll().associateBy { it.messageId }
+        val folderChannelById = runCatching {
+            folderDao.getAll().associate { it.id to it.channelId }
         }.getOrDefault(emptyMap())
-        val hasCloudCache = cachedByMsgId.isNotEmpty()
-        val trashedMsgIds = runCatching {
-            trashEntryDao.getAll().mapTo(HashSet()) { it.messageId }
-        }.getOrDefault(emptySet())
+        val cachedEntities = runCatching { fileCacheDao.getAll() }.getOrDefault(emptyList())
+        val cachedByKey = cachedEntities.associateBy { it.chatId to it.messageId }
+        val cachedByMsgIdFallback = cachedEntities.associateBy { it.messageId }
+        val trashedEntities = runCatching { trashEntryDao.getAll() }.getOrDefault(emptyList())
+        val trashedKeys = trashedEntities.mapTo(HashSet()) { it.chatId to it.messageId }
+        val trashedMsgIdsFallback = trashedEntities.mapTo(HashSet()) { it.messageId }
 
         val synced = syncedFileDao.getAll().distinctBy { it.localPath }
         val result = ArrayList<ReclaimableFile>()
         for (entry in synced) {
-            if (entry.telegramMessageId in trashedMsgIds) continue
-            val cached = cachedByMsgId[entry.telegramMessageId]
-            if (hasCloudCache && cached == null) continue
+            val folderChannelId = entry.folderId?.let { folderChannelById[it] }
+            val verified = FreeUpSpacePolicy.isVerifiedInCloud(
+                folderChannelId = folderChannelId,
+                telegramMessageId = entry.telegramMessageId,
+                cachedKeys = cachedByKey.keys,
+                cachedMsgIdsFallback = cachedByMsgIdFallback.keys,
+                trashedKeys = trashedKeys,
+                trashedMsgIdsFallback = trashedMsgIdsFallback,
+            )
+            if (!verified) continue
+            val cached = if (folderChannelId != null) {
+                cachedByKey[folderChannelId to entry.telegramMessageId]
+            } else {
+                cachedByMsgIdFallback[entry.telegramMessageId]
+            } ?: continue
 
             val path = entry.localPath
             if (path.startsWith("content://")) {
@@ -244,10 +288,14 @@ class FreeUpSpaceViewModel @Inject constructor(
             var skippedModified = 0
             try {
                 for (item in targets) {
+                    if (!item.verifiedInCloud) {
+                        skippedModified++
+                        continue
+                    }
                     if (current.verifyShaBeforeDelete && !item.sha256.isNullOrBlank()) {
                         val actualSha = sha256Calculator.compute(item.localPath)
-                        if (actualSha != null && actualSha != item.sha256) {
-                            Log.w("FreeUpSpace: skipping ${item.displayName} (local file changed after backup)")
+                        if (!FreeUpSpacePolicy.shouldDeleteAfterShaCheck(true, item.sha256, actualSha)) {
+                            Log.w("FreeUpSpace: skipping ${item.displayName} (SHA mismatch or unreadable local file)")
                             skippedModified++
                             continue
                         }

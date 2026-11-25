@@ -255,6 +255,8 @@ class RootViewModel @Inject constructor(
             try {
                 val has = keystoreHelper.getApiCreds() != null
                 _state.update { it.copy(hasStoredApiCreds = has) }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("RootViewModel: checkStoredCreds failed", t)
             }
@@ -283,6 +285,8 @@ class RootViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             try {
                 preferences.update { it.copy(biometricLastBgTime = now) }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("RootViewModel: persist biometricLastBgTime failed", t)
             }

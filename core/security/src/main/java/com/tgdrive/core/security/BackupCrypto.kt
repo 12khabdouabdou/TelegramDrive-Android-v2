@@ -75,8 +75,13 @@ class BackupCrypto @Inject constructor(
 
     /** Short verification fingerprint (e.g. `A1B2-C3D4`) for displaying the active Vault Key. */
     fun vaultKeyFingerprint(): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(vaultKey())
-        return "%02X%02X-%02X%02X".format(digest[0], digest[1], digest[2], digest[3])
+        val key = vaultKey()
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256").digest(key)
+            "%02X%02X-%02X%02X".format(digest[0], digest[1], digest[2], digest[3])
+        } finally {
+            key.fill(0)
+        }
     }
 
     /** Restores a previously exported 256-bit Base64 Vault Key; returns `false` if invalid. */
@@ -85,22 +90,36 @@ class BackupCrypto @Inject constructor(
         val clean = encoded.trim()
         if (clean.isEmpty()) return false
         val decoded = runCatching { Base64.getDecoder().decode(clean) }.getOrNull() ?: return false
-        if (decoded.size != KEY_BYTES) return false
-        keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(decoded))
-        return true
+        if (decoded.size != KEY_BYTES) {
+            decoded.fill(0)
+            return false
+        }
+        return try {
+            keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(decoded))
+            true
+        } finally {
+            decoded.fill(0)
+        }
     }
 
     /** Wraps the 256-bit Device Vault Key in an AES-256 `TGE2` container protected by [recoveryPassphrase]. */
     fun wrapVaultKeyWithPassphrase(recoveryPassphrase: String): ByteArray {
         val cleanPass = recoveryPassphrase.trim()
         require(cleanPass.length >= 4) { "Recovery passphrase must be at least 4 characters" }
-        val out = ByteArrayOutputStream()
-        encryptStreamWithPassphrase(
-            passphrase = cleanPass.toCharArray(),
-            input = ByteArrayInputStream(vaultKey()),
-            output = out,
-        )
-        return out.toByteArray()
+        val passChars = cleanPass.toCharArray()
+        val key = vaultKey()
+        return try {
+            val out = ByteArrayOutputStream()
+            encryptStreamWithPassphrase(
+                passphrase = passChars,
+                input = ByteArrayInputStream(key),
+                output = out,
+            )
+            out.toByteArray()
+        } finally {
+            passChars.fill('\u0000')
+            key.fill(0)
+        }
     }
 
     /** Unwraps a passphrase-protected Vault Key blob produced by [wrapVaultKeyWithPassphrase] and imports it. */
@@ -111,20 +130,29 @@ class BackupCrypto @Inject constructor(
     ): Boolean {
         val cleanPass = recoveryPassphrase.trim()
         if (cleanPass.isEmpty()) throw WrongPassphraseException("Recovery passphrase is required")
+        val passChars = cleanPass.toCharArray()
         val out = ByteArrayOutputStream()
-        try {
-            decryptStreamWithPassphrase(
-                passphrase = cleanPass.toCharArray(),
-                input = ByteArrayInputStream(wrappedBytes),
-                output = out,
-            )
-        } catch (e: AEADBadTagException) {
-            throw WrongPassphraseException("Incorrect recovery passphrase", e)
+        val key = try {
+            try {
+                decryptStreamWithPassphrase(
+                    passphrase = passChars,
+                    input = ByteArrayInputStream(wrappedBytes),
+                    output = out,
+                )
+            } catch (e: AEADBadTagException) {
+                throw WrongPassphraseException("Incorrect recovery passphrase", e)
+            }
+            out.toByteArray()
+        } finally {
+            passChars.fill('\u0000')
         }
-        val key = out.toByteArray()
-        if (key.size != KEY_BYTES) return false
-        keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(key))
-        return true
+        return try {
+            if (key.size != KEY_BYTES) return false
+            keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(key))
+            true
+        } finally {
+            key.fill(0)
+        }
     }
 
     fun getCustomBackupPassphrase(): String? =
@@ -178,22 +206,31 @@ class BackupCrypto @Inject constructor(
                 BufferedOutputStream(FileOutputStream(outputFile), DEFAULT_CHUNK_SIZE).use { output ->
                     val cleanPass = passphrase?.takeIf { it.isNotBlank() }
                     if (cleanPass != null) {
-                        encryptStreamWithPassphrase(
-                            passphrase = cleanPass.toCharArray(),
-                            input = input,
-                            output = output,
-                            onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
-                            cancelCheck = cancelCheck,
-                        )
+                        val passChars = cleanPass.toCharArray()
+                        try {
+                            encryptStreamWithPassphrase(
+                                passphrase = passChars,
+                                input = input,
+                                output = output,
+                                onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                                cancelCheck = cancelCheck,
+                            )
+                        } finally {
+                            passChars.fill('\u0000')
+                        }
                     } else {
                         val key = vaultKey()
-                        encryptStream(
-                            keyBytes = key,
-                            input = input,
-                            output = output,
-                            onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
-                            cancelCheck = cancelCheck,
-                        )
+                        try {
+                            encryptStream(
+                                keyBytes = key,
+                                input = input,
+                                output = output,
+                                onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                                cancelCheck = cancelCheck,
+                            )
+                        } finally {
+                            key.fill(0)
+                        }
                     }
                 }
             }
@@ -230,24 +267,34 @@ class BackupCrypto @Inject constructor(
                     val progressCb = onProgress?.let { cb -> { bytes: Long -> cb(bytes, total) } }
                     when (format) {
                         EncryptedFileFormat.VAULT_TGE1 -> {
-                            decryptStream(
-                                keyBytes = vaultKey(),
-                                input = input,
-                                output = output,
-                                onBytesProcessed = progressCb,
-                                cancelCheck = cancelCheck,
-                            )
+                            val key = vaultKey()
+                            try {
+                                decryptStream(
+                                    keyBytes = key,
+                                    input = input,
+                                    output = output,
+                                    onBytesProcessed = progressCb,
+                                    cancelCheck = cancelCheck,
+                                )
+                            } finally {
+                                key.fill(0)
+                            }
                         }
                         EncryptedFileFormat.PASSPHRASE_TGE2 -> {
                             val resolved = passphrase?.takeIf { it.isNotBlank() } ?: getCustomBackupPassphrase()
                                 ?: throw WrongPassphraseException("Passphrase is required to decrypt this file")
-                            decryptStreamWithPassphrase(
-                                passphrase = resolved.toCharArray(),
-                                input = input,
-                                output = output,
-                                onBytesProcessed = progressCb,
-                                cancelCheck = cancelCheck,
-                            )
+                            val passChars = resolved.toCharArray()
+                            try {
+                                decryptStreamWithPassphrase(
+                                    passphrase = passChars,
+                                    input = input,
+                                    output = output,
+                                    onBytesProcessed = progressCb,
+                                    cancelCheck = cancelCheck,
+                                )
+                            } finally {
+                                passChars.fill('\u0000')
+                            }
                         }
                         EncryptedFileFormat.UNKNOWN -> {
                             throw IllegalArgumentException("Unrecognized encrypted file header")
@@ -274,7 +321,7 @@ class BackupCrypto @Inject constructor(
         private const val TAG_BITS = 128
         private const val TAG_BYTES = TAG_BITS / 8
         const val DEFAULT_CHUNK_SIZE = 64 * 1024
-        const val PBKDF2_ITERATIONS = 120_000
+        const val PBKDF2_ITERATIONS = 310_000
         private val MAGIC = byteArrayOf('T'.code.toByte(), 'G'.code.toByte(), 'E'.code.toByte(), '1'.code.toByte())
         private val MAGIC_V2 = byteArrayOf('T'.code.toByte(), 'G'.code.toByte(), 'E'.code.toByte(), '2'.code.toByte())
         private const val FLAG_DATA: Byte = 0
@@ -431,23 +478,28 @@ class BackupCrypto @Inject constructor(
 
             val baseIv = ByteArray(IV_BYTES).also { SecureRandom().nextBytes(it) }
             val keySpec = SecretKeySpec(keyBytes, "AES")
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             dos.write(baseIv)
             dos.writeInt(chunkSize)
 
             val plainBuf = ByteArray(chunkSize)
             var chunkIdx = 0L
             var totalRead = 0L
-            while (true) {
-                if (cancelCheck?.invoke() == true) throw CancellationException("Encryption cancelled")
-                val read = readFullyUpTo(input, plainBuf)
-                if (read <= 0) break
-                writeChunk(dos, keySpec, baseIv, chunkIdx, FLAG_DATA, plainBuf, read)
-                chunkIdx++
-                totalRead += read
-                onBytesProcessed?.invoke(totalRead)
+            try {
+                while (true) {
+                    if (cancelCheck?.invoke() == true) throw CancellationException("Encryption cancelled")
+                    val read = readFullyUpTo(input, plainBuf)
+                    if (read <= 0) break
+                    writeChunk(cipher, dos, keySpec, baseIv, chunkIdx, FLAG_DATA, plainBuf, read)
+                    chunkIdx++
+                    totalRead += read
+                    onBytesProcessed?.invoke(totalRead)
+                }
+                // Final empty sentinel chunk authenticates exact stream end against truncation.
+                writeChunk(cipher, dos, keySpec, baseIv, chunkIdx, FLAG_EOF, ByteArray(0), 0)
+            } finally {
+                plainBuf.fill(0)
             }
-            // Final empty sentinel chunk authenticates exact stream end against truncation.
-            writeChunk(dos, keySpec, baseIv, chunkIdx, FLAG_EOF, ByteArray(0), 0)
         }
 
         private fun readEncryptedChunks(
@@ -466,6 +518,7 @@ class BackupCrypto @Inject constructor(
             }
 
             val keySpec = SecretKeySpec(keyBytes, "AES")
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             var chunkIdx = 0L
             var totalWritten = 0L
             var sawEof = false
@@ -480,7 +533,6 @@ class BackupCrypto @Inject constructor(
                 dis.readFully(cipherBytes)
 
                 val nonce = deriveNonce(baseIv, chunkIdx)
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
                 cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
                 cipher.updateAAD(buildAad(chunkIdx, flag))
                 val plain = cipher.doFinal(cipherBytes)
@@ -505,6 +557,7 @@ class BackupCrypto @Inject constructor(
         }
 
         private fun writeChunk(
+            cipher: Cipher,
             dos: DataOutputStream,
             keySpec: SecretKeySpec,
             baseIv: ByteArray,
@@ -514,7 +567,6 @@ class BackupCrypto @Inject constructor(
             plainLen: Int,
         ) {
             val nonce = deriveNonce(baseIv, chunkIdx)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
             cipher.updateAAD(buildAad(chunkIdx, flag))
             val encrypted = cipher.doFinal(plainBuf, 0, plainLen)

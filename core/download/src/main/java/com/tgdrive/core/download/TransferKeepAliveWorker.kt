@@ -41,13 +41,18 @@ class TransferKeepAliveWorker @AssistedInject constructor(
 
         // Brief grace window for enqueue/beginUpload state propagation, then wait until idle
         delay(250L)
+        var lastUpdateMs = 0L
+        var lastActiveCount = -1
         combine(downloadManager.state, uploadTracker.state) { dlState, ulState ->
             val activeDl = dlState.items.filter {
                 it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
             }
             val activeUl = ulState.items.filter { it.status.isActive }
             val activeCount = activeDl.size + activeUl.size
-            if (activeCount > 0) {
+            val now = System.currentTimeMillis()
+            if (activeCount > 0 && (activeCount != lastActiveCount || now - lastUpdateMs >= 400L)) {
+                lastUpdateMs = now
+                lastActiveCount = activeCount
                 val label = activeUl.firstOrNull()?.let { ul ->
                     val verb = when (ul.status) {
                         UploadStatus.PACKING -> "Packing"
@@ -70,7 +75,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
                             progress = progressPct,
                             max = 100,
                             indeterminate = progressPct == 0,
-                            hasActiveUploads = activeUl.isNotEmpty(),
+                            hasActiveTransfers = true,
                         ),
                     )
                 }
@@ -86,7 +91,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
         progress: Int,
         max: Int,
         indeterminate: Boolean,
-        hasActiveUploads: Boolean = false,
+        hasActiveTransfers: Boolean = false,
     ): ForegroundInfo {
         val pausePi = PendingIntent.getBroadcast(
             applicationContext,
@@ -112,7 +117,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             .setOnlyAlertOnce(true)
             .apply {
                 if (max > 0) setProgress(max, progress, indeterminate)
-                if (hasActiveUploads) {
+                if (hasActiveTransfers) {
                     addAction(0, "Pause", pausePi)
                 }
                 addAction(0, "Stop", stopPi)

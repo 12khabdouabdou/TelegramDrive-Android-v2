@@ -6,11 +6,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
+import com.tgdrive.core.common.BitmapUtils
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import kotlinx.coroutines.CompletableDeferred
@@ -807,10 +806,7 @@ class TdLibTelegramClient(
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(localPath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        var sample = 1
-        while (bounds.outWidth / sample > 640 || bounds.outHeight / sample > 640) {
-            sample *= 2
-        }
+        val sample = BitmapUtils.computeInSampleSize(bounds.outWidth, bounds.outHeight, 640)
         val decoded = BitmapFactory.decodeFile(
             localPath,
             BitmapFactory.Options().apply {
@@ -818,36 +814,7 @@ class TdLibTelegramClient(
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             },
         ) ?: return null
-        val orientation = runCatching {
-            ExifInterface(localPath).getAttributeInt(
-                ExifInterface.TAG_ORIENTATION,
-                ExifInterface.ORIENTATION_NORMAL,
-            )
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-        val matrix = Matrix()
-        when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
-            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
-            ExifInterface.ORIENTATION_TRANSPOSE -> {
-                matrix.postRotate(90f)
-                matrix.postScale(-1f, 1f)
-            }
-            ExifInterface.ORIENTATION_TRANSVERSE -> {
-                matrix.postRotate(270f)
-                matrix.postScale(-1f, 1f)
-            }
-            else -> return decoded
-        }
-        return try {
-            val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-            if (rotated !== decoded && !decoded.isRecycled) decoded.recycle()
-            rotated
-        } catch (_: Throwable) {
-            decoded
-        }
+        return BitmapUtils.applyExifOrientationFromFile(localPath, decoded)
     }
 
     private fun decodeUploadVideoThumb(localPath: String): Bitmap? {

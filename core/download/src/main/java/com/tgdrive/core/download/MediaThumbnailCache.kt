@@ -5,13 +5,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
+import com.tgdrive.core.common.BitmapUtils
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
@@ -143,13 +140,18 @@ class MediaThumbnailCache @Inject constructor(
         if (rawBmp == null || rawBmp.isRecycled) return@withContext null
         var scaled: Bitmap = rawBmp
         return@withContext try {
-            scaled = scaleToMax(rawBmp, TARGET_MAX_PX)
+            scaled = BitmapUtils.scaleToMax(rawBmp, TARGET_MAX_PX)
             val jpegOut = ByteArrayOutputStream()
             scaled.compress(Bitmap.CompressFormat.JPEG, 80, jpegOut)
             val plainBytes = jpegOut.toByteArray()
             if (plainBytes.isEmpty()) return@withContext null
             val encOut = ByteArrayOutputStream()
-            BackupCrypto.encryptStream(backupCrypto.vaultKey(), ByteArrayInputStream(plainBytes), encOut)
+            val key = backupCrypto.vaultKey()
+            try {
+                BackupCrypto.encryptStream(key, ByteArrayInputStream(plainBytes), encOut)
+            } finally {
+                key.fill(0)
+            }
             encOut.toByteArray()
         } catch (t: Throwable) {
             Log.w("MediaThumbnailCache: buildEncryptedThumbnailBytes failed", t)
@@ -168,7 +170,12 @@ class MediaThumbnailCache @Inject constructor(
             val plain = jpegOut.toByteArray()
             if (plain.isEmpty()) return@withContext null
             val encOut = ByteArrayOutputStream()
-            BackupCrypto.encryptStream(backupCrypto.vaultKey(), ByteArrayInputStream(plain), encOut)
+            val key = backupCrypto.vaultKey()
+            try {
+                BackupCrypto.encryptStream(key, ByteArrayInputStream(plain), encOut)
+            } finally {
+                key.fill(0)
+            }
             encOut.toByteArray()
         } catch (t: Throwable) {
             Log.w("MediaThumbnailCache: buildEncryptedCollageBytes failed", t)
@@ -249,63 +256,7 @@ class MediaThumbnailCache @Inject constructor(
     fun buildCollageBitmap(
         bitmaps: List<Bitmap>,
         sizePx: Int = TARGET_MAX_PX,
-    ): Bitmap? {
-        val valid = ArrayList<Bitmap>(4)
-        for (bmp in bitmaps) {
-            if (!bmp.isRecycled && bmp.width > 0 && bmp.height > 0) {
-                valid.add(bmp)
-                if (valid.size >= 4) break
-            }
-        }
-        if (valid.isEmpty()) return null
-        if (valid.size == 1) return scaleToMax(valid[0], sizePx)
-
-        val out = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        canvas.drawColor(Color.rgb(20, 24, 32))
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        val half = sizePx / 2
-        val gap = 2
-        val slots: List<Rect> = when (valid.size) {
-            2 -> listOf(
-                Rect(0, 0, half - gap / 2, sizePx),
-                Rect(half + gap / 2, 0, sizePx, sizePx),
-            )
-            3 -> listOf(
-                Rect(0, 0, half - gap / 2, half - gap / 2),
-                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
-                Rect(0, half + gap / 2, sizePx, sizePx),
-            )
-            else -> listOf(
-                Rect(0, 0, half - gap / 2, half - gap / 2),
-                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
-                Rect(0, half + gap / 2, half - gap / 2, sizePx),
-                Rect(half + gap / 2, half + gap / 2, sizePx, sizePx),
-            )
-        }
-        for (i in slots.indices) {
-            val bmp = valid[i]
-            val dst = slots[i]
-            val src = centerCropSrcRect(bmp.width, bmp.height, dst.width(), dst.height())
-            canvas.drawBitmap(bmp, src, dst, paint)
-        }
-        return out
-    }
-
-    private fun centerCropSrcRect(srcW: Int, srcH: Int, dstW: Int, dstH: Int): Rect {
-        if (dstW <= 0 || dstH <= 0) return Rect(0, 0, srcW, srcH)
-        val srcRatio = srcW.toFloat() / srcH.toFloat()
-        val dstRatio = dstW.toFloat() / dstH.toFloat()
-        return if (srcRatio > dstRatio) {
-            val cropW = (srcH * dstRatio).toInt().coerceIn(1, srcW)
-            val left = (srcW - cropW) / 2
-            Rect(left, 0, left + cropW, srcH)
-        } else {
-            val cropH = (srcW / dstRatio).toInt().coerceIn(1, srcH)
-            val top = (srcH - cropH) / 2
-            Rect(0, top, srcW, top + cropH)
-        }
-    }
+    ): Bitmap? = BitmapUtils.composeCollageBitmap(bitmaps, sizePx)
 
     fun saveEncryptedThumbnailBytes(
         chatId: Long,
@@ -325,8 +276,13 @@ class MediaThumbnailCache @Inject constructor(
         if (!f.isFile || f.length() <= 0L) return@withContext null
         runCatching {
             val out = ByteArrayOutputStream()
-            f.inputStream().buffered().use { input ->
-                BackupCrypto.decryptStream(backupCrypto.vaultKey(), input, out)
+            val key = backupCrypto.vaultKey()
+            try {
+                f.inputStream().buffered().use { input ->
+                    BackupCrypto.decryptStream(key, input, out)
+                }
+            } finally {
+                key.fill(0)
             }
             out.toByteArray()
         }.getOrNull()
@@ -489,7 +445,7 @@ class MediaThumbnailCache @Inject constructor(
         val tmpFile = File(thumbsDir, "${chatId}_$messageId.tmp")
         var scaled: Bitmap = rawBmp
         return try {
-            scaled = scaleToMax(rawBmp, TARGET_MAX_PX)
+            scaled = BitmapUtils.scaleToMax(rawBmp, TARGET_MAX_PX)
             FileOutputStream(tmpFile).use { fos ->
                 scaled.compress(Bitmap.CompressFormat.JPEG, 82, fos)
             }
@@ -518,7 +474,7 @@ class MediaThumbnailCache @Inject constructor(
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, TARGET_MAX_PX)
+        val sample = BitmapUtils.computeInSampleSize(bounds.outWidth, bounds.outHeight, TARGET_MAX_PX)
         val bmp = BitmapFactory.decodeFile(
             path,
             BitmapFactory.Options().apply {
@@ -526,20 +482,14 @@ class MediaThumbnailCache @Inject constructor(
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             },
         ) ?: return null
-        val orientation = runCatching {
-            ExifInterface(path).getAttributeInt(
-                ExifInterface.TAG_ORIENTATION,
-                ExifInterface.ORIENTATION_NORMAL,
-            )
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-        return applyExifOrientation(bmp, orientation)
+        return BitmapUtils.applyExifOrientationFromFile(path, bmp)
     }
 
     private fun decodeSampledImageBytes(bytes: ByteArray): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, TARGET_MAX_PX)
+        val sample = BitmapUtils.computeInSampleSize(bounds.outWidth, bounds.outHeight, TARGET_MAX_PX)
         val bmp = BitmapFactory.decodeByteArray(
             bytes,
             0,
@@ -549,13 +499,7 @@ class MediaThumbnailCache @Inject constructor(
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             },
         ) ?: return null
-        val orientation = runCatching {
-            ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
-                ExifInterface.TAG_ORIENTATION,
-                ExifInterface.ORIENTATION_NORMAL,
-            )
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-        return applyExifOrientation(bmp, orientation)
+        return BitmapUtils.applyExifOrientationFromBytes(bytes, bmp)
     }
 
     private fun decodeVideoFrame(path: String): Bitmap? {
@@ -593,49 +537,6 @@ class MediaThumbnailCache @Inject constructor(
                 Log.w("MediaThumbnailCache: failed rendering PDF thumb for ${srcFile.name}", t)
             }.getOrNull()
         }
-    }
-
-    private fun applyExifOrientation(bmp: Bitmap, orientation: Int): Bitmap {
-        val matrix = Matrix()
-        when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
-            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
-            ExifInterface.ORIENTATION_TRANSPOSE -> {
-                matrix.postRotate(90f)
-                matrix.postScale(-1f, 1f)
-            }
-            ExifInterface.ORIENTATION_TRANSVERSE -> {
-                matrix.postRotate(270f)
-                matrix.postScale(-1f, 1f)
-            }
-            else -> return bmp
-        }
-        return try {
-            val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-            if (rotated !== bmp && !bmp.isRecycled) bmp.recycle()
-            rotated
-        } catch (_: Throwable) {
-            bmp
-        }
-    }
-
-    private fun scaleToMax(src: Bitmap, maxDim: Int): Bitmap {
-        if (src.width <= maxDim && src.height <= maxDim) return src
-        val ratio = minOf(maxDim.toFloat() / src.width.coerceAtLeast(1), maxDim.toFloat() / src.height.coerceAtLeast(1))
-        val targetW = (src.width * ratio).toInt().coerceAtLeast(1)
-        val targetH = (src.height * ratio).toInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(src, targetW, targetH, true)
-    }
-
-    private fun computeInSampleSize(width: Int, height: Int, target: Int): Int {
-        var sample = 1
-        while (width / sample > target || height / sample > target) {
-            sample *= 2
-        }
-        return sample
     }
 
     companion object {

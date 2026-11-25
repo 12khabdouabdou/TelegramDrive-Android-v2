@@ -705,7 +705,6 @@ fun FolderScreen(
                         FileViewMode.GRID ->
                             FileGrid(
                                 items = state.items,
-                                pdfThumbnails = state.pdfThumbnails,
                                 decryptedThumbs = state.decryptedThumbs,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
@@ -739,7 +738,6 @@ fun FolderScreen(
                         FileViewMode.LIST ->
                             FileList(
                                 items = state.items,
-                                pdfThumbnails = state.pdfThumbnails,
                                 decryptedThumbs = state.decryptedThumbs,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
@@ -1507,7 +1505,6 @@ private val PART_ZIP_REGEX = Regex("_part(\\d+)\\.zip$", RegexOption.IGNORE_CASE
 @Composable
 private fun FileGrid(
     items: List<FileCacheEntity>,
-    pdfThumbnails: Map<Long, String>,
     decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
@@ -1541,7 +1538,6 @@ private fun FileGrid(
         items(items, key = { it.messageId }) { item ->
             FileGridCell(
                 item = item,
-                pdfThumbnailPath = pdfThumbnails[item.messageId],
                 decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
@@ -1572,7 +1568,6 @@ private fun FileGrid(
 @Composable
 private fun FileGridCell(
     item: FileCacheEntity,
-    pdfThumbnailPath: String? = null,
     decryptedThumbBytes: ByteArray? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
@@ -1580,14 +1575,14 @@ private fun FileGridCell(
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath, pdfThumbnailPath, item.isEncryptedVault) {
+    val thumbFile = remember(item.thumbnailPath, item.isEncryptedVault) {
         if (item.isEncryptedVault) {
             null
         } else {
-            listOfNotNull(item.thumbnailPath, pdfThumbnailPath)
-                .filterNot { it.endsWith(".tgethumb", ignoreCase = true) }
-                .map(::File)
-                .firstOrNull { it.isFile && it.length() > 0L }
+            item.thumbnailPath
+                ?.takeUnless { it.endsWith(".tgethumb", ignoreCase = true) }
+                ?.let(::File)
+                ?.takeIf { it.isFile && it.length() > 0L }
         }
     }
     val partBadge = remember(item.fileName) {
@@ -1768,7 +1763,6 @@ private fun FileGridCell(
 @Composable
 private fun FileList(
     items: List<FileCacheEntity>,
-    pdfThumbnails: Map<Long, String>,
     decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
@@ -1800,7 +1794,6 @@ private fun FileList(
         items(items, key = { it.messageId }) { item ->
             FileListRow(
                 item = item,
-                pdfThumbnailPath = pdfThumbnails[item.messageId],
                 decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
@@ -1831,7 +1824,6 @@ private fun FileList(
 @Composable
 private fun FileListRow(
     item: FileCacheEntity,
-    pdfThumbnailPath: String? = null,
     decryptedThumbBytes: ByteArray? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
@@ -1839,14 +1831,14 @@ private fun FileListRow(
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath, pdfThumbnailPath, item.isEncryptedVault) {
+    val thumbFile = remember(item.thumbnailPath, item.isEncryptedVault) {
         if (item.isEncryptedVault) {
             null
         } else {
-            listOfNotNull(item.thumbnailPath, pdfThumbnailPath)
-                .filterNot { it.endsWith(".tgethumb", ignoreCase = true) }
-                .map(::File)
-                .firstOrNull { it.isFile && it.length() > 0L }
+            item.thumbnailPath
+                ?.takeUnless { it.endsWith(".tgethumb", ignoreCase = true) }
+                ?.let(::File)
+                ?.takeIf { it.isFile && it.length() > 0L }
         }
     }
     val partBadge = remember(item.fileName) {

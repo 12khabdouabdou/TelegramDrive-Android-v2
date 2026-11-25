@@ -37,6 +37,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
@@ -115,28 +116,30 @@ class BackupOrchestrator @Inject constructor(
 
         // --- 2.5. Cancellation & Pause watcher on injected IO dispatcher
         val parentJob = coroutineContext[Job]
-        val watcherJob = CoroutineScope(parentJob!! + dispatchers.io).launch {
-            try {
-                val cancelWatcher = launch {
-                    registry.cancelRequested.collect { requestedId ->
-                        if (requestedId == jobId) {
-                            Log.i("BackupOrchestrator: watcher detected cancellation — cancelling parent job")
-                            parentJob.cancel()
+        val watcherJob = parentJob?.let { pj ->
+            CoroutineScope(SupervisorJob(pj) + dispatchers.io).launch {
+                try {
+                    val cancelWatcher = launch {
+                        registry.cancelRequested.collect { requestedId ->
+                            if (requestedId == jobId) {
+                                Log.i("BackupOrchestrator: watcher detected cancellation — cancelling parent job")
+                                pj.cancel()
+                            }
                         }
                     }
-                }
-                val pauseWatcher = launch {
-                    preferences.data.collect { p ->
-                        val shouldCancel = if (isManual) p.backupPaused else (!p.backupEnabled || p.backupPaused)
-                        if (shouldCancel) {
-                            Log.i("BackupOrchestrator: watcher detected pause/disable — cancelling parent job")
-                            parentJob.cancel()
+                    val pauseWatcher = launch {
+                        preferences.data.collect { p ->
+                            val shouldCancel = if (isManual) p.backupPaused else (!p.backupEnabled || p.backupPaused)
+                            if (shouldCancel) {
+                                Log.i("BackupOrchestrator: watcher detected pause/disable — cancelling parent job")
+                                pj.cancel()
+                            }
                         }
                     }
+                    cancelWatcher.join()
+                    pauseWatcher.cancel()
+                } catch (_: CancellationException) {
                 }
-                cancelWatcher.join()
-                pauseWatcher.cancel()
-            } catch (_: CancellationException) {
             }
         }
 
@@ -901,7 +904,7 @@ class BackupOrchestrator @Inject constructor(
         } finally {
             withContext(NonCancellable) {
                 try {
-                    watcherJob.cancelAndJoin()
+                    watcherJob?.cancelAndJoin()
                 } catch (_: Throwable) {}
             }
         }

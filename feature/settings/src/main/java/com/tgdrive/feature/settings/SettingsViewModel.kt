@@ -52,6 +52,7 @@ data class SettingsUiState(
     val apiHash: String = "",
     val clearingCache: Boolean = false,
     val isEncryptionAvailable: Boolean = true,
+    val keystoreRecoveryReset: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
     val backupEncryptAll: Boolean = false,
@@ -122,6 +123,7 @@ class SettingsViewModel @Inject constructor(
             apiHash = creds?.apiHash.orEmpty(),
             clearingCache = clearing,
             isEncryptionAvailable = keystore.isEncryptionAvailable,
+            keystoreRecoveryReset = keystore.hadRecoveryReset,
             cloudSyncing = syncing,
             lastCloudSyncMs = p.lastCloudSyncMs,
             backupEncryptAll = p.backupEncryptAll,
@@ -323,15 +325,21 @@ class SettingsViewModel @Inject constructor(
             withContext(NonCancellable) {
                 Log.i("SettingsViewModel: starting full logout")
 
-                // 1. Stop background workers, active transfers, and audio playback first.
+                // 1. Stop background workers, clear pins BEFORE clearing download queue, and stop audio playback.
                 try { WorkManager.getInstance(appContext).cancelAllWork() } catch (t: Throwable) {
                     Log.w("logout: cancelAllWork failed", t)
+                }
+                try { offlinePinStore.clearAll() } catch (t: Throwable) {
+                    Log.w("logout: offlinePinStore.clearAll failed", t)
                 }
                 try { uploadManager.cancelAll() } catch (t: Throwable) {
                     Log.w("logout: uploadManager.cancelAll failed", t)
                 }
                 try { downloadManager.clearCache() } catch (t: Throwable) {
                     Log.w("logout: downloadManager.clearCache failed", t)
+                }
+                try { cloudSyncManager.clearInMemoryState() } catch (t: Throwable) {
+                    Log.w("logout: cloudSyncManager.clearInMemoryState failed", t)
                 }
                 try { audioPlayerController.release() } catch (t: Throwable) {
                     Log.w("logout: audio release failed", t)
@@ -354,7 +362,6 @@ class SettingsViewModel @Inject constructor(
                 try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
                 try { albumDao.clear() } catch (t: Throwable) { Log.w("logout: albumDao.clear failed", t) }
                 try { pendingUploadDao.clear() } catch (t: Throwable) { Log.w("logout: pendingUploadDao.clear failed", t) }
-                try { offlinePinStore.clearAll() } catch (t: Throwable) { Log.w("logout: offlinePinStore.clearAll failed", t) }
 
                 // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
                 try {
@@ -399,9 +406,37 @@ class SettingsViewModel @Inject constructor(
 
                 // 5. Purge all local cache / staging directories.
                 try { decryptedTempSweeper.wipeAll() } catch (_: Throwable) {}
-                for (dirName in listOf("backup_staging", "upload_staging", "decrypted", "downloads", "image_cache", "zip_extracts", "share_staging", "pdf_thumbs", "cloud_sync", "media_thumbs", "minithumbs", "upload_thumbs", "encrypted_thumbs", "vault_sync")) {
+                for (
+                    dirName in listOf(
+                        "backup_staging",
+                        "upload_staging",
+                        "decrypted",
+                        "downloads",
+                        "image_cache",
+                        "zip_extracts",
+                        "share_staging",
+                        "pdf_thumbs",
+                        "zip_thumbs",
+                        "cloud_sync",
+                        "media_thumbs",
+                        "minithumbs",
+                        "upload_thumbs",
+                        "encrypted_thumbs",
+                        "vault_sync",
+                        "text_edits",
+                        "crop_tmp",
+                        "scan_tmp",
+                    )
+                ) {
                     try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
                 }
+                try {
+                    appContext.cacheDir.listFiles()?.forEach { f ->
+                        if (f.name.startsWith("zip_export_")) {
+                            runCatching { f.deleteRecursively() }
+                        }
+                    }
+                } catch (_: Throwable) {}
 
                 _credsVersion.value += 1
                 Log.i("SettingsViewModel: logout complete")
@@ -416,6 +451,8 @@ class SettingsViewModel @Inject constructor(
                 telegramClient.clearDownloadCache()
             }
             Log.i("SettingsViewModel: cache cleared")
+        } catch (e: CancellationException) {
+            throw e
         } catch (t: Throwable) {
             Log.w("SettingsViewModel: clearCache failed", t)
         } finally {

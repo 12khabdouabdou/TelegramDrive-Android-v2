@@ -36,6 +36,7 @@ open class KeystoreHelper @Inject constructor(
 
     @Volatile private var _prefs: SharedPreferences? = null
     @Volatile private var _encryptionAvailable: Boolean = true
+    @Volatile private var _hadRecoveryReset: Boolean = false
     private var generation: Int = 0
 
     @Deprecated(
@@ -76,6 +77,7 @@ open class KeystoreHelper @Inject constructor(
             Log.w("KeystoreHelper: EncryptedSharedPreferences open/canary failed — attempting recovery", t)
         }
         // Attempt 2: wipe corrupted master key + prefs and retry cleanly.
+        _hadRecoveryReset = true
         resetSecureStorageInternal()
         try {
             val prefs = createEncryptedPrefs()
@@ -237,10 +239,12 @@ open class KeystoreHelper @Inject constructor(
 
     @Synchronized
     fun clear() {
+        _hadRecoveryReset = false
         resetSecureStorage()
     }
 
     val isEncryptionAvailable: Boolean get() = _encryptionAvailable
+    val hadRecoveryReset: Boolean get() = _hadRecoveryReset
 
     companion object {
         const val KEY_API_ID = "telegram_api_id"

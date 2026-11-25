@@ -1,14 +1,10 @@
 package com.tgdrive.core.download
 
-import android.content.ContentValues
 import android.content.Context
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import android.webkit.MimeTypeMap
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
@@ -24,7 +20,6 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileInputStream
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -674,49 +669,11 @@ class DownloadManager @Inject constructor(
      */
     fun saveCompletedToDownloads(item: DownloadItem): File? {
         val localPath = item.localPath ?: return null
-        val src = File(localPath)
-        if (!src.isFile || src.length() <= 0L) return null
-        val safeName = sanitizeDownloadFileName(item.fileName)
-        val ext = safeName.substringAfterLast('.', "").lowercase()
-        val mime = when (ext) {
-            "pdf" -> "application/pdf"
-            else -> runCatching {
-                MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext)
-            }.getOrNull() ?: "application/octet-stream"
-        }
-        return runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
-                    put(MediaStore.Downloads.MIME_TYPE, mime)
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = ctx.contentResolver
-                val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
-                try {
-                    resolver.openOutputStream(itemUri)?.use { out ->
-                        FileInputStream(src).use { input -> input.copyTo(out, 64 * 1024) }
-                    }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(itemUri, values, null, null)
-                } catch (t: Throwable) {
-                    runCatching { resolver.delete(itemUri, null, null) }
-                    throw t
-                }
-                src
-            } else {
-                @Suppress("DEPRECATION")
-                val dlDir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "TelegramDrive",
-                ).apply { mkdirs() }
-                val dest = File(dlDir, safeName)
-                src.copyTo(dest, overwrite = true)
-                dest
-            }
-        }.getOrNull()
+        return PublicDownloadsExporter.saveToPublicDownloads(
+            ctx = ctx,
+            source = File(localPath),
+            displayName = item.fileName,
+        )
     }
 
     private fun persistQueue() {
@@ -788,14 +745,8 @@ class DownloadManager @Inject constructor(
         private const val DOWNLOAD_NOTIF_ID = 50001
         private const val WIFI_WAIT_MESSAGE = "Waiting for Wi-Fi…"
 
-        internal fun sanitizeDownloadFileName(raw: String): String {
-            val cleaned = raw
-                .substringAfterLast('/')
-                .substringAfterLast('\\')
-                .replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001F]"), "_")
-                .trim(' ', '.')
-            return cleaned.ifBlank { "download" }
-        }
+        internal fun sanitizeDownloadFileName(raw: String): String =
+            PublicDownloadsExporter.sanitizeFileName(raw)
     }
 
     private fun updateItem(chatId: Long, id: Long, transform: (DownloadItem) -> DownloadItem) {

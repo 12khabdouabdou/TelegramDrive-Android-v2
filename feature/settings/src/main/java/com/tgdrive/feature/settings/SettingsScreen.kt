@@ -875,6 +875,38 @@ fun SettingsScreen(
                     }
                 }
             }
+            if (state.keystoreRecoveryReset) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.tertiaryContainer)
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Warning,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Column {
+                        Text(
+                            text = stringResource(R.string.settings_keystore_reset_title),
+                            style = TgTypography.Display.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                        Text(
+                            text = stringResource(R.string.settings_keystore_reset_desc),
+                            style = TgTypography.Display.bodySmall,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                    }
+                }
+            }
 
             val canToggle = bioAvail == BiometricHelper.Availability.AVAILABLE || state.biometricEnabled
             val bioDesc = if (bioAvail == BiometricHelper.Availability.AVAILABLE || state.biometricEnabled) {

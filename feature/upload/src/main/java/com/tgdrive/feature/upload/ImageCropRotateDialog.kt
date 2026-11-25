@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -32,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -49,6 +51,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.tgdrive.core.common.BitmapUtils
 import com.tgdrive.designsystem.theme.TgTypography
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -73,8 +76,15 @@ fun ImageCropRotateDialog(
     var previewBitmap by remember(sourceUri) { mutableStateOf<Bitmap?>(null) }
     var saving by remember { mutableStateOf(false) }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            previewBitmap?.takeIf { !it.isRecycled }?.recycle()
+            previewBitmap = null
+        }
+    }
+
     LaunchedEffect(sourceUri, rotationDeg, aspectRatio) {
-        previewBitmap = withContext(Dispatchers.IO) {
+        val next = withContext(Dispatchers.IO) {
             renderTransformedBitmap(
                 context = context,
                 uri = sourceUri,
@@ -82,6 +92,11 @@ fun ImageCropRotateDialog(
                 rotationDeg = rotationDeg,
                 targetAspect = aspectRatio,
             )
+        }
+        val prev = previewBitmap
+        previewBitmap = next
+        if (prev != null && prev !== next && !prev.isRecycled) {
+            prev.recycle()
         }
     }
 
@@ -118,7 +133,7 @@ fun ImageCropRotateDialog(
                     contentAlignment = Alignment.Center,
                 ) {
                     val bmp = previewBitmap
-                    if (bmp != null) {
+                    if (bmp != null && !bmp.isRecycled) {
                         Image(
                             bitmap = bmp.asImageBitmap(),
                             contentDescription = displayName,
@@ -189,7 +204,7 @@ fun ImageCropRotateDialog(
                             val fullBmp = renderTransformedBitmap(
                                 context = context,
                                 uri = sourceUri,
-                                maxSidePx = 4096,
+                                maxSidePx = 2560,
                                 rotationDeg = rotationDeg,
                                 targetAspect = aspectRatio,
                             ) ?: return@withContext null
@@ -248,43 +263,42 @@ private fun renderTransformedBitmap(
     val opts = BitmapFactory.Options().apply { inSampleSize = sample }
     val decoded = openUriStream(context, uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
         ?: return null
+    val exifOrientation = runCatching {
+        openUriStream(context, uri)?.use { stream ->
+            ExifInterface(stream).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL,
+            )
+        } ?: ExifInterface.ORIENTATION_NORMAL
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+    val oriented = BitmapUtils.applyExifOrientation(decoded, exifOrientation)
 
-    var rotated: Bitmap? = null
-    var cropped: Bitmap? = null
-    try {
-        val norm = ((rotationDeg % 360f) + 360f) % 360f
-        val base = if (norm > 0.5f) {
-            val m = Matrix().apply { postRotate(norm) }
-            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true).also { rotated = it }
-        } else {
-            decoded
-        }
-        val finalBmp = if (targetAspect != null && targetAspect > 0f) {
-            val w = base.width
-            val h = base.height
-            val curRatio = w.toFloat() / h.toFloat().coerceAtLeast(1f)
-            val (cw, ch) = if (curRatio > targetAspect) {
-                (h * targetAspect).toInt().coerceIn(1, w) to h
-            } else {
-                w to (w / targetAspect).toInt().coerceIn(1, h)
-            }
-            val x = ((w - cw) / 2).coerceAtLeast(0)
-            val y = ((h - ch) / 2).coerceAtLeast(0)
-            Bitmap.createBitmap(base, x, y, cw, ch).also { cropped = it }
-        } else {
-            base
-        }
+    val norm = ((rotationDeg % 360f) + 360f) % 360f
+    val base = if (norm > 0.5f) {
+        val m = Matrix().apply { postRotate(norm) }
+        val r = Bitmap.createBitmap(oriented, 0, 0, oriented.width, oriented.height, m, true)
+        if (r !== oriented && !oriented.isRecycled) oriented.recycle()
+        r
+    } else {
+        oriented
+    }
 
-        if (finalBmp === decoded) {
-            decoded.copy(Bitmap.Config.ARGB_8888, false)
+    if (targetAspect != null && targetAspect > 0f) {
+        val w = base.width
+        val h = base.height
+        val curRatio = w.toFloat() / h.toFloat().coerceAtLeast(1f)
+        val (cw, ch) = if (curRatio > targetAspect) {
+            (h * targetAspect).toInt().coerceIn(1, w) to h
         } else {
-            finalBmp
+            w to (w / targetAspect).toInt().coerceIn(1, h)
         }
-    } finally {
-        if (rotated != null && rotated !== decoded && cropped !== rotated) {
-            rotated?.recycle()
-        }
-        decoded.recycle()
+        val x = ((w - cw) / 2).coerceAtLeast(0)
+        val y = ((h - ch) / 2).coerceAtLeast(0)
+        val cropped = Bitmap.createBitmap(base, x, y, cw, ch)
+        if (cropped !== base && !base.isRecycled) base.recycle()
+        cropped
+    } else {
+        base
     }
 }.getOrNull()
 

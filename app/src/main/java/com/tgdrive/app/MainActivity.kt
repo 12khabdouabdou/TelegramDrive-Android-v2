@@ -31,7 +31,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -58,6 +57,7 @@ import com.tgdrive.designsystem.components.OfflineBanner
 import com.tgdrive.designsystem.theme.TelegramDriveTheme
 import com.tgdrive.designsystem.theme.TgTypography
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -85,8 +85,10 @@ class MainActivity : FragmentActivity() {
                 currentIntent?.let { rootVm.handleAppIntent(it) }
             }
 
-            LaunchedEffect(state.blockScreenshotsEverywhere) {
-                if (state.blockScreenshotsEverywhere) {
+            val shouldSecureWindow =
+                state.blockScreenshotsEverywhere || (state.biometricRequired && !state.biometricUnlocked)
+            LaunchedEffect(shouldSecureWindow) {
+                if (shouldSecureWindow) {
                     window.setFlags(
                         WindowManager.LayoutParams.FLAG_SECURE,
                         WindowManager.LayoutParams.FLAG_SECURE,
@@ -166,19 +168,22 @@ class MainActivity : FragmentActivity() {
         var retryTrigger by remember { mutableIntStateOf(0) }
         val promptTitle = stringResource(R.string.biometric_prompt_title)
         val promptSubtitle = stringResource(R.string.biometric_prompt_subtitle)
-
-        DisposableEffect(Unit) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-            onDispose {
-                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-            }
-        }
+        val unavailableMsg = stringResource(R.string.biometric_locked_subtitle)
 
         LaunchedEffect(retryTrigger) {
             try {
-                if (biometricHelper.availability() != BiometricHelper.Availability.AVAILABLE) {
-                    onUnlock()
-                    return@LaunchedEffect
+                when (biometricHelper.availability()) {
+                    BiometricHelper.Availability.NO_HARDWARE,
+                    BiometricHelper.Availability.NOT_ENROLLED,
+                    -> {
+                        onUnlock()
+                        return@LaunchedEffect
+                    }
+                    BiometricHelper.Availability.UNAVAILABLE -> {
+                        error = unavailableMsg
+                        return@LaunchedEffect
+                    }
+                    BiometricHelper.Availability.AVAILABLE -> Unit
                 }
                 biometricHelper.authenticate(
                     activity = this@MainActivity,
@@ -187,6 +192,8 @@ class MainActivity : FragmentActivity() {
                     onSuccess = { onUnlock() },
                     onError = { msg -> error = msg },
                 )
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 error = t.message
             }

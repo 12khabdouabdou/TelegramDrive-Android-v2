@@ -20,6 +20,7 @@ import com.tgdrive.feature.autobackup.BackupScheduler
 import com.tgdrive.feature.autobackup.ScheduledUploadScheduler
 import com.tgdrive.feature.autobackup.watcher.FolderWatcher
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -113,6 +114,8 @@ class TelegramDriveApp :
                     Log.w("TelegramDriveApp: TDLib init timed out after ${TDLIB_INIT_TIMEOUT_MS}ms — " +
                           "user will see auth screen; TDLib may finish initializing in the background")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: auto-init failed", t)
             }
@@ -124,6 +127,8 @@ class TelegramDriveApp :
             try {
                 val n = syncLogDao.markRunningAsCancelled(System.currentTimeMillis())
                 if (n > 0) Log.i("TelegramDriveApp: recovered $n stale RUNNING sync_log row(s)")
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: stale RUNNING recovery failed", t)
             }
@@ -135,11 +140,15 @@ class TelegramDriveApp :
         appScope.launch {
             try {
                 backupScheduler.rescheduleIfEnabled()
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: rescheduleIfEnabled failed", t)
             }
             try {
                 scheduledUploadScheduler.rescheduleIfEnabled()
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: scheduledUploadScheduler failed", t)
             }
@@ -159,6 +168,8 @@ class TelegramDriveApp :
                         Log.i("TelegramDriveApp: ON_CHANGE trigger → enqueuing backup")
                         backupScheduler.enqueueOnChange()
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (t: Throwable) {
                     Log.w("TelegramDriveApp: ON_CHANGE trigger failed", t)
                 }

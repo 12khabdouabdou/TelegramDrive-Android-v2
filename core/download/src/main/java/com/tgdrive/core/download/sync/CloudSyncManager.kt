@@ -894,6 +894,25 @@ class CloudSyncManager @Inject constructor(
         }
     }
 
+    fun clearInMemoryState() {
+        pushMetaJob?.cancel()
+        pushMetaJob = null
+        pushSearchJob?.cancel()
+        pushSearchJob = null
+        localStarTimestamps.clear()
+        localRenameTimestamps.clear()
+        localColorTimestamps.clear()
+        localTrashTombstones.clear()
+        localPlaybackTimestamps.clear()
+        localVirtualPathTimestamps.clear()
+        localLockTimestamps.clear()
+        localNoteTimestamps.clear()
+        localAlbumTimestamps.clear()
+        localAlbumItemTimestamps.clear()
+        localAiTimestamps.clear()
+        localEncryptedThumbTimestamps.clear()
+    }
+
     companion object {
         private const val PUSH_DEBOUNCE_MS = 8_000L
         const val TRASH_RETENTION_MS = 30L * 24L * 60L * 60L * 1000L

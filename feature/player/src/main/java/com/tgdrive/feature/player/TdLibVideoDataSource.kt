@@ -22,6 +22,8 @@ class TdLibVideoDataSource(
     private val telegramClient: TelegramClient,
     private val remoteId: String,
     private val fallbackTotalBytes: Long,
+    private val chatId: Long = 0L,
+    private val messageId: Long = 0L,
     private val onOpenedFileId: (Int) -> Unit = {},
 ) : BaseDataSource(/* isNetwork = */ true) {
 
@@ -39,8 +41,20 @@ class TdLibVideoDataSource(
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
         dataUri = dataSpec.uri
-        val info = runBlocking { telegramClient.openStreamFile(remoteId) }
-            ?: throw IOException("Unable to open Telegram stream")
+        val info = runBlocking {
+            telegramClient.openStreamFile(remoteId) ?: run {
+                if (chatId != 0L && messageId != 0L) {
+                    val refreshed = telegramClient.refreshMessageRemoteId(chatId, messageId)
+                    if (!refreshed.isNullOrBlank() && refreshed != remoteId) {
+                        telegramClient.openStreamFile(refreshed)
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+            }
+        } ?: throw IOException("Unable to open Telegram stream")
 
         fileId = info.fileId
         onOpenedFileId(fileId)

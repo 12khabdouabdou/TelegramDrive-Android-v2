@@ -255,37 +255,12 @@ class VideoPlayerViewModel @Inject constructor(
         displayName: String,
         mimeType: String,
     ): File? = withContext(dispatchers.io) {
-        if (!source.isFile || source.length() <= 0L) return@withContext null
-        val safeName = displayName.replace(Regex("[^A-Za-z0-9._ -]"), "_").ifBlank { source.name }
-        runCatching {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
-                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = appContext.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
-                try {
-                    resolver.openOutputStream(uri)?.use { out -> source.inputStream().use { it.copyTo(out) } }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                } catch (t: Throwable) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    throw t
-                }
-                source
-            } else {
-                @Suppress("DEPRECATION")
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TelegramDrive")
-                    .apply { mkdirs() }
-                val dest = File(dir, safeName)
-                source.copyTo(dest, overwrite = true)
-                dest
-            }
-        }.getOrNull()
+        com.tgdrive.core.common.PublicDownloadsExporter.saveToPublicDownloads(
+            ctx = appContext,
+            source = source,
+            displayName = displayName,
+            mimeType = mimeType,
+        )
     }
 
     suspend fun saveEditedTextToDownloads(fileName: String, text: String): Boolean = withContext(dispatchers.io) {
@@ -931,6 +906,8 @@ private fun VideoPlayerBody(
                         telegramClient = vm.telegramClient,
                         remoteId = entry.remoteId,
                         fallbackTotalBytes = entry.fileSize,
+                        chatId = entry.chatId,
+                        messageId = entry.messageId,
                         onOpenedFileId = { fid -> streamFileId = fid },
                     )
                 }

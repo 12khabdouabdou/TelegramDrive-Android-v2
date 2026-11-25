@@ -2,15 +2,11 @@ package com.tgdrive.feature.browser
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
 import android.os.ParcelFileDescriptor
 import androidx.collection.LruCache
+import com.tgdrive.core.common.BitmapUtils
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.security.BackupCrypto
 import net.lingala.zip4j.ZipFile
@@ -117,7 +113,7 @@ class ZipThumbnailGenerator(
             }
         }
         if (decoded.isEmpty()) return null
-        val collage = composeCollageBitmap(decoded, targetSizePx) ?: return null
+        val collage = BitmapUtils.composeCollageBitmap(decoded, targetSizePx) ?: return null
         cache.put(key, collage)
         writeToDiskCache(diskHash, collage, encrypted)
         return collage
@@ -190,52 +186,18 @@ class ZipThumbnailGenerator(
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
-            val sample = computeInSampleSize(bounds.outWidth, bounds.outHeight, targetSizePx)
+            val sample = BitmapUtils.computeInSampleSize(bounds.outWidth, bounds.outHeight, targetSizePx)
             val opts = BitmapFactory.Options().apply {
                 inSampleSize = sample
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             }
             val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
-            applyExifOrientation(bytes, decoded)
+            BitmapUtils.applyExifOrientationFromBytes(bytes, decoded)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (t: Throwable) {
             Log.w("ZipThumbnailGenerator: failed to decode image '$entryName'", t)
             null
-        }
-    }
-
-    private fun applyExifOrientation(bytes: ByteArray, bitmap: Bitmap): Bitmap {
-        val orientation = runCatching {
-            ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
-                ExifInterface.TAG_ORIENTATION,
-                ExifInterface.ORIENTATION_NORMAL,
-            )
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-
-        val matrix = Matrix()
-        when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
-            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
-            ExifInterface.ORIENTATION_TRANSPOSE -> {
-                matrix.postRotate(90f)
-                matrix.postScale(-1f, 1f)
-            }
-            ExifInterface.ORIENTATION_TRANSVERSE -> {
-                matrix.postRotate(270f)
-                matrix.postScale(-1f, 1f)
-            }
-            else -> return bitmap
-        }
-        return try {
-            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-            if (rotated !== bitmap && !bitmap.isRecycled) bitmap.recycle()
-            rotated
-        } catch (_: Throwable) {
-            bitmap
         }
     }
 
@@ -333,66 +295,6 @@ class ZipThumbnailGenerator(
         }
     }
 
-    private fun composeCollageBitmap(bitmaps: List<Bitmap>, sizePx: Int): Bitmap? {
-        if (bitmaps.isEmpty()) return null
-        if (bitmaps.size == 1) {
-            val single = bitmaps[0]
-            if (single.isRecycled) return null
-            return Bitmap.createScaledBitmap(
-                single,
-                sizePx.coerceAtLeast(1),
-                ((single.height.toFloat() / single.width.coerceAtLeast(1)) * sizePx).toInt().coerceIn(1, sizePx),
-                true,
-            )
-        }
-        val out = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        canvas.drawColor(Color.rgb(20, 24, 32))
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        val half = sizePx / 2
-        val gap = 2
-        val slots: List<Rect> = when (bitmaps.size) {
-            2 -> listOf(
-                Rect(0, 0, half - gap / 2, sizePx),
-                Rect(half + gap / 2, 0, sizePx, sizePx),
-            )
-            3 -> listOf(
-                Rect(0, 0, half - gap / 2, half - gap / 2),
-                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
-                Rect(0, half + gap / 2, sizePx, sizePx),
-            )
-            else -> listOf(
-                Rect(0, 0, half - gap / 2, half - gap / 2),
-                Rect(half + gap / 2, 0, sizePx, half - gap / 2),
-                Rect(0, half + gap / 2, half - gap / 2, sizePx),
-                Rect(half + gap / 2, half + gap / 2, sizePx, sizePx),
-            )
-        }
-        for (i in slots.indices) {
-            val bmp = bitmaps[i]
-            if (bmp.isRecycled) continue
-            val dst = slots[i]
-            val src = centerCropSrcRect(bmp.width, bmp.height, dst.width(), dst.height())
-            canvas.drawBitmap(bmp, src, dst, paint)
-        }
-        return out
-    }
-
-    private fun centerCropSrcRect(srcW: Int, srcH: Int, dstW: Int, dstH: Int): Rect {
-        if (dstW <= 0 || dstH <= 0) return Rect(0, 0, srcW, srcH)
-        val srcRatio = srcW.toFloat() / srcH.coerceAtLeast(1).toFloat()
-        val dstRatio = dstW.toFloat() / dstH.toFloat()
-        return if (srcRatio > dstRatio) {
-            val cropW = (srcH * dstRatio).toInt().coerceIn(1, srcW)
-            val left = (srcW - cropW) / 2
-            Rect(left, 0, left + cropW, srcH)
-        } else {
-            val cropH = (srcW / dstRatio).toInt().coerceIn(1, srcH)
-            val top = (srcH - cropH) / 2
-            Rect(0, top, srcW, top + cropH)
-        }
-    }
-
     private fun computeDiskHash(prefix: String, zipPath: String, target: String): String {
         val mtime = runCatching { File(zipPath).lastModified() }.getOrDefault(0L)
         val digest = MessageDigest.getInstance("SHA-256")
@@ -465,7 +367,7 @@ class ZipThumbnailGenerator(
 
     private fun downsampleIfNeeded(bitmap: Bitmap): Bitmap {
         if (bitmap.width <= targetSizePx && bitmap.height <= targetSizePx) return bitmap
-        val sample = computeInSampleSize(bitmap.width, bitmap.height, targetSizePx)
+        val sample = BitmapUtils.computeInSampleSize(bitmap.width, bitmap.height, targetSizePx)
         val scaled = Bitmap.createScaledBitmap(
             bitmap,
             (bitmap.width / sample).coerceAtLeast(1),
@@ -476,18 +378,6 @@ class ZipThumbnailGenerator(
             bitmap.recycle()
         }
         return scaled
-    }
-
-    private fun computeInSampleSize(
-        width: Int,
-        height: Int,
-        target: Int,
-    ): Int {
-        var sample = 1
-        while (width / sample > target || height / sample > target) {
-            sample *= 2
-        }
-        return sample
     }
 
     internal fun selectVideoReadLimitBytes(uncompressedSize: Long): Long =

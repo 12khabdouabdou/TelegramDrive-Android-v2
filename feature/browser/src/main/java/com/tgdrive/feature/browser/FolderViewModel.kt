@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.FileFilter
@@ -109,7 +110,6 @@ data class FolderUiState(
     val fileFilter: FileFilter = FileFilter.ALL,
     val fileSort: FileSort = FileSort.DATE_DESC,
     val uploads: List<UploadItem> = emptyList(),
-    val pdfThumbnails: Map<Long, String> = emptyMap(),
     val pendingReviewFiles: List<com.tgdrive.core.download.UploadFileItem> = emptyList(),
     val pendingZipTreeUri: Uri? = null,
     val pendingZipFolderName: String? = null,
@@ -162,7 +162,6 @@ class FolderViewModel
         private val _virtualPath = MutableStateFlow("")
         private val _createdVirtualFolders = MutableStateFlow<Map<Long, Set<String>>>(emptyMap())
         private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
-        private val _pdfThumbnails = MutableStateFlow<Map<Long, String>>(emptyMap())
         private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
         val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
         private val _isSavedMessages = MutableStateFlow(false)
@@ -256,7 +255,6 @@ class FolderViewModel
                     _search,
                     preferences.data,
                     uploadManager.uploads,
-                    _pdfThumbnails,
                     combine(
                         _boundChatId,
                         _batchDecryptProgress,
@@ -270,18 +268,15 @@ class FolderViewModel
                         search,
                         prefs,
                         uploadQueue,
-                        pdfThumbs,
                         auxTail,
                     ->
-                    listOf(search, prefs, uploadQueue, pdfThumbs, auxTail)
+                    listOf(search, prefs, uploadQueue, auxTail)
                 },
             ) { c, overlays, aux ->
                 val search = aux[0] as String
                 val prefs = aux[1] as com.tgdrive.core.datastore.AppPreferencesData
                 val uploadQueue = aux[2] as com.tgdrive.core.download.UploadQueueState
-                @Suppress("UNCHECKED_CAST")
-                val pdfThumbs = aux[3] as Map<Long, String>
-                val auxTail = aux[4] as FolderAuxTail
+                val auxTail = aux[3] as FolderAuxTail
                 val boundId = auxTail.boundId
                 val batchProgress = auxTail.batchProgress
                 val rawVirtualPath = normalizeVirtualPath(auxTail.virtualPath)
@@ -385,7 +380,6 @@ class FolderViewModel
                     fileFilter = prefs.fileFilter,
                     fileSort = prefs.fileSort,
                     uploads = chatUploads,
-                    pdfThumbnails = pdfThumbs,
                     pendingReviewFiles = overlays.reviewFiles,
                     pendingZipTreeUri = overlays.zipFolder.first,
                     pendingZipFolderName = overlays.zipFolder.second,
@@ -432,7 +426,6 @@ class FolderViewModel
             attemptedThumbKeys.clear()
             _items.value = emptyList()
             _selected.value = emptySet()
-            _pdfThumbnails.value = emptyMap()
             oldestMessageId = 0L
             hasMoreMessages = true
             bindJob =
@@ -1572,54 +1565,18 @@ class FolderViewModel
                         _error.value = "Downloaded file is missing"
                         return@launch
                     }
-                    val safeName = item.fileName
-                        .substringAfterLast('/')
-                        .substringAfterLast('\\')
-                        .replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001F]"), "_")
-                        .trim(' ', '.')
-                        .ifBlank { "download" }
-                    val mime = when {
-                        safeName.endsWith(".pdf", ignoreCase = true) -> "application/pdf"
-                        !item.mimeType.isNullOrBlank() -> item.mimeType
-                        else -> "application/octet-stream"
-                    }
-                    if (android.os.Build.VERSION.SDK_INT >= 29) {
-                        val values =
-                            android.content.ContentValues().apply {
-                                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName)
-                                put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
-                                put(
-                                    android.provider.MediaStore.Downloads.RELATIVE_PATH,
-                                    "${android.os.Environment.DIRECTORY_DOWNLOADS}/TelegramDrive",
-                                )
-                                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
-                            }
-                        val resolver = appContext.contentResolver
-                        val uri =
-                            resolver.insert(
-                                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                                values,
-                            ) ?: throw IllegalStateException("Could not create MediaStore entry")
-                        try {
-                            resolver.openOutputStream(uri)?.use { out ->
-                                source.inputStream().use { it.copyTo(out) }
-                            } ?: throw IllegalStateException("Could not open Downloads stream")
-                            values.clear()
-                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
-                            resolver.update(uri, values, null, null)
-                        } catch (t: Throwable) {
-                            runCatching { resolver.delete(uri, null, null) }
-                            throw t
-                        }
+                    val saved =
+                        PublicDownloadsExporter.saveToPublicDownloads(
+                            ctx = appContext,
+                            source = source,
+                            displayName = item.fileName,
+                            mimeType = item.mimeType,
+                        )
+                    if (saved != null) {
+                        showSnackbar("Saved to Downloads/TelegramDrive")
                     } else {
-                        @Suppress("DEPRECATION")
-                        val dir =
-                            android.os.Environment.getExternalStoragePublicDirectory(
-                                android.os.Environment.DIRECTORY_DOWNLOADS,
-                            ).let { File(it, "TelegramDrive").apply { mkdirs() } }
-                        source.copyTo(File(dir, safeName), overwrite = true)
+                        _error.value = "Failed to copy file to Downloads"
                     }
-                    showSnackbar("Saved to Downloads/TelegramDrive")
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {

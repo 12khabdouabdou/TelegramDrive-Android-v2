@@ -21,18 +21,18 @@ class AudioPlaybackService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val state = controller.state.value
-        val notif = controller.currentNotification()
-        if (state.path != null && notif != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    AudioMediaNotification.NOTIFICATION_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-                )
-            } else {
-                startForeground(AudioMediaNotification.NOTIFICATION_ID, notif)
-            }
+        val activeNotif = if (state.path != null) controller.currentNotification() else null
+        val fgNotif = activeNotif ?: AudioMediaNotification.buildFallbackNotification(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                AudioMediaNotification.NOTIFICATION_ID,
+                fgNotif,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            )
         } else {
+            startForeground(AudioMediaNotification.NOTIFICATION_ID, fgNotif)
+        }
+        if (activeNotif == null) {
             stopSelf()
         }
         return START_NOT_STICKY

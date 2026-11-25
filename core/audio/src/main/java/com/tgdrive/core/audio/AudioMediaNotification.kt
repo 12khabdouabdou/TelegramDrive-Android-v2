@@ -233,21 +233,34 @@ internal class AudioMediaNotification(
     }
 
     private fun ensureChannel() {
-        val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return
-        if (nm.getNotificationChannel(CHANNEL_ID) != null) return
-        nm.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "Audio Playback",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                setShowBadge(false)
-            },
-        )
+        ensureChannel(appContext)
     }
 
     internal companion object {
+        fun ensureChannel(context: Context) {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                ?: return
+            if (nm.getNotificationChannel(CHANNEL_ID) != null) return
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Audio Playback",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    setShowBadge(false)
+                },
+            )
+        }
+
+        fun buildFallbackNotification(context: Context): Notification {
+            ensureChannel(context)
+            return Notification.Builder(context, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentTitle("TelegramDrive Audio")
+                .setOngoing(true)
+                .build()
+        }
+
         const val CHANNEL_ID = "audio.playback"
         const val SESSION_TAG = "TelegramDriveAudioSession"
         const val NOTIFICATION_ID = 4910

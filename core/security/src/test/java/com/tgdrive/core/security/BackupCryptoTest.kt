@@ -220,4 +220,41 @@ class BackupCryptoTest {
         dst.decryptFile(encFile, outFile)
         assertThat(outFile.readBytes()).isEqualTo(secretFile.readBytes())
     }
+
+    @Test
+    fun `reused GCM cipher encrypts and decrypts many odd-sized chunks reliably`() {
+        val key = ByteArray(32).also { SecureRandom(byteArrayOf(42)).nextBytes(it) }
+        val payload = ByteArray(100 * 1024 + 317).also { SecureRandom(byteArrayOf(99)).nextBytes(it) }
+
+        val encrypted = ByteArrayOutputStream()
+        BackupCrypto.encryptStream(key, ByteArrayInputStream(payload), encrypted, chunkSize = 4096)
+
+        val decrypted = ByteArrayOutputStream()
+        BackupCrypto.decryptStream(key, ByteArrayInputStream(encrypted.toByteArray()), decrypted)
+
+        assertThat(decrypted.toByteArray()).isEqualTo(payload)
+    }
+
+    @Test
+    fun `legacy 120k-iteration TGE2 payload remains decryptable`() {
+        val passphrase = "legacy-vault-passphrase".toCharArray()
+        val payload = "legacy encrypted backup stream ".repeat(300).toByteArray()
+
+        val encrypted = ByteArrayOutputStream()
+        BackupCrypto.encryptStreamWithPassphrase(
+            passphrase = passphrase,
+            input = ByteArrayInputStream(payload),
+            output = encrypted,
+            chunkSize = 4096,
+            iterations = 120_000,
+        )
+
+        val decrypted = ByteArrayOutputStream()
+        BackupCrypto.decryptStreamWithPassphrase(
+            passphrase = passphrase,
+            input = ByteArrayInputStream(encrypted.toByteArray()),
+            output = decrypted,
+        )
+        assertThat(decrypted.toByteArray()).isEqualTo(payload)
+    }
 }

@@ -112,6 +112,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
+private val PDF_CLOSE_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
 private class PdfRendererSession(
     val fd: ParcelFileDescriptor,
     val renderer: PdfRenderer,
@@ -122,7 +124,7 @@ private class PdfRendererSession(
 
     fun closeAsync() {
         isClosed = true
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        PDF_CLOSE_SCOPE.launch {
             mutex.withLock {
                 runCatching { renderer.close() }
                 runCatching { fd.close() }

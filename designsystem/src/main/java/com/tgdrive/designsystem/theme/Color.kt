@@ -78,16 +78,3 @@ object TgColors {
     val LightErrorContainer = Color(0xFFFEE2E2)
     val LightOnErrorContainer = Color(0xFF7F1D1D)
 }
-
-/**
- * File-type tint map — maps to the accent colors.
- */
-object FileTypeTints {
-    val image = TgColors.Secondary      // blue for photos
-    val video = TgColors.Primary        // amber for videos
-    val audio = TgColors.Tertiary       // mint for audio
-    val pdf = TgColors.Error            // red for PDFs
-    val archive = TgColors.TertiaryContainer
-    val doc = TgColors.OnSurfaceVariant
-    val other = TgColors.Primary
-}
