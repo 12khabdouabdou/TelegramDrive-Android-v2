@@ -1415,9 +1415,7 @@ class TdLibTelegramClient(
             FLOOD_WAIT_REGEX.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { sec ->
                 if (sec > 0) return sec
             }
-            if (code == 429 || message.contains("TOO_MANY_REQUESTS", ignoreCase = true) ||
-                message.contains("retry after", ignoreCase = true)
-            ) {
+            if (code == 429 || message.contains("TOO_MANY_REQUESTS", ignoreCase = true)) {
                 RETRY_AFTER_REGEX.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { sec ->
                     if (sec > 0) return sec
                 }
