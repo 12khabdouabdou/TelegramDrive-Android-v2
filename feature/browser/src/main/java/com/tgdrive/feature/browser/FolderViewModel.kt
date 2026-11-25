@@ -64,6 +64,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
+private const val MAX_FOLDER_DECRYPTED_THUMBS = 60
+
 private val THUMBNAILABLE_EXTS =
     setOf(
         "jpg",
@@ -1420,7 +1422,17 @@ class FolderViewModel
                         } ?: return@withPermit
                         val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
                         if (bytes != null && bytes.isNotEmpty()) {
-                            _decryptedThumbs.update { cur -> cur + (key to bytes) }
+                            _decryptedThumbs.update { cur ->
+                                if (cur.size < MAX_FOLDER_DECRYPTED_THUMBS) {
+                                    cur + (key to bytes)
+                                } else {
+                                    val trimmed = LinkedHashMap<Pair<Long, Long>, ByteArray>(MAX_FOLDER_DECRYPTED_THUMBS)
+                                    val dropCount = cur.size - MAX_FOLDER_DECRYPTED_THUMBS + 1
+                                    cur.entries.drop(dropCount).forEach { (k, v) -> trimmed[k] = v }
+                                    trimmed[key] = bytes
+                                    trimmed
+                                }
+                            }
                         }
                     }
                 }

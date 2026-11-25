@@ -8,11 +8,13 @@ import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
+import android.util.LruCache
 import com.tgdrive.core.common.BitmapUtils
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
+import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.sync.CloudSyncManager
@@ -23,9 +25,12 @@ import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -34,6 +39,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -51,6 +58,7 @@ class MediaThumbnailCache @Inject constructor(
     private val offlinePinStore: OfflinePinStore,
     private val backupCrypto: BackupCrypto,
     private val cloudSyncManager: CloudSyncManager,
+    private val appPreferences: AppPreferences,
     private val dispatchers: DispatchersProvider,
 ) {
     private val thumbsDir: File
@@ -59,13 +67,58 @@ class MediaThumbnailCache @Inject constructor(
     private val encryptedThumbsDir: File
         get() = File(ctx.cacheDir, "encrypted_thumbs").apply { mkdirs() }
 
+    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
+    @Volatile private var maxDiskBytes: Long = DEFAULT_DISK_LIMIT_BYTES
+    private val writeCounter = AtomicInteger(0)
+    private val lastEvictMs = AtomicLong(0L)
+    private val decryptedThumbCache = object : LruCache<String, ByteArray>(DECRYPTED_MEM_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: ByteArray): Int = value.size.coerceAtLeast(1)
+    }
+
+    init {
+        scope.launch {
+            runCatching {
+                appPreferences.data.collect { prefs ->
+                    maxDiskBytes = prefs.thumbnailCacheLimitBytes.coerceAtLeast(MIN_DISK_LIMIT_BYTES)
+                }
+            }
+        }
+    }
+
     private val semaphore = Semaphore(2)
     private val inFlight = ConcurrentHashMap<Pair<Long, Long>, Deferred<String?>>()
     private val failedAtMs = ConcurrentHashMap<Pair<Long, Long>, Long>()
 
+    fun clearDecryptedMemoryCache() {
+        decryptedThumbCache.evictAll()
+    }
+
+    private fun touchIfStale(file: File) {
+        val now = System.currentTimeMillis()
+        if (now - file.lastModified() > LRU_TOUCH_INTERVAL_MS) {
+            runCatching { file.setLastModified(now) }
+        }
+    }
+
+    private fun maybeEvictDiskCache() {
+        val count = writeCounter.incrementAndGet()
+        val now = System.currentTimeMillis()
+        val prev = lastEvictMs.get()
+        if ((count % EVICT_WRITE_STRIDE == 0 || now - prev >= EVICT_COOLDOWN_MS) &&
+            lastEvictMs.compareAndSet(prev, now)
+        ) {
+            runCatching {
+                evictOldestFilesToCap(
+                    dirs = listOf(thumbsDir, encryptedThumbsDir),
+                    maxBytes = maxDiskBytes,
+                )
+            }
+        }
+    }
+
     fun getCachedThumbnailPath(chatId: Long, messageId: Long): String? {
         val file = File(thumbsDir, "${chatId}_$messageId.jpg")
-        return file.takeIf { it.isFile && it.length() > 0L }?.absolutePath
+        return file.takeIf { it.isFile && it.length() > 0L }?.also(::touchIfStale)?.absolutePath
     }
 
     fun isValidThumbnailPath(path: String?): Boolean {
@@ -112,7 +165,7 @@ class MediaThumbnailCache @Inject constructor(
      */
     fun getEncryptedThumbnailPath(chatId: Long, messageId: Long): String? {
         val f = File(encryptedThumbsDir, "${chatId}_${messageId}$ENCRYPTED_THUMB_EXT")
-        return f.absolutePath.takeIf { f.isFile && f.length() > 0L }
+        return f.takeIf { it.isFile && it.length() > 0L }?.also(::touchIfStale)?.absolutePath
     }
 
     /**
@@ -267,13 +320,16 @@ class MediaThumbnailCache @Inject constructor(
         return runCatching {
             val out = File(encryptedThumbsDir, "${chatId}_${messageId}$ENCRYPTED_THUMB_EXT")
             out.writeBytes(encryptedBytes)
+            maybeEvictDiskCache()
             out.absolutePath
         }.getOrNull()
     }
 
     suspend fun decryptThumbnailToBytes(encryptedThumbPath: String): ByteArray? = withContext(dispatchers.io) {
+        decryptedThumbCache.get(encryptedThumbPath)?.let { return@withContext it }
         val f = File(encryptedThumbPath)
         if (!f.isFile || f.length() <= 0L) return@withContext null
+        touchIfStale(f)
         runCatching {
             val out = ByteArrayOutputStream()
             val key = backupCrypto.vaultKey()
@@ -284,7 +340,11 @@ class MediaThumbnailCache @Inject constructor(
             } finally {
                 key.fill(0)
             }
-            out.toByteArray()
+            val decrypted = out.toByteArray()
+            if (decrypted.isNotEmpty() && decrypted.size <= MAX_CACHED_SINGLE_THUMB_BYTES) {
+                decryptedThumbCache.put(encryptedThumbPath, decrypted)
+            }
+            decrypted
         }.getOrNull()
     }
 
@@ -457,6 +517,7 @@ class MediaThumbnailCache @Inject constructor(
                     tmpFile.copyTo(outFile, overwrite = true)
                     tmpFile.delete()
                 }
+                maybeEvictDiskCache()
                 outFile.absolutePath
             } else {
                 tmpFile.delete()
@@ -548,7 +609,44 @@ class MediaThumbnailCache @Inject constructor(
         private const val MAX_REMOTE_PDF_BYTES = 25L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024
         private const val FAIL_COOLDOWN_MS = 5L * 60 * 1000L
+        private const val DEFAULT_DISK_LIMIT_BYTES = 50L * 1024 * 1024
+        private const val MIN_DISK_LIMIT_BYTES = 10L * 1024 * 1024
+        private const val EVICT_WRITE_STRIDE = 20
+        private const val EVICT_COOLDOWN_MS = 30_000L
+        private const val LRU_TOUCH_INTERVAL_MS = 3_600_000L
+        private const val DECRYPTED_MEM_CACHE_BYTES = 8 * 1024 * 1024
+        private const val MAX_CACHED_SINGLE_THUMB_BYTES = 2 * 1024 * 1024
         private val PDF_RENDER_LOCK = Any()
+
+        internal fun evictOldestFilesToCap(
+            dirs: List<File>,
+            maxBytes: Long,
+        ): Int {
+            if (maxBytes <= 0L) return 0
+            val files = dirs
+                .asSequence()
+                .filter { it.isDirectory }
+                .flatMap { dir -> (dir.listFiles() ?: emptyArray()).asSequence() }
+                .filter { it.isFile }
+                .toMutableList()
+            if (files.isEmpty()) return 0
+
+            var totalBytes = files.sumOf { it.length() }
+            if (totalBytes <= maxBytes) return 0
+
+            val targetBytes = (maxBytes * 85L) / 100L
+            files.sortBy { it.lastModified() }
+            var evicted = 0
+            for (file in files) {
+                if (totalBytes <= targetBytes) break
+                val len = file.length()
+                if (file.delete()) {
+                    totalBytes -= len
+                    evicted++
+                }
+            }
+            return evicted
+        }
 
         internal fun computePdfThumbDimensions(
             pageWidth: Int,

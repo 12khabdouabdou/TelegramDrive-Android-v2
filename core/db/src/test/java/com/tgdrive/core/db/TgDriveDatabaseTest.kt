@@ -260,6 +260,14 @@ class TgDriveDatabaseTest {
         raw.execSQL("CREATE INDEX index_file_cache_chat_id ON file_cache(chat_id)")
         raw.execSQL("CREATE INDEX index_file_cache_date ON file_cache(date)")
         raw.execSQL("CREATE INDEX index_file_cache_is_starred ON file_cache(is_starred)")
+        raw.execSQL(
+            """
+            INSERT INTO file_cache (
+                message_id, chat_id, file_name, file_size, mime_type, thumbnail_path,
+                remote_id, date, is_starred, last_accessed
+            ) VALUES (1, 10, 'legacy_statement.pdf', 1500, 'application/pdf', NULL, 'rem_legacy', 50, 1, 0)
+            """.trimIndent(),
+        )
         raw.version = 3
         raw.close()
 
@@ -270,6 +278,7 @@ class TgDriveDatabaseTest {
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_5_6,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_6_7,
                 com.tgdrive.core.db.di.DatabaseModule.MIGRATION_7_8,
+                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
@@ -473,6 +482,30 @@ class TgDriveDatabaseTest {
             )
             assertThat(migrated.fileCacheDao().getMediaItemsForAlbum("alb2").map { it.messageId })
                 .containsExactly(801L)
+
+            // Verify v9 bucket backfill, auto-population, aggregates, and FTS4 search
+            val legacyMigrated = migrated.fileCacheDao().getById(10L, 1L)
+            assertThat(legacyMigrated?.bucket).isEqualTo("PDF")
+            assertThat(migrated.fileCacheDao().getById(10L, 801L)?.bucket).isEqualTo("IMAGES")
+            assertThat(migrated.fileCacheDao().getById(10L, 77L)?.bucket).isEqualTo("VIDEOS")
+            assertThat(migrated.fileCacheDao().starredCount()).isEqualTo(1)
+
+            val bucketMap = migrated.fileCacheDao().bucketAggregates().associateBy { it.bucket }
+            assertThat(bucketMap["PDF"]?.fileCount).isEqualTo(1)
+            assertThat(bucketMap["PDF"]?.totalBytes).isEqualTo(1500L)
+            assertThat(bucketMap["IMAGES"]?.fileCount).isEqualTo(2)
+
+            val chatBuckets = migrated.fileCacheDao().chatBucketCounts()
+                .filter { it.chatId == 10L }
+                .associate { it.bucket to it.fileCount }
+            assertThat(chatBuckets["PDF"]).isEqualTo(1)
+
+            migrated.fileCacheDao().updateUserNote(10L, 801L, "yosemite sunrise noteToken")
+            assertThat(migrated.fileCacheDao().searchFts("legacy*").map { it.messageId })
+                .containsExactly(1L)
+            assertThat(migrated.fileCacheDao().searchFts("noteToken*").map { it.messageId })
+                .containsExactly(801L)
+            assertThat(migrated.fileCacheDao().searchFts("locked*")).isEmpty()
         } finally {
             migrated.close()
             dbFile.delete()

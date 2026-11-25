@@ -211,17 +211,48 @@ class BackupCrypto @Inject constructor(
         )
     }
 
-    fun encryptFile(
-        inputFile: File,
+    fun encryptInputStreamWithBackupSettings(
+        input: InputStream,
         outputFile: File,
-        passphrase: String? = null,
+        useCustomPassphrase: Boolean,
+        totalBytes: Long = -1L,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
         cancelCheck: (() -> Boolean)? = null,
     ) {
-        val total = inputFile.length().coerceAtLeast(0L)
+        val custom = if (useCustomPassphrase) {
+            getCustomBackupPassphrase()
+                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
+        } else {
+            null
+        }
+        encryptInputStream(
+            input = input,
+            outputFile = outputFile,
+            passphrase = custom,
+            totalBytes = totalBytes,
+            onProgress = onProgress,
+            cancelCheck = cancelCheck,
+        )
+    }
+
+    fun encryptInputStream(
+        input: InputStream,
+        outputFile: File,
+        passphrase: String? = null,
+        totalBytes: Long = -1L,
+        onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
+        cancelCheck: (() -> Boolean)? = null,
+    ) {
+        val total = totalBytes.coerceAtLeast(0L)
         outputFile.parentFile?.mkdirs()
+        val progressCb = onProgress?.let { cb -> { bytes: Long -> cb(bytes, total) } }
         try {
-            BufferedInputStream(FileInputStream(inputFile), DEFAULT_CHUNK_SIZE).use { input ->
+            val bufferedInput = if (input is BufferedInputStream) {
+                input
+            } else {
+                BufferedInputStream(input, DEFAULT_CHUNK_SIZE)
+            }
+            bufferedInput.use { src ->
                 BufferedOutputStream(FileOutputStream(outputFile), DEFAULT_CHUNK_SIZE).use { output ->
                     val cleanPass = passphrase?.takeIf { it.isNotBlank() }
                     if (cleanPass != null) {
@@ -229,9 +260,9 @@ class BackupCrypto @Inject constructor(
                         try {
                             encryptStreamWithPassphrase(
                                 passphrase = passChars,
-                                input = input,
+                                input = src,
                                 output = output,
-                                onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                                onBytesProcessed = progressCb,
                                 cancelCheck = cancelCheck,
                             )
                         } finally {
@@ -242,9 +273,9 @@ class BackupCrypto @Inject constructor(
                         try {
                             encryptStream(
                                 keyBytes = key,
-                                input = input,
+                                input = src,
                                 output = output,
-                                onBytesProcessed = onProgress?.let { cb -> { bytes -> cb(bytes, total) } },
+                                onBytesProcessed = progressCb,
                                 cancelCheck = cancelCheck,
                             )
                         } finally {
@@ -257,6 +288,23 @@ class BackupCrypto @Inject constructor(
             runCatching { outputFile.delete() }
             throw t
         }
+    }
+
+    fun encryptFile(
+        inputFile: File,
+        outputFile: File,
+        passphrase: String? = null,
+        onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
+        cancelCheck: (() -> Boolean)? = null,
+    ) {
+        encryptInputStream(
+            input = FileInputStream(inputFile),
+            outputFile = outputFile,
+            passphrase = passphrase,
+            totalBytes = inputFile.length().coerceAtLeast(0L),
+            onProgress = onProgress,
+            cancelCheck = cancelCheck,
+        )
     }
 
     fun detectFormat(file: File): EncryptedFileFormat {

@@ -36,7 +36,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -142,6 +144,7 @@ class TdLibTelegramClient(
     override val messageIdUpdates: kotlinx.coroutines.flow.SharedFlow<MessageIdUpdate> = _messageIdUpdates.asSharedFlow()
 
     private val initLock = Mutex()
+    private val requestSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
 
     private fun <V : Any> putBoundedOrphan(
         map: ConcurrentHashMap<Long, V>,
@@ -379,19 +382,64 @@ class TdLibTelegramClient(
 
     internal suspend fun <T : TdApi.Object> send(function: TdApi.Function<*>): T =
         withContext(dispatchers.io) {
-            val c = client ?: throw TelegramException(-1, "TDLib not initialised")
-            suspendCancellableCoroutine { cont ->
-                c.send(function, { result ->
-                    if (!cont.isActive) return@send
-                    when (result) {
-                        is TdApi.Error -> cont.resumeWithException(TelegramException.fromError(result))
-                        else -> @Suppress("UNCHECKED_CAST") cont.resume(result as T)
+            val bypassGate = function is TdApi.Close || function is TdApi.LogOut
+            val retrySafe = isFloodRetrySafe(function)
+            for (attempt in 0..MAX_FLOOD_WAIT_RETRIES) {
+                try {
+                    return@withContext if (bypassGate) {
+                        sendOnce(function)
+                    } else {
+                        requestSemaphore.withPermit { sendOnce(function) }
                     }
-                }, { t ->
-                    if (cont.isActive) cont.resumeWithException(t)
-                })
+                } catch (e: TelegramException) {
+                    val waitSec = parseFloodWaitSeconds(e.code, e.errorMessage)
+                    if (waitSec != null &&
+                        waitSec in 1..MAX_AUTO_FLOOD_WAIT_SEC &&
+                        attempt < MAX_FLOOD_WAIT_RETRIES &&
+                        retrySafe
+                    ) {
+                        Log.w(
+                            "TDLib: FLOOD_WAIT_${waitSec}s on ${function.javaClass.simpleName} " +
+                                "(retry ${attempt + 1}/$MAX_FLOOD_WAIT_RETRIES)",
+                        )
+                        delay((waitSec + 1L) * 1000L)
+                    } else {
+                        throw e
+                    }
+                }
             }
+            throw TelegramException(-1, "Unexpected retry termination for ${function.javaClass.simpleName}")
         }
+
+    private suspend fun <T : TdApi.Object> sendOnce(function: TdApi.Function<*>): T {
+        val c = client ?: throw TelegramException(-1, "TDLib not initialised")
+        return suspendCancellableCoroutine { cont ->
+            c.send(function, { result ->
+                if (!cont.isActive) return@send
+                when (result) {
+                    is TdApi.Error -> cont.resumeWithException(TelegramException.fromError(result))
+                    else -> @Suppress("UNCHECKED_CAST") cont.resume(result as T)
+                }
+            }, { t ->
+                if (cont.isActive) cont.resumeWithException(t)
+            })
+        }
+    }
+
+    private fun isFloodRetrySafe(function: TdApi.Function<*>): Boolean = when (function) {
+        is TdApi.Close,
+        is TdApi.LogOut,
+        is TdApi.SetAuthenticationPhoneNumber,
+        is TdApi.ResendAuthenticationCode,
+        is TdApi.CheckAuthenticationCode,
+        is TdApi.CheckAuthenticationPassword,
+        is TdApi.CheckAuthenticationEmailCode,
+        is TdApi.SetAuthenticationEmailAddress,
+        is TdApi.RegisterUser,
+        is TdApi.RequestQrCodeAuthentication,
+        -> false
+        else -> true
+    }
 
     // Auth
     override suspend fun sendPhoneNumber(phone: String) {
@@ -1354,8 +1402,28 @@ class TdLibTelegramClient(
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256
         private const val MAX_ZIP_COVER_BYTES = 10L * 1024 * 1024
+        private const val MAX_CONCURRENT_REQUESTS = 16
+        private const val MAX_FLOOD_WAIT_RETRIES = 2
+        private const val MAX_AUTO_FLOOD_WAIT_SEC = 30
+        private val FLOOD_WAIT_REGEX = Regex("""FLOOD_WAIT_(\d+)""", RegexOption.IGNORE_CASE)
+        private val RETRY_AFTER_REGEX = Regex("""retry[\s_-]*after[\s:=]*(\d+)""", RegexOption.IGNORE_CASE)
         private val IMAGE_THUMB_EXTS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
         private val VIDEO_THUMB_EXTS = setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp")
+
+        internal fun parseFloodWaitSeconds(code: Int, message: String?): Int? {
+            if (message.isNullOrBlank()) return null
+            FLOOD_WAIT_REGEX.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { sec ->
+                if (sec > 0) return sec
+            }
+            if (code == 429 || message.contains("TOO_MANY_REQUESTS", ignoreCase = true) ||
+                message.contains("retry after", ignoreCase = true)
+            ) {
+                RETRY_AFTER_REGEX.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { sec ->
+                    if (sec > 0) return sec
+                }
+            }
+            return null
+        }
     }
 }
 

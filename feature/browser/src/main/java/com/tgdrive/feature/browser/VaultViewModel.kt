@@ -43,6 +43,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
+private const val MAX_VAULT_DECRYPTED_THUMBS = 60
+
 data class VaultExternalOpenEvent(
     val id: Long,
     val file: File,
@@ -194,7 +196,17 @@ class VaultViewModel @Inject constructor(
                     } ?: return@withPermit
                     val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
                     if (bytes != null && bytes.isNotEmpty() && _isUnlocked.value) {
-                        _decryptedThumbs.update { cur -> cur + (key to bytes) }
+                        _decryptedThumbs.update { cur ->
+                            if (cur.size < MAX_VAULT_DECRYPTED_THUMBS) {
+                                cur + (key to bytes)
+                            } else {
+                                val trimmed = LinkedHashMap<Pair<Long, Long>, ByteArray>(MAX_VAULT_DECRYPTED_THUMBS)
+                                val dropCount = cur.size - MAX_VAULT_DECRYPTED_THUMBS + 1
+                                cur.entries.drop(dropCount).forEach { (k, v) -> trimmed[k] = v }
+                                trimmed[key] = bytes
+                                trimmed
+                            }
+                        }
                     }
                 }
             }
@@ -226,7 +238,13 @@ class VaultViewModel @Inject constructor(
         _isUnlocked.value = false
         _selected.value = emptySet()
         _decryptedThumbs.value = emptyMap()
+        mediaThumbnailCache.clearDecryptedMemoryCache()
         synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        mediaThumbnailCache.clearDecryptedMemoryCache()
     }
 
     fun toggleSelection(chatId: Long, messageId: Long) {

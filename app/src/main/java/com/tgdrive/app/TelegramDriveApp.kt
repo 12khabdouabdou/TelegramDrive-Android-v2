@@ -35,20 +35,20 @@ class TelegramDriveApp :
     Configuration.Provider,
     ImageLoaderFactory {
 
-    @Inject lateinit var workerFactory: HiltWorkerFactory
-    @Inject lateinit var keystoreHelper: KeystoreHelper
-    @Inject lateinit var telegramClient: TelegramClient
-    @Inject lateinit var preferences: AppPreferences
-    @Inject lateinit var folderWatcher: FolderWatcher
-    @Inject lateinit var backupScheduler: BackupScheduler
-    @Inject lateinit var scheduledUploadScheduler: ScheduledUploadScheduler
-    @Inject lateinit var syncLogDao: SyncLogDao
+    @Inject lateinit var workerFactory: dagger.Lazy<HiltWorkerFactory>
+    @Inject lateinit var keystoreHelper: dagger.Lazy<KeystoreHelper>
+    @Inject lateinit var telegramClient: dagger.Lazy<TelegramClient>
+    @Inject lateinit var preferences: dagger.Lazy<AppPreferences>
+    @Inject lateinit var folderWatcher: dagger.Lazy<FolderWatcher>
+    @Inject lateinit var backupScheduler: dagger.Lazy<BackupScheduler>
+    @Inject lateinit var scheduledUploadScheduler: dagger.Lazy<ScheduledUploadScheduler>
+    @Inject lateinit var syncLogDao: dagger.Lazy<SyncLogDao>
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override val workManagerConfiguration: Configuration by lazy {
         Configuration.Builder()
-            .setWorkerFactory(workerFactory)
+            .setWorkerFactory(workerFactory.get())
             .setMinimumLoggingLevel(android.util.Log.INFO)
             .build()
     }
@@ -96,7 +96,7 @@ class TelegramDriveApp :
         // splash timer handles this).
         appScope.launch {
             try {
-                val creds = keystoreHelper.getApiCreds()
+                val creds = keystoreHelper.get().getApiCreds()
                 val parsedId = creds?.apiId?.toIntOrNull()
                 if (creds == null || parsedId == null || parsedId <= 0) {
                     Log.i("TelegramDriveApp: no stored API creds — skipping TDLib init (fresh install)")
@@ -104,7 +104,7 @@ class TelegramDriveApp :
                 }
                 Log.i("TelegramDriveApp: auto-initializing TDLib with stored creds")
                 val ok = withTimeoutOrNull(TDLIB_INIT_TIMEOUT_MS) {
-                    telegramClient.initialize(
+                    telegramClient.get().initialize(
                         apiId = parsedId,
                         apiHash = creds.apiHash,
                         sessionDir = "tgdrive_tdlib",
@@ -125,7 +125,7 @@ class TelegramDriveApp :
         // sync_log rows as CANCELLED. Independent of TDLib.
         appScope.launch {
             try {
-                val n = syncLogDao.markRunningAsCancelled(System.currentTimeMillis())
+                val n = syncLogDao.get().markRunningAsCancelled(System.currentTimeMillis())
                 if (n > 0) Log.i("TelegramDriveApp: recovered $n stale RUNNING sync_log row(s)")
             } catch (e: CancellationException) {
                 throw e
@@ -134,19 +134,18 @@ class TelegramDriveApp :
             }
         }
 
-        // Task 3: Register FolderWatcher callback unconditionally + reschedule
-        // periodic & on-change work so UI toggles take effect immediately.
-        registerFolderWatcherCallback()
+        // Task 3: Register FolderWatcher callback + reschedule periodic & on-change work off main thread.
         appScope.launch {
             try {
-                backupScheduler.rescheduleIfEnabled()
+                registerFolderWatcherCallback()
+                backupScheduler.get().rescheduleIfEnabled()
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Log.w("TelegramDriveApp: rescheduleIfEnabled failed", t)
             }
             try {
-                scheduledUploadScheduler.rescheduleIfEnabled()
+                scheduledUploadScheduler.get().rescheduleIfEnabled()
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -158,15 +157,15 @@ class TelegramDriveApp :
 
     /** Wire up FolderWatcher's onChange callback to enqueue an on-change backup. */
     private fun registerFolderWatcherCallback() {
-        folderWatcher.onChange {
+        folderWatcher.get().onChange {
             appScope.launch {
                 try {
-                    val prefs = preferences.data.first()
+                    val prefs = preferences.get().data.first()
                     if (prefs.backupEnabled && !prefs.backupPaused &&
                         prefs.backupSchedule == BackupSchedule.ON_CHANGE
                     ) {
                         Log.i("TelegramDriveApp: ON_CHANGE trigger → enqueuing backup")
-                        backupScheduler.enqueueOnChange()
+                        backupScheduler.get().enqueueOnChange()
                     }
                 } catch (e: CancellationException) {
                     throw e

@@ -209,9 +209,9 @@ class HomeViewModel
 
                     val counts = mutableMapOf<FileFilter, Int>()
                     val perChatFilterCounts = mutableMapOf<FileFilter, MutableMap<Long, Int>>()
-                    for (file in fileCacheDao.getAll()) {
-                        val chatId = file.chatId
-                        val filter = when (classifyFile(file.mimeType, file.fileName)) {
+                    for (row in fileCacheDao.chatBucketCounts()) {
+                        val bucket = runCatching { FileBucket.valueOf(row.bucket) }.getOrNull() ?: continue
+                        val filter = when (bucket) {
                             FileBucket.IMAGES -> FileFilter.IMAGES
                             FileBucket.VIDEOS -> FileFilter.VIDEOS
                             FileBucket.AUDIO -> FileFilter.AUDIO
@@ -219,9 +219,9 @@ class HomeViewModel
                             FileBucket.ARCHIVES -> FileFilter.ARCHIVES
                             FileBucket.OTHER -> continue
                         }
-                        counts[filter] = (counts[filter] ?: 0) + 1
+                        counts[filter] = (counts[filter] ?: 0) + row.fileCount
                         val map = perChatFilterCounts.getOrPut(filter) { mutableMapOf() }
-                        map[chatId] = (map[chatId] ?: 0) + 1
+                        map[row.chatId] = (map[row.chatId] ?: 0) + row.fileCount
                     }
 
                     val targets = perChatFilterCounts.mapValues { (_, byChat) ->

@@ -333,4 +333,47 @@ class StorageAnalyticsTest {
             assertThat(StorageAnalytics.classify(f)).isEqualTo(StorageAnalytics.FileBucket.IMAGES)
         }
     }
+
+    @Test
+    @DisplayName("computeFromAggregates matches compute() on identical fixtures")
+    fun computeFromAggregatesParity() {
+        val files = listOf(
+            fileEntity("a.jpg", 100L, mime = "image/jpeg", chatId = 10L, starred = true),
+            fileEntity("b.mp4", 1_000L, mime = "video/mp4", chatId = 10L, starred = false),
+            fileEntity("c.zip", 500L, mime = null, chatId = 20L, starred = true),
+        )
+        val folders = listOf(folder(1L, "Camera", 10L))
+        val cacheAgg = listOf(
+            cacheRow(10L, 2, 1_100L),
+            cacheRow(20L, 1, 500L),
+        )
+        val grand = FileCacheDao.GrandTotalRow(3, 1_600L)
+        val dups = listOf(dupRow("x", 10L, 2))
+        val backupGrand = SyncedFileDao.SyncedGrandTotalRow(2, 1_100L, 999L)
+
+        val full = StorageAnalytics.compute(
+            cacheAggregates = cacheAgg,
+            grandTotal = grand,
+            duplicateAggregates = dups,
+            folders = folders,
+            savedMessagesChatId = 20L,
+            allCachedFiles = files,
+            backupGrandTotal = backupGrand,
+        )
+        val agg = StorageAnalytics.computeFromAggregates(
+            cacheAggregates = cacheAgg,
+            grandTotal = grand,
+            duplicateAggregates = dups,
+            bucketAggregates = listOf(
+                FileCacheDao.BucketAggregateRow("IMAGES", 1, 100L),
+                FileCacheDao.BucketAggregateRow("VIDEOS", 1, 1_000L),
+                FileCacheDao.BucketAggregateRow("ARCHIVES", 1, 500L),
+            ),
+            totalStarred = 2,
+            folders = folders,
+            savedMessagesChatId = 20L,
+            backupGrandTotal = backupGrand,
+        )
+        assertThat(agg).isEqualTo(full)
+    }
 }

@@ -114,6 +114,54 @@ class StagingManager @Inject constructor(
         encrypt: Boolean,
         useCustomPassphrase: Boolean,
     ): StageOutcome {
+        val willCompress = quality == BackupQuality.STORAGE_SAVER &&
+            shouldTryStorageSaver(displayName, mimeType, expectedSize)
+
+        if (encrypt && !willCompress) {
+            val neededBytes = expectedSize + (expectedSize / 50L) + 65_536L
+            if (!hasEnoughDiskSpace(neededBytes)) {
+                return StageOutcome.Failed("Not enough free cache storage to stage file", retryable = false)
+            }
+            val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(64)
+            val encFile = File(
+                stagingDir,
+                "${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}_$safeName.tgenc",
+            )
+            val uri = try { Uri.parse(uriStr) } catch (_: Throwable) {
+                return StageOutcome.Failed("Could not read file from device storage", retryable = true)
+            }
+            val input = try {
+                ctx.contentResolver.openInputStream(uri)
+            } catch (t: Throwable) {
+                Log.w("StagingManager: openInputStream failed for '$displayName'", t)
+                null
+            } ?: return StageOutcome.Failed("Could not read file from device storage", retryable = true)
+            return try {
+                input.use { src ->
+                    backupCrypto.encryptInputStreamWithBackupSettings(
+                        input = src,
+                        outputFile = encFile,
+                        useCustomPassphrase = useCustomPassphrase,
+                        totalBytes = expectedSize,
+                    )
+                }
+                StageOutcome.Ready(
+                    path = encFile.absolutePath,
+                    effectiveName = "$displayName.tgenc",
+                    effectiveMime = "application/octet-stream",
+                    effectiveSize = encFile.length(),
+                    wasCompressed = false,
+                    wasEncrypted = true,
+                )
+            } catch (e: CancellationException) {
+                runCatching { encFile.delete() }
+                throw e
+            } catch (t: Throwable) {
+                runCatching { encFile.delete() }
+                StageOutcome.Failed("Encryption failed: ${t.message ?: t.javaClass.simpleName}", retryable = false)
+            }
+        }
+
         val neededBytes = if (encrypt) expectedSize * 2L else expectedSize
         if (!hasEnoughDiskSpace(neededBytes)) {
             return StageOutcome.Failed("Not enough free cache storage to stage file", retryable = false)

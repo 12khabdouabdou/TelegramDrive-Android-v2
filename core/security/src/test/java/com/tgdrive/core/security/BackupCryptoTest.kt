@@ -291,4 +291,43 @@ class BackupCryptoTest {
             BackupCrypto.decryptStream(key, ByteArrayInputStream(extended), ByteArrayOutputStream())
         }
     }
+
+    @Test
+    fun `encryptInputStream and encryptInputStreamWithBackupSettings round trip and clean up on cancel`(@TempDir tmp: File) {
+        val crypto = BackupCrypto(inMemoryKeystore())
+        crypto.setCustomBackupPassphrase("direct-stream-pass")
+        val payload = "Direct encrypted stream avoids 2x disk copy ".repeat(200).toByteArray()
+
+        val vaultOut = File(tmp, "vault_stream.tgenc")
+        crypto.encryptInputStream(
+            input = ByteArrayInputStream(payload),
+            outputFile = vaultOut,
+            totalBytes = payload.size.toLong(),
+        )
+        val vaultDec = File(tmp, "vault_dec.bin")
+        crypto.decryptFile(vaultOut, vaultDec)
+        assertThat(vaultDec.readBytes()).isEqualTo(payload)
+
+        val customOut = File(tmp, "custom_stream.tgenc")
+        crypto.encryptInputStreamWithBackupSettings(
+            input = ByteArrayInputStream(payload),
+            outputFile = customOut,
+            useCustomPassphrase = true,
+            totalBytes = payload.size.toLong(),
+        )
+        assertThat(BackupCrypto.detectMagicFormat(customOut)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        val customDec = File(tmp, "custom_dec.bin")
+        crypto.decryptFile(customOut, customDec)
+        assertThat(customDec.readBytes()).isEqualTo(payload)
+
+        val cancelledOut = File(tmp, "cancelled_stream.tgenc")
+        assertThrows<CancellationException> {
+            crypto.encryptInputStream(
+                input = ByteArrayInputStream(ByteArray(256 * 1024) { 7 }),
+                outputFile = cancelledOut,
+                cancelCheck = { true },
+            )
+        }
+        assertThat(cancelledOut.exists()).isFalse()
+    }
 }

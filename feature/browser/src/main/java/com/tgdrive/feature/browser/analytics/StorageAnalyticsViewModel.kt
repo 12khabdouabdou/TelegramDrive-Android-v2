@@ -146,15 +146,17 @@ class StorageAnalyticsViewModel
             val duplicateAggregates = fileCacheDao.duplicateAggregates()
             val folders = folderDao.getAll()
             val backupGrandTotal = syncedFileDao.grandTotal()
-            val allCachedFiles = fileCacheDao.getAll()
+            val bucketAggregates = fileCacheDao.bucketAggregates()
+            val totalStarred = fileCacheDao.starredCount()
 
-            return StorageAnalytics.compute(
+            return StorageAnalytics.computeFromAggregates(
                 cacheAggregates = cacheAggregates,
                 grandTotal = grandTotal,
                 duplicateAggregates = duplicateAggregates,
+                bucketAggregates = bucketAggregates,
+                totalStarred = totalStarred,
                 folders = folders,
                 savedMessagesChatId = myUserId,
-                allCachedFiles = allCachedFiles,
                 backupGrandTotal = backupGrandTotal,
             )
         }

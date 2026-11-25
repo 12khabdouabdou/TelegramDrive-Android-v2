@@ -17,6 +17,7 @@ import androidx.room.Index
         Index("is_pinned_offline"),
         Index("is_locked"),
         Index(value = ["chat_id", "virtual_path"]),
+        Index("bucket"),
     ],
 )
 data class FileCacheEntity(
@@ -40,4 +41,5 @@ data class FileCacheEntity(
     @ColumnInfo(name = "ai_tags") val aiTags: String? = null,
     @ColumnInfo(name = "exif_lat") val exifLat: Double? = null,
     @ColumnInfo(name = "exif_lng") val exifLng: Double? = null,
+    @ColumnInfo(name = "bucket") val bucket: String = "",
 )

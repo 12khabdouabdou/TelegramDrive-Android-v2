@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
+import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.entity.FileCacheEntity
 import kotlinx.coroutines.flow.Flow
 
@@ -40,7 +41,8 @@ interface FileCacheDao {
                 ELSE thumbnail_path
             END,
             remote_id = CASE WHEN :remoteId != '' THEN :remoteId ELSE remote_id END,
-            date = :date
+            date = :date,
+            bucket = CASE WHEN :bucket != '' THEN :bucket ELSE bucket END
         WHERE message_id = :messageId AND chat_id = :chatId
     """)
     suspend fun updateRemoteMetadata(
@@ -51,6 +53,7 @@ interface FileCacheDao {
         thumbnailPath: String?,
         remoteId: String,
         date: Long,
+        bucket: String,
     )
 
     /**
@@ -60,7 +63,11 @@ interface FileCacheDao {
      */
     @Transaction
     suspend fun upsertAll(entries: List<FileCacheEntity>) {
-        for (entry in entries) {
+        for (rawEntry in entries) {
+            val resolvedBucket = rawEntry.bucket.ifBlank {
+                classifyFile(rawEntry.mimeType, rawEntry.fileName).name
+            }
+            val entry = if (rawEntry.bucket == resolvedBucket) rawEntry else rawEntry.copy(bucket = resolvedBucket)
             val rowId = insertIgnore(entry)
             if (rowId == -1L) {
                 updateRemoteMetadata(
@@ -71,6 +78,7 @@ interface FileCacheDao {
                     thumbnailPath = entry.thumbnailPath,
                     remoteId = entry.remoteId,
                     date = entry.date,
+                    bucket = resolvedBucket,
                 )
             }
         }
@@ -125,23 +133,29 @@ interface FileCacheDao {
           AND is_encrypted_vault = 0
           AND lower(file_name) NOT LIKE '%.tgenc'
           AND (
-              mime_type LIKE 'image/%'
-              OR mime_type LIKE 'video/%'
-              OR lower(file_name) LIKE '%.jpg'
-              OR lower(file_name) LIKE '%.jpeg'
-              OR lower(file_name) LIKE '%.png'
-              OR lower(file_name) LIKE '%.webp'
-              OR lower(file_name) LIKE '%.gif'
-              OR lower(file_name) LIKE '%.heic'
-              OR lower(file_name) LIKE '%.heif'
-              OR lower(file_name) LIKE '%.avif'
-              OR lower(file_name) LIKE '%.bmp'
-              OR lower(file_name) LIKE '%.mp4'
-              OR lower(file_name) LIKE '%.mkv'
-              OR lower(file_name) LIKE '%.mov'
-              OR lower(file_name) LIKE '%.webm'
-              OR lower(file_name) LIKE '%.avi'
-              OR lower(file_name) LIKE '%.3gp'
+              bucket IN ('IMAGES', 'VIDEOS')
+              OR (
+                  bucket = ''
+                  AND (
+                      mime_type LIKE 'image/%'
+                      OR mime_type LIKE 'video/%'
+                      OR lower(file_name) LIKE '%.jpg'
+                      OR lower(file_name) LIKE '%.jpeg'
+                      OR lower(file_name) LIKE '%.png'
+                      OR lower(file_name) LIKE '%.webp'
+                      OR lower(file_name) LIKE '%.gif'
+                      OR lower(file_name) LIKE '%.heic'
+                      OR lower(file_name) LIKE '%.heif'
+                      OR lower(file_name) LIKE '%.avif'
+                      OR lower(file_name) LIKE '%.bmp'
+                      OR lower(file_name) LIKE '%.mp4'
+                      OR lower(file_name) LIKE '%.mkv'
+                      OR lower(file_name) LIKE '%.mov'
+                      OR lower(file_name) LIKE '%.webm'
+                      OR lower(file_name) LIKE '%.avi'
+                      OR lower(file_name) LIKE '%.3gp'
+                  )
+              )
           )
         ORDER BY date DESC
         """,
@@ -155,23 +169,29 @@ interface FileCacheDao {
           AND is_encrypted_vault = 0
           AND lower(file_name) NOT LIKE '%.tgenc'
           AND (
-              mime_type LIKE 'image/%'
-              OR mime_type LIKE 'video/%'
-              OR lower(file_name) LIKE '%.jpg'
-              OR lower(file_name) LIKE '%.jpeg'
-              OR lower(file_name) LIKE '%.png'
-              OR lower(file_name) LIKE '%.webp'
-              OR lower(file_name) LIKE '%.gif'
-              OR lower(file_name) LIKE '%.heic'
-              OR lower(file_name) LIKE '%.heif'
-              OR lower(file_name) LIKE '%.avif'
-              OR lower(file_name) LIKE '%.bmp'
-              OR lower(file_name) LIKE '%.mp4'
-              OR lower(file_name) LIKE '%.mkv'
-              OR lower(file_name) LIKE '%.mov'
-              OR lower(file_name) LIKE '%.webm'
-              OR lower(file_name) LIKE '%.avi'
-              OR lower(file_name) LIKE '%.3gp'
+              bucket IN ('IMAGES', 'VIDEOS')
+              OR (
+                  bucket = ''
+                  AND (
+                      mime_type LIKE 'image/%'
+                      OR mime_type LIKE 'video/%'
+                      OR lower(file_name) LIKE '%.jpg'
+                      OR lower(file_name) LIKE '%.jpeg'
+                      OR lower(file_name) LIKE '%.png'
+                      OR lower(file_name) LIKE '%.webp'
+                      OR lower(file_name) LIKE '%.gif'
+                      OR lower(file_name) LIKE '%.heic'
+                      OR lower(file_name) LIKE '%.heif'
+                      OR lower(file_name) LIKE '%.avif'
+                      OR lower(file_name) LIKE '%.bmp'
+                      OR lower(file_name) LIKE '%.mp4'
+                      OR lower(file_name) LIKE '%.mkv'
+                      OR lower(file_name) LIKE '%.mov'
+                      OR lower(file_name) LIKE '%.webm'
+                      OR lower(file_name) LIKE '%.avi'
+                      OR lower(file_name) LIKE '%.3gp'
+                  )
+              )
           )
         ORDER BY date DESC
         """,
@@ -288,6 +308,39 @@ interface FileCacheDao {
         val wastedCopies: Int,
         val wastedBytes: Long,
     )
+
+    data class BucketAggregateRow(
+        val bucket: String,
+        val fileCount: Int,
+        val totalBytes: Long,
+    )
+
+    data class ChatBucketCountRow(
+        val chatId: Long,
+        val bucket: String,
+        val fileCount: Int,
+    )
+
+    @Query("SELECT bucket AS bucket, COUNT(*) AS fileCount, COALESCE(SUM(file_size), 0) AS totalBytes FROM file_cache GROUP BY bucket")
+    suspend fun bucketAggregates(): List<BucketAggregateRow>
+
+    @Query("SELECT chat_id AS chatId, bucket AS bucket, COUNT(*) AS fileCount FROM file_cache GROUP BY chat_id, bucket")
+    suspend fun chatBucketCounts(): List<ChatBucketCountRow>
+
+    @Query("SELECT COUNT(*) FROM file_cache WHERE is_starred = 1")
+    suspend fun starredCount(): Int
+
+    @Query(
+        """
+        SELECT file_cache.* FROM file_cache
+        JOIN file_cache_fts ON file_cache.rowid = file_cache_fts.docid
+        WHERE file_cache_fts MATCH :ftsQuery
+          AND file_cache.is_locked = 0
+        ORDER BY file_cache.date DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun searchFts(ftsQuery: String, limit: Int = 500): List<FileCacheEntity>
 
     @Query("UPDATE file_cache SET message_id = :newId WHERE message_id = :oldId AND chat_id = :chatId")
     suspend fun updateMessageId(chatId: Long, oldId: Long, newId: Long)

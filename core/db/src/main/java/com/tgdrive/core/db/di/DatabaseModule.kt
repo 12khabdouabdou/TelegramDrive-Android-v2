@@ -215,11 +215,126 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_8_9 = object : Migration(8, 9) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN bucket TEXT NOT NULL DEFAULT ''")
+            db.execSQL(
+                """
+                UPDATE file_cache
+                SET bucket = CASE
+                    WHEN mime_type IS NOT NULL
+                        AND mime_type != ''
+                        AND lower(mime_type) != 'application/octet-stream'
+                        AND lower(mime_type) LIKE 'image/%' THEN 'IMAGES'
+                    WHEN mime_type IS NOT NULL
+                        AND mime_type != ''
+                        AND lower(mime_type) != 'application/octet-stream'
+                        AND lower(mime_type) LIKE 'video/%' THEN 'VIDEOS'
+                    WHEN mime_type IS NOT NULL
+                        AND mime_type != ''
+                        AND lower(mime_type) != 'application/octet-stream'
+                        AND lower(mime_type) LIKE 'audio/%' THEN 'AUDIO'
+                    WHEN mime_type IS NOT NULL
+                        AND lower(mime_type) != ''
+                        AND lower(mime_type) != 'application/octet-stream'
+                        AND lower(mime_type) = 'application/pdf' THEN 'PDF'
+                    WHEN lower(file_name) LIKE '%.jpg'
+                        OR lower(file_name) LIKE '%.jpeg'
+                        OR lower(file_name) LIKE '%.png'
+                        OR lower(file_name) LIKE '%.gif'
+                        OR lower(file_name) LIKE '%.webp'
+                        OR lower(file_name) LIKE '%.heic'
+                        OR lower(file_name) LIKE '%.bmp'
+                        OR lower(file_name) LIKE '%.heif'
+                        OR lower(file_name) LIKE '%.avif' THEN 'IMAGES'
+                    WHEN lower(file_name) LIKE '%.mp4'
+                        OR lower(file_name) LIKE '%.mkv'
+                        OR lower(file_name) LIKE '%.mov'
+                        OR lower(file_name) LIKE '%.avi'
+                        OR lower(file_name) LIKE '%.webm'
+                        OR lower(file_name) LIKE '%.m4v'
+                        OR lower(file_name) LIKE '%.3gp' THEN 'VIDEOS'
+                    WHEN lower(file_name) LIKE '%.mp3'
+                        OR lower(file_name) LIKE '%.wav'
+                        OR lower(file_name) LIKE '%.flac'
+                        OR lower(file_name) LIKE '%.aac'
+                        OR lower(file_name) LIKE '%.m4a'
+                        OR lower(file_name) LIKE '%.ogg'
+                        OR lower(file_name) LIKE '%.opus' THEN 'AUDIO'
+                    WHEN lower(file_name) LIKE '%.pdf' THEN 'PDF'
+                    WHEN lower(file_name) LIKE '%.txt'
+                        OR lower(file_name) LIKE '%.doc'
+                        OR lower(file_name) LIKE '%.docx'
+                        OR lower(file_name) LIKE '%.rtf'
+                        OR lower(file_name) LIKE '%.odt'
+                        OR lower(file_name) LIKE '%.md'
+                        OR lower(file_name) LIKE '%.csv'
+                        OR lower(file_name) LIKE '%.xls'
+                        OR lower(file_name) LIKE '%.xlsx'
+                        OR lower(file_name) LIKE '%.ppt'
+                        OR lower(file_name) LIKE '%.pptx' THEN 'DOCUMENTS'
+                    WHEN lower(file_name) LIKE '%.zip'
+                        OR lower(file_name) LIKE '%.rar'
+                        OR lower(file_name) LIKE '%.7z'
+                        OR lower(file_name) LIKE '%.tar'
+                        OR lower(file_name) LIKE '%.gz'
+                        OR lower(file_name) LIKE '%.bz2'
+                        OR lower(file_name) LIKE '%.xz' THEN 'ARCHIVES'
+                    ELSE 'OTHER'
+                END
+                WHERE bucket = ''
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_file_cache_bucket ON file_cache(bucket)")
+            db.execSQL(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS `file_cache_fts` USING FTS4(" +
+                    "`file_name` TEXT NOT NULL, " +
+                    "`virtual_path` TEXT NOT NULL, " +
+                    "`user_note` TEXT, " +
+                    "`ocr_text` TEXT, " +
+                    "`ai_tags` TEXT, " +
+                    "content=`file_cache`)",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_BEFORE_UPDATE` " +
+                    "BEFORE UPDATE ON `file_cache` BEGIN " +
+                    "DELETE FROM `file_cache_fts` WHERE `docid`=OLD.`rowid`; END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_BEFORE_DELETE` " +
+                    "BEFORE DELETE ON `file_cache` BEGIN " +
+                    "DELETE FROM `file_cache_fts` WHERE `docid`=OLD.`rowid`; END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_AFTER_UPDATE` " +
+                    "AFTER UPDATE ON `file_cache` BEGIN " +
+                    "INSERT INTO `file_cache_fts`(`docid`, `file_name`, `virtual_path`, `user_note`, `ocr_text`, `ai_tags`) " +
+                    "VALUES (NEW.`rowid`, NEW.`file_name`, NEW.`virtual_path`, NEW.`user_note`, NEW.`ocr_text`, NEW.`ai_tags`); END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_AFTER_INSERT` " +
+                    "AFTER INSERT ON `file_cache` BEGIN " +
+                    "INSERT INTO `file_cache_fts`(`docid`, `file_name`, `virtual_path`, `user_note`, `ocr_text`, `ai_tags`) " +
+                    "VALUES (NEW.`rowid`, NEW.`file_name`, NEW.`virtual_path`, NEW.`user_note`, NEW.`ocr_text`, NEW.`ai_tags`); END",
+            )
+            db.execSQL("INSERT INTO `file_cache_fts`(`file_cache_fts`) VALUES('rebuild')")
+        }
+    }
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+            .addMigrations(
+                MIGRATION_1_2,
+                MIGRATION_2_3,
+                MIGRATION_3_4,
+                MIGRATION_4_5,
+                MIGRATION_5_6,
+                MIGRATION_6_7,
+                MIGRATION_7_8,
+                MIGRATION_8_9,
+            )
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()

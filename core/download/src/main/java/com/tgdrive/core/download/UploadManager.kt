@@ -13,8 +13,10 @@ import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.PendingUploadDao
@@ -700,94 +702,153 @@ class UploadManager @Inject constructor(
             var encryptedFile: File? = null
             try {
                 currentCoroutineContext().ensureActive()
-                val estNeeded = if (options.encryption.enabled) item.sizeBytes * 2L else item.sizeBytes
-                if (!hasEnoughDiskSpace(stagingDir, estNeeded)) {
-                    uploadTracker.markFailed(id, "Not enough free storage space to stage file", canRetry = false)
-                    return@withPermit false
-                }
+                val canDirectStreamEncrypt = options.encryption.enabled &&
+                    item.sizeBytes in 1L..maxLimit &&
+                    (
+                        !options.encryption.useVaultKey ||
+                            classifyFile(item.mimeType, rawName) !in setOf(
+                                FileBucket.IMAGES,
+                                FileBucket.VIDEOS,
+                                FileBucket.PDF,
+                                FileBucket.ARCHIVES,
+                            )
+                    )
 
-                uploadTracker.updatePhase(id, UploadStatus.PREPARING, detail = "Copying to staging…", fileName = targetName)
-                val tempRaw = File(stagingDir, "${UUID.randomUUID().toString().take(8)}_$rawName")
-                stagedFile = tempRaw
-                val stream = openUriStream(item.uri)
-                    ?: throw IllegalStateException("Cannot open selected file")
-                stream.use { input ->
-                    FileOutputStream(tempRaw).use { out ->
-                        copyWithCancel(input, out)
-                    }
-                }
+                var fileToUpload: File
+                var finalMime: String
+                var encryptedThumbBytes: ByteArray? = null
+                var captureDateMs: Long
 
-                val rawSize = tempRaw.length()
-                val captureDateMs = extractCaptureTimestampMs(tempRaw, item.mimeType, spec.lastModifiedMs)
-
-                // Handle single file exceeding Telegram account limit
-                if (rawSize > maxLimit) {
-                    if (!options.autoSplitOversized) {
-                        val limitGb = maxLimit / (1024L * 1024 * 1024)
-                        uploadTracker.markFailed(id, "File exceeds $limitGb GB limit", canRetry = false)
+                if (canDirectStreamEncrypt) {
+                    val estNeeded = item.sizeBytes + (item.sizeBytes / 50L) + 65_536L
+                    if (!hasEnoughDiskSpace(stagingDir, estNeeded)) {
+                        uploadTracker.markFailed(id, "Not enough free storage space to stage file", canRetry = false)
                         return@withPermit false
                     }
-                    val splitOk = uploadOversizedSingleFileSplit(
-                        id = id,
-                        chatId = chatId,
-                        sourceFile = tempRaw,
-                        displayName = rawName,
-                        maxPartBytes = (maxLimit * 92L / 100L),
-                        options = options,
-                        virtualPath = spec.virtualPath,
-                        captureDateMs = captureDateMs,
-                        stagingDir = stagingDir,
-                    )
-                    if (splitOk) {
-                        waitingForWifiIds.remove(id)
-                        withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
-                    }
-                    return@withPermit splitOk
-                }
-
-                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled && options.encryption.useVaultKey) {
-                    runCatching {
-                        mediaThumbnailCache.buildEncryptedThumbnailBytes(
-                            localPath = tempRaw.absolutePath,
-                            mimeType = item.mimeType.ifBlank { guessMimeType(rawName) },
-                            originalFileName = rawName,
-                        )
-                    }.getOrNull()
-                } else {
-                    null
-                }
-
-                var fileToUpload = tempRaw
-                var finalMime = effectiveMime
-                if (options.encryption.enabled) {
+                    captureDateMs = spec.lastModifiedMs.takeIf { it > 0L } ?: System.currentTimeMillis()
                     uploadTracker.updatePhase(
                         id = id,
                         status = UploadStatus.ENCRYPTING,
                         detail = if (options.encryption.useVaultKey) "Encrypting (Vault Key)…" else "Encrypting (AES-256)…",
                         progress = 0f,
+                        fileName = targetName,
                         isEncrypted = true,
                     )
-                    val encOut = File(stagingDir, "${tempRaw.name}${BackupCrypto.ENCRYPTED_EXT}")
+                    val encOut = File(stagingDir, "${UUID.randomUUID().toString().take(8)}_${rawName}${BackupCrypto.ENCRYPTED_EXT}")
                     encryptedFile = encOut
                     val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
-                    backupCrypto.encryptFile(
-                        inputFile = tempRaw,
-                        outputFile = encOut,
-                        passphrase = customPass,
-                        onProgress = { done, tot ->
-                            if (tot > 0L) {
-                                uploadTracker.updatePhase(
-                                    id = id,
-                                    status = UploadStatus.ENCRYPTING,
-                                    progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
-                                )
-                            }
-                        },
-                        cancelCheck = { id in cancelledIds || id in pausedIds },
-                    )
-                    tempRaw.delete()
+                    val stream = openUriStream(item.uri)
+                        ?: throw IllegalStateException("Cannot open selected file")
+                    stream.use { input ->
+                        backupCrypto.encryptInputStream(
+                            input = input,
+                            outputFile = encOut,
+                            passphrase = customPass,
+                            totalBytes = item.sizeBytes,
+                            onProgress = { done, tot ->
+                                if (tot > 0L) {
+                                    uploadTracker.updatePhase(
+                                        id = id,
+                                        status = UploadStatus.ENCRYPTING,
+                                        progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
+                                    )
+                                }
+                            },
+                            cancelCheck = { id in cancelledIds || id in pausedIds },
+                        )
+                    }
                     fileToUpload = encOut
                     finalMime = "application/octet-stream"
+                } else {
+                    val estNeeded = if (options.encryption.enabled) item.sizeBytes * 2L else item.sizeBytes
+                    if (!hasEnoughDiskSpace(stagingDir, estNeeded)) {
+                        uploadTracker.markFailed(id, "Not enough free storage space to stage file", canRetry = false)
+                        return@withPermit false
+                    }
+
+                    uploadTracker.updatePhase(id, UploadStatus.PREPARING, detail = "Copying to staging…", fileName = targetName)
+                    val tempRaw = File(stagingDir, "${UUID.randomUUID().toString().take(8)}_$rawName")
+                    stagedFile = tempRaw
+                    val stream = openUriStream(item.uri)
+                        ?: throw IllegalStateException("Cannot open selected file")
+                    stream.use { input ->
+                        FileOutputStream(tempRaw).use { out ->
+                            copyWithCancel(input, out)
+                        }
+                    }
+
+                    val rawSize = tempRaw.length()
+                    captureDateMs = extractCaptureTimestampMs(tempRaw, item.mimeType, spec.lastModifiedMs)
+
+                    // Handle single file exceeding Telegram account limit
+                    if (rawSize > maxLimit) {
+                        if (!options.autoSplitOversized) {
+                            val limitGb = maxLimit / (1024L * 1024 * 1024)
+                            uploadTracker.markFailed(id, "File exceeds $limitGb GB limit", canRetry = false)
+                            return@withPermit false
+                        }
+                        val splitOk = uploadOversizedSingleFileSplit(
+                            id = id,
+                            chatId = chatId,
+                            sourceFile = tempRaw,
+                            displayName = rawName,
+                            maxPartBytes = (maxLimit * 92L / 100L),
+                            options = options,
+                            virtualPath = spec.virtualPath,
+                            captureDateMs = captureDateMs,
+                            stagingDir = stagingDir,
+                        )
+                        if (splitOk) {
+                            waitingForWifiIds.remove(id)
+                            withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
+                        }
+                        return@withPermit splitOk
+                    }
+
+                    encryptedThumbBytes = if (options.encryption.enabled && options.encryption.useVaultKey) {
+                        runCatching {
+                            mediaThumbnailCache.buildEncryptedThumbnailBytes(
+                                localPath = tempRaw.absolutePath,
+                                mimeType = item.mimeType.ifBlank { guessMimeType(rawName) },
+                                originalFileName = rawName,
+                            )
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
+
+                    fileToUpload = tempRaw
+                    finalMime = effectiveMime
+                    if (options.encryption.enabled) {
+                        uploadTracker.updatePhase(
+                            id = id,
+                            status = UploadStatus.ENCRYPTING,
+                            detail = if (options.encryption.useVaultKey) "Encrypting (Vault Key)…" else "Encrypting (AES-256)…",
+                            progress = 0f,
+                            isEncrypted = true,
+                        )
+                        val encOut = File(stagingDir, "${tempRaw.name}${BackupCrypto.ENCRYPTED_EXT}")
+                        encryptedFile = encOut
+                        val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
+                        backupCrypto.encryptFile(
+                            inputFile = tempRaw,
+                            outputFile = encOut,
+                            passphrase = customPass,
+                            onProgress = { done, tot ->
+                                if (tot > 0L) {
+                                    uploadTracker.updatePhase(
+                                        id = id,
+                                        status = UploadStatus.ENCRYPTING,
+                                        progress = (done.toFloat() / tot.toFloat()).coerceIn(0f, 1f),
+                                    )
+                                }
+                            },
+                            cancelCheck = { id in cancelledIds || id in pausedIds },
+                        )
+                        tempRaw.delete()
+                        fileToUpload = encOut
+                        finalMime = "application/octet-stream"
+                    }
                 }
 
                 val uploadSize = fileToUpload.length()

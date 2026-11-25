@@ -101,6 +101,70 @@ object StorageAnalytics {
         allCachedFiles: List<FileCacheEntity>,
         backupGrandTotal: SyncedFileDao.SyncedGrandTotalRow,
         topOffenderCount: Int = 5,
+    ): Report = assembleReport(
+        cacheAggregates = cacheAggregates,
+        grandTotal = grandTotal,
+        duplicateAggregates = duplicateAggregates,
+        perType = bucketByType(allCachedFiles),
+        totalStarred = allCachedFiles.count { it.isStarred },
+        folders = folders,
+        savedMessagesChatId = savedMessagesChatId,
+        backupGrandTotal = backupGrandTotal,
+        topOffenderCount = topOffenderCount,
+    )
+
+    fun computeFromAggregates(
+        cacheAggregates: List<FileCacheDao.ChatAggregateRow>,
+        grandTotal: FileCacheDao.GrandTotalRow,
+        duplicateAggregates: List<FileCacheDao.DuplicateAggregateRow>,
+        bucketAggregates: List<FileCacheDao.BucketAggregateRow>,
+        totalStarred: Int,
+        folders: List<FolderEntity>,
+        savedMessagesChatId: Long,
+        backupGrandTotal: SyncedFileDao.SyncedGrandTotalRow,
+        topOffenderCount: Int = 5,
+    ): Report {
+        val counts = mutableMapOf<FileBucket, TypeAccumulator>()
+        for (row in bucketAggregates) {
+            val bucket = runCatching { FileBucket.valueOf(row.bucket) }.getOrDefault(FileBucket.OTHER)
+            val acc = counts.getOrPut(bucket) { TypeAccumulator() }
+            acc.count += row.fileCount
+            acc.bytes += row.totalBytes
+        }
+        val perType = FileBucket.entries
+            .map { bucket ->
+                val acc = counts[bucket] ?: TypeAccumulator()
+                TypeStat(
+                    bucket = bucket,
+                    label = bucket.label,
+                    fileCount = acc.count,
+                    totalBytes = acc.bytes,
+                )
+            }.filter { it.fileCount > 0 || it.totalBytes > 0 }
+            .sortedByDescending { it.totalBytes }
+        return assembleReport(
+            cacheAggregates = cacheAggregates,
+            grandTotal = grandTotal,
+            duplicateAggregates = duplicateAggregates,
+            perType = perType,
+            totalStarred = totalStarred,
+            folders = folders,
+            savedMessagesChatId = savedMessagesChatId,
+            backupGrandTotal = backupGrandTotal,
+            topOffenderCount = topOffenderCount,
+        )
+    }
+
+    private fun assembleReport(
+        cacheAggregates: List<FileCacheDao.ChatAggregateRow>,
+        grandTotal: FileCacheDao.GrandTotalRow,
+        duplicateAggregates: List<FileCacheDao.DuplicateAggregateRow>,
+        perType: List<TypeStat>,
+        totalStarred: Int,
+        folders: List<FolderEntity>,
+        savedMessagesChatId: Long,
+        backupGrandTotal: SyncedFileDao.SyncedGrandTotalRow,
+        topOffenderCount: Int,
     ): Report {
         val folderByChat = folders.associateBy { it.channelId }
 
@@ -117,9 +181,6 @@ object StorageAnalytics {
                     isSavedMessages = isSavedMessages,
                 )
             }
-
-        val perType: List<TypeStat> = bucketByType(allCachedFiles)
-        val totalStarred = allCachedFiles.count { it.isStarred }
 
         val dedup =
             DedupStat(

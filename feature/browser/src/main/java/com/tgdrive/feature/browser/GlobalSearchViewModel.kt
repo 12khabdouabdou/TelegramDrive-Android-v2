@@ -48,6 +48,15 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
+private val FTS_TOKEN_REGEX = Regex("""[\p{L}\p{N}]+""")
+
+internal fun buildFtsPrefixQuery(raw: String): String? {
+    val tokens = FTS_TOKEN_REGEX.findAll(raw)
+        .map { "${it.value}*" }
+        .toList()
+    return if (tokens.isEmpty()) null else tokens.joinToString(" ")
+}
+
 sealed class GlobalSearchUiState {
     data object Idle : GlobalSearchUiState()
     data object Searching : GlobalSearchUiState()
@@ -154,7 +163,6 @@ class GlobalSearchViewModel
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Throwable) {}
-                refreshLocalSnapshot()
                 refreshUnindexedCount()
                 refreshUnindexedAiCount()
             }
@@ -336,11 +344,37 @@ class GlobalSearchViewModel
             }
             searchJob = viewModelScope.launch(dispatchers.io) {
                 if (!immediate) delay(220L)
-                ensureFreshSnapshot()
                 val trimmed = query.trim()
                 val excludedIds = systemChannelId?.let { setOf(it) } ?: emptySet()
-                val localFiles = cachedFiles
-                val localZips = cachedZipEntries
+                val canTryFts = parsed.textQuery.isNotBlank() &&
+                    !parsed.hasOperators &&
+                    activeScope == SearchScopeFilter.ALL &&
+                    !activeCriteria.hasUiFilters &&
+                    cachedFiles.isEmpty()
+
+                val ftsHits = if (canTryFts) {
+                    val ftsQuery = buildFtsPrefixQuery(parsed.textQuery)
+                    if (ftsQuery != null) {
+                        val trashed = runCatching {
+                            trashEntryDao.getAll().mapTo(HashSet()) { it.chatId to it.messageId }
+                        }.getOrDefault(emptySet())
+                        cachedTrashedKeys = trashed
+                        runCatching { fileCacheDao.searchFts(ftsQuery, limit = 500) }
+                            .getOrNull()
+                            ?.filterNot { (it.chatId to it.messageId) in trashed }
+                            ?.takeIf { it.size >= 10 }
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+
+                if (ftsHits == null) {
+                    ensureFreshSnapshot()
+                }
+                val localFiles = ftsHits ?: cachedFiles
+                val localZips = if (ftsHits != null) emptyList() else cachedZipEntries
                 val trashedKeys = cachedTrashedKeys
 
                 val localHits = SmartSearchEngine.search(
