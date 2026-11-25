@@ -192,6 +192,9 @@ fun ImagePlayerScreen(
     }
 
     val activeRef = pages.getOrNull(pagerState.currentPage) ?: pages.first()
+    SecureWindowForSensitiveEntry(
+        isSensitive = activeRef.entity?.isLocked == true || activeRef.entity?.isEncryptedVault == true,
+    )
     val activePath = remember(activeRef, downloadState.items) {
         vm.getLocalPath(activeRef.messageId, activeRef.chatId)
     }

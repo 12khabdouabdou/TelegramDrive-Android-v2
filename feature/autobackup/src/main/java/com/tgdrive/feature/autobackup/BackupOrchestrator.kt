@@ -245,6 +245,7 @@ class BackupOrchestrator @Inject constructor(
             val folderNameByUri = HashMap<String, String>()
             val scanProblemUris = HashSet<String>()
             var permissionLostCount = 0
+            var anyHitLimit = false
             val excludePatterns = ExcludePatternMatcher.parse(prefs.backupExcludePatterns)
             var lastProgressUpdateMs = 0L
 
@@ -265,6 +266,7 @@ class BackupOrchestrator @Inject constructor(
                             )
                         }
                     }
+                    if (scanResult.hitLimit) anyHitLimit = true
                     folderNameByUri[uri] = scanResult.folderName.ifBlank { fallbackFolderName(uri) }
                     if (scanResult.permissionLost) {
                         permissionLostCount++
@@ -394,7 +396,15 @@ class BackupOrchestrator @Inject constructor(
                         targetByPath[item.absolutePath] = destChatId to folderDbId
                         toUpload += item
                     }
-                    val canPruneStale = onlyLocalPaths == null && urisForTarget.none { it in scanProblemUris }
+                    val anyTemporaryFilterActive = prefs.backupMediaFilter != BackupMediaFilter.ALL_FILES ||
+                        prefs.backupMaxFileSizeMb > 0 ||
+                        prefs.backupOnlyNewAfterMs > 0L ||
+                        (isMetered && prefs.backupSkipVideosOnCellular && !isManual)
+                    val canPruneStale = onlyLocalPaths == null &&
+                        overrideFolderUris == null &&
+                        !anyHitLimit &&
+                        !anyTemporaryFilterActive &&
+                        urisForTarget.none { it in scanProblemUris }
                     if (canPruneStale) {
                         for (stalePath in groupDiff.staleRemotePaths) {
                             runCatching { syncedFileDao.deleteByPathAndFolder(stalePath, queryFolderId) }

@@ -257,4 +257,38 @@ class BackupCryptoTest {
         )
         assertThat(decrypted.toByteArray()).isEqualTo(payload)
     }
+
+    @Test
+    fun `wrapVaultKeyWithPassphrase requires at least 8 characters`() {
+        val crypto = BackupCrypto(inMemoryKeystore())
+        assertThrows<IllegalArgumentException> {
+            crypto.wrapVaultKeyWithPassphrase("1234567")
+        }
+        val wrapped = crypto.wrapVaultKeyWithPassphrase("12345678")
+        assertThat(BackupCrypto.detectMagicFormat(wrapped)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+    }
+
+    @Test
+    fun `encryptFileWithBackupSettings throws instead of downgrading when custom passphrase is missing`(@TempDir tmp: File) {
+        val crypto = BackupCrypto(inMemoryKeystore())
+        val src = File(tmp, "secret.txt").apply { writeText("sensitive") }
+        val dst = File(tmp, "secret.txt.tgenc")
+
+        assertThrows<IllegalStateException> {
+            crypto.encryptFileWithBackupSettings(src, dst, useCustomPassphrase = true)
+        }
+    }
+
+    @Test
+    fun `decryptStream rejects trailing data appended after EOF sentinel`() {
+        val key = ByteArray(32) { 5 }
+        val payload = "hello".toByteArray()
+        val encrypted = ByteArrayOutputStream()
+        BackupCrypto.encryptStream(key, ByteArrayInputStream(payload), encrypted)
+        val extended = encrypted.toByteArray() + byteArrayOf(0x01, 0x02, 0x03)
+
+        assertThrows<AEADBadTagException> {
+            BackupCrypto.decryptStream(key, ByteArrayInputStream(extended), ByteArrayOutputStream())
+        }
+    }
 }

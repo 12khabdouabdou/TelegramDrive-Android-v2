@@ -43,9 +43,15 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
+data class VaultExternalOpenEvent(
+    val id: Long,
+    val file: File,
+    val mimeType: String,
+)
+
 data class VaultUiState(
     val items: List<FileCacheEntity> = emptyList(),
-    val selectedIds: Set<Long> = emptySet(),
+    val selectedIds: Set<Pair<Long, Long>> = emptySet(),
     val biometricRequired: Boolean = false,
     val isUnlocked: Boolean = false,
     val ready: Boolean = false,
@@ -72,7 +78,7 @@ class VaultViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
-    private val _selected = MutableStateFlow<Set<Long>>(emptySet())
+    private val _selected = MutableStateFlow<Set<Pair<Long, Long>>>(emptySet())
     private val _biometricRequired = MutableStateFlow(false)
     private val _isUnlocked = MutableStateFlow(false)
     private val _ready = MutableStateFlow(false)
@@ -85,6 +91,9 @@ class VaultViewModel @Inject constructor(
 
     private val _decryptedOpenEvent = MutableStateFlow<DecryptedOpenEvent?>(null)
     val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = _decryptedOpenEvent.asStateFlow()
+
+    private val _externalOpenEvent = MutableStateFlow<VaultExternalOpenEvent?>(null)
+    val externalOpenEvent: StateFlow<VaultExternalOpenEvent?> = _externalOpenEvent.asStateFlow()
 
     private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
     private val thumbSemaphore = Semaphore(2)
@@ -113,7 +122,7 @@ class VaultViewModel @Inject constructor(
         @Suppress("UNCHECKED_CAST")
         val items = core[0] as List<FileCacheEntity>
         @Suppress("UNCHECKED_CAST")
-        val selected = core[1] as Set<Long>
+        val selected = core[1] as Set<Pair<Long, Long>>
         val bioReq = core[2] as Boolean
         val unlocked = core[3] as Boolean
         val ready = core[4] as Boolean
@@ -220,12 +229,13 @@ class VaultViewModel @Inject constructor(
         synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
     }
 
-    fun toggleSelection(messageId: Long) {
-        _selected.update { cur -> if (messageId in cur) cur - messageId else cur + messageId }
+    fun toggleSelection(chatId: Long, messageId: Long) {
+        val key = chatId to messageId
+        _selected.update { cur -> if (key in cur) cur - key else cur + key }
     }
 
     fun selectAll() {
-        val visible = state.value.items.map { it.messageId }.toSet()
+        val visible = state.value.items.mapTo(mutableSetOf()) { it.chatId to it.messageId }
         _selected.value = if (_selected.value.size == visible.size) emptySet() else visible
     }
 
@@ -234,13 +244,18 @@ class VaultViewModel @Inject constructor(
     }
 
     fun unhideSelected() {
-        val targets = state.value.items.filter { it.messageId in _selected.value && it.isLocked }
+        val selectedKeys = _selected.value
+        val targets = state.value.items.filter { (it.chatId to it.messageId) in selectedKeys && it.isLocked }
         if (targets.isEmpty()) return
         viewModelScope.launch(dispatchers.io) {
             for (item in targets) {
-                runCatching {
+                try {
                     fileCacheDao.setLocked(item.chatId, item.messageId, false)
                     cloudSyncManager.noteLockChanged(item.chatId, item.messageId, false)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("VaultViewModel: failed to unhide ${item.chatId}/${item.messageId}", t)
                 }
             }
             _selected.value = emptySet()
@@ -256,7 +271,7 @@ class VaultViewModel @Inject constructor(
         onOpenPdf: (Long, Long) -> Unit,
         onOpenText: (Long, Long) -> Unit,
     ) {
-        if (BackupCrypto.isEncryptedFileName(item.fileName)) {
+        if (item.isEncryptedVault || BackupCrypto.isEncryptedFileName(item.fileName)) {
             startDecryptFlow(item)
             return
         }
@@ -301,8 +316,26 @@ class VaultViewModel @Inject constructor(
                     }
                 }
             }
-            else -> startDecryptFlow(item)
+            else -> {
+                val mime = item.mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+                if (local != null) {
+                    _externalOpenEvent.value = VaultExternalOpenEvent(System.nanoTime(), File(local), mime)
+                } else {
+                    viewModelScope.launch(dispatchers.io) {
+                        val downloaded = ensureLocalFile(item)
+                        if (downloaded != null) {
+                            _externalOpenEvent.value = VaultExternalOpenEvent(System.nanoTime(), downloaded, mime)
+                        } else {
+                            _error.value = "Failed to download file"
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    fun clearExternalOpenEvent() {
+        _externalOpenEvent.value = null
     }
 
     fun clearError() {
@@ -429,8 +462,9 @@ class VaultViewModel @Inject constructor(
     }
 
     fun batchDecryptSelected(passphrase: String? = null) {
+        val selectedKeys = _selected.value
         val targets = state.value.items.filter {
-            it.messageId in _selected.value && BackupCrypto.isEncryptedFileName(it.fileName)
+            (it.chatId to it.messageId) in selectedKeys && BackupCrypto.isEncryptedFileName(it.fileName)
         }
         if (targets.isEmpty() || _batchProgress.value != null) return
         viewModelScope.launch(dispatchers.io) {

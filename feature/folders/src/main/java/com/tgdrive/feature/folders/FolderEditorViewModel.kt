@@ -3,8 +3,12 @@ package com.tgdrive.feature.folders
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.TrashEntryDao
+import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.FolderEntity
+import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.telegram.TelegramClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,6 +37,10 @@ data class FolderEditorState(
 class FolderEditorViewModel @Inject constructor(
     private val telegramClient: TelegramClient,
     private val folderDao: FolderDao,
+    private val fileCacheDao: FileCacheDao,
+    private val zipEntryDao: ZipEntryDao,
+    private val trashEntryDao: TrashEntryDao,
+    private val offlinePinStore: OfflinePinStore,
     private val dispatchers: DispatchersProvider,
 ) : ViewModel() {
 
@@ -87,6 +95,10 @@ class FolderEditorViewModel @Inject constructor(
             try {
                 telegramClient.deleteFolder(folder.channelId)
                 folderDao.delete(folder)
+                runCatching { fileCacheDao.deleteForChat(folder.channelId) }
+                runCatching { zipEntryDao.deleteForChat(folder.channelId) }
+                runCatching { trashEntryDao.deleteForChat(folder.channelId) }
+                runCatching { offlinePinStore.unpinChat(folder.channelId) }
                 _state.update { it.copy(loading = false, saved = true) }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e
             } catch (t: Throwable) {

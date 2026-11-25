@@ -31,6 +31,9 @@ interface TrashEntryDao {
     @Query("DELETE FROM trash_entries WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun deleteById(chatId: Long, messageId: Long)
 
+    @Query("DELETE FROM trash_entries WHERE chat_id = :chatId")
+    suspend fun deleteForChat(chatId: Long)
+
     @Query("SELECT * FROM trash_entries WHERE deleted_at < :cutoffMs")
     suspend fun getOlderThan(cutoffMs: Long): List<TrashEntryEntity>
 

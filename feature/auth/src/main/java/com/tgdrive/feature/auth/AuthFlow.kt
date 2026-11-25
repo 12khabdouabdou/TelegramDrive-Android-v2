@@ -3,11 +3,14 @@ package com.tgdrive.feature.auth
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.PersistableBundle
 import android.view.WindowManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -578,7 +581,17 @@ private fun ColumnScope.QrLoginForm(state: AuthState, vm: AuthViewModel) {
         TextButton(
             onClick = {
                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("Telegram login link", state.qrLink))
+                val clip = ClipData.newPlainText("Telegram login link", state.qrLink).apply {
+                    description.extras = PersistableBundle().apply {
+                        val key = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            ClipDescription.EXTRA_IS_SENSITIVE
+                        } else {
+                            "android.content.extra.IS_SENSITIVE"
+                        }
+                        putBoolean(key, true)
+                    }
+                }
+                cm.setPrimaryClip(clip)
                 localNotice = copiedMsg
             },
             enabled = state.qrLink.isNotBlank(),
@@ -687,9 +700,14 @@ private fun ColumnScope.PasswordForm(state: AuthState, vm: AuthViewModel) {
 
     DisposableEffect(context) {
         val window = context.findActivity()?.window
-        window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        val hadSecure = ((window?.attributes?.flags ?: 0) and WindowManager.LayoutParams.FLAG_SECURE) != 0
+        if (!hadSecure) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
         onDispose {
-            window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            if (!hadSecure) {
+                window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
         }
     }
 

@@ -95,6 +95,16 @@ class OfflinePinStore @Inject constructor(
         runCatching { fileCacheDao.setPinnedOffline(chatId, messageId, false) }
     }
 
+    /** Remove all offline-pinned files belonging to [chatId]. */
+    suspend fun unpinChat(chatId: Long) = withContext(dispatchers.io) {
+        val chatPrefix = "${chatId}_"
+        pinsDir.listFiles()?.forEach { f ->
+            if (f.isFile && f.name.startsWith(chatPrefix)) {
+                runCatching { f.delete() }
+            }
+        }
+    }
+
     /** Return `(count, totalBytes)` of all pinned files on disk. */
     suspend fun stats(): Pair<Int, Long> = withContext(dispatchers.io) {
         val files = pinsDir.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") } ?: emptyList()

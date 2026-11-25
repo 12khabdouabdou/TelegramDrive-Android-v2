@@ -85,7 +85,7 @@ class TelegramDocumentsProvider : DocumentsProvider() {
     private suspend fun isBiometricLocked(ep: DocumentsProviderEntryPoint): Boolean = try {
         ep.appPreferences().data.first().biometricLockEnabled
     } catch (_: Throwable) {
-        false
+        true
     }
 
     companion object {

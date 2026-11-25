@@ -17,6 +17,7 @@ import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.telegram.TelegramMessage
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -849,14 +850,36 @@ class CloudSyncManager @Inject constructor(
         }
     }
 
+    private suspend fun findSystemMessages(
+        systemChatId: Long,
+        fileName: String,
+        stopOnFirstPageMatch: Boolean,
+        maxPages: Int = 10,
+        pageSize: Int = 100,
+    ): List<TelegramMessage> {
+        val matches = mutableListOf<TelegramMessage>()
+        var fromMessageId = 0L
+        repeat(maxPages) {
+            val page = runCatching {
+                telegramClient.fetchMessages(systemChatId, fromMessageId, pageSize)
+            }.getOrDefault(emptyList())
+            if (page.isEmpty()) return matches
+            matches += page.filter { it.fileName == fileName }
+            if (stopOnFirstPageMatch && matches.isNotEmpty()) return matches
+            val oldestId = page.minOfOrNull { it.id } ?: return matches
+            if (page.size < pageSize || oldestId == fromMessageId) return matches
+            fromMessageId = oldestId
+        }
+        return matches
+    }
+
     private suspend fun <T> downloadSnapshot(
         systemChatId: Long,
         fileName: String,
         decode: (ByteArray) -> T?,
     ): T? {
-        val msgs = runCatching { telegramClient.fetchMessages(systemChatId, 0L, 40) }.getOrDefault(emptyList())
-        val match = msgs
-            .filter { it.fileName == fileName && it.fileRemoteId.isNotEmpty() }
+        val match = findSystemMessages(systemChatId, fileName, stopOnFirstPageMatch = true)
+            .filter { it.fileRemoteId.isNotEmpty() }
             .maxByOrNull { it.date } ?: return null
         val terminal = telegramClient.downloadFile(match.fileRemoteId, "")
             .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
@@ -872,9 +895,7 @@ class CloudSyncManager @Inject constructor(
         fileName: String,
         bytes: ByteArray,
     ) {
-        val oldMsgs = runCatching { telegramClient.fetchMessages(systemChatId, 0L, 40) }
-            .getOrDefault(emptyList())
-            .filter { it.fileName == fileName }
+        val oldMsgs = findSystemMessages(systemChatId, fileName, stopOnFirstPageMatch = false)
 
         val outFile = File(syncDir, fileName)
         try {

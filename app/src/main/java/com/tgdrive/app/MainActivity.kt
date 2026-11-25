@@ -3,6 +3,7 @@ package com.tgdrive.app
 import android.content.Intent
 import android.os.Bundle
 import android.view.WindowManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -41,8 +42,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -125,10 +128,19 @@ class MainActivity : FragmentActivity() {
                     } else {
                         Modifier.weight(1f)
                     }
+                    val isBiometricLocked = state.biometricRequired && !state.biometricUnlocked
                     Box(modifier = contentModifier) {
-                        RootNavHost(state = state, rootVm = rootVm)
+                        Box(
+                            modifier = if (isBiometricLocked) {
+                                Modifier.fillMaxSize().clearAndSetSemantics {}
+                            } else {
+                                Modifier.fillMaxSize()
+                            },
+                        ) {
+                            RootNavHost(state = state, rootVm = rootVm)
+                        }
 
-                        if (state.biometricRequired && !state.biometricUnlocked) {
+                        if (isBiometricLocked) {
                             BiometricGate(
                                 onUnlock = { rootVm.onBiometricUnlocked() },
                             )
@@ -199,12 +211,21 @@ class MainActivity : FragmentActivity() {
             }
         }
 
+        BackHandler(enabled = true) {}
+
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
                 .statusBarsPadding()
-                .navigationBarsPadding(),
+                .navigationBarsPadding()
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            awaitPointerEvent().changes.forEach { it.consume() }
+                        }
+                    }
+                },
             contentAlignment = Alignment.Center,
         ) {
             Column(

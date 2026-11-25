@@ -1206,7 +1206,7 @@ private fun BackupPassphraseDialog(
             TextButton(onClick = {
                 when {
                     passphrase.isBlank() -> error = errEmpty
-                    passphrase.length < 4 -> error = errShort
+                    passphrase.length < 8 -> error = errShort
                     passphrase != confirm -> error = errMismatch
                     else -> onSavePassphrase(passphrase)
                 }

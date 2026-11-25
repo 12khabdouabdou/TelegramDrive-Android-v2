@@ -104,12 +104,13 @@ class RootViewModel @Inject constructor(
     val state: StateFlow<RootState> = _state.asStateFlow()
 
     // Shadow flags for biometric lock & persisted background timeout.
-    private var biometricPrefEnabled = false
-    private var biometricLastBgTimeMs = 0L
-    private var biometricTimeoutSeconds = 0
-    private var decryptedTempTtlMinutes = 30
-    private var initialPrefSynced = false
-    private var cloudSyncedForSession = false
+    @Volatile private var biometricPrefEnabled = false
+    @Volatile private var biometricLastBgTimeMs = 0L
+    @Volatile private var biometricTimeoutSeconds = 0
+    @Volatile private var decryptedTempTtlMinutes = 30
+    @Volatile private var initialPrefSynced = false
+    @Volatile private var authSettled = false
+    @Volatile private var cloudSyncedForSession = false
 
     init {
         observeAuth()
@@ -160,14 +161,14 @@ class RootViewModel @Inject constructor(
     private fun observeAuth() {
         viewModelScope.launch(dispatchers.io) {
             telegramClient.authState.collect { st ->
+                authSettled = st !is AuthorizationState.WaitInitialization
                 _state.update { current ->
                     current.copy(
                         isAuthorized = st is AuthorizationState.Ready,
                         biometricRequired = st is AuthorizationState.Ready && biometricPrefEnabled,
-                        // Flip isInitializing to false as soon as TDLib reports
-                        // any non-WaitInitialization state. This is the "early
-                        // exit" path for returning users.
-                        isInitializing = current.isInitializing && st is AuthorizationState.WaitInitialization,
+                        // Flip isInitializing to false once both TDLib leaves
+                        // WaitInitialization and DataStore preferences have synced.
+                        isInitializing = current.isInitializing && (!authSettled || !initialPrefSynced),
                     )
                 }
                 if (st is AuthorizationState.Ready && !cloudSyncedForSession) {
@@ -215,6 +216,7 @@ class RootViewModel @Inject constructor(
                         onboardingCompleted = prefs.onboardingCompleted,
                         biometricRequired = current.isAuthorized && prefs.biometricLockEnabled,
                         biometricUnlocked = if (coldStartLock) false else current.biometricUnlocked,
+                        isInitializing = current.isInitializing && (!authSettled || !initialPrefSynced),
                         manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                         decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes,
                         blockScreenshotsEverywhere = prefs.blockScreenshotsEverywhere,
@@ -299,7 +301,7 @@ class RootViewModel @Inject constructor(
         val lastBg = biometricLastBgTimeMs
         val now = System.currentTimeMillis()
         val timeoutMs = biometricTimeoutSeconds.coerceAtLeast(0).toLong() * 1000L
-        if (lastBg == 0L || now < lastBg || (now - lastBg) >= timeoutMs) {
+        if (lastBg > 0L && (now < lastBg || (now - lastBg) >= timeoutMs)) {
             _state.update { it.copy(biometricUnlocked = false) }
         }
     }

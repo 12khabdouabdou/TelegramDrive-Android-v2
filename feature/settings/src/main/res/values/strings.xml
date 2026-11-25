@@ -92,7 +92,7 @@
     <string name="settings_passvault_passphrase_desc">Set a portable custom passphrase for TGE2 encrypted backups, or reset to automatic Device Vault Key.</string>
     <string name="settings_passvault_passphrase_label">Passphrase</string>
     <string name="settings_passvault_passphrase_confirm">Confirm passphrase</string>
-    <string name="settings_passvault_passphrase_short">Use at least 4 characters</string>
+    <string name="settings_passvault_passphrase_short">Use at least 8 characters</string>
     <string name="settings_passvault_passphrase_mismatch">Passphrases do not match</string>
     <string name="settings_passvault_use_vault">Use Vault Key</string>
     <string name="settings_passvault_passphrase_saved">Custom Vault passphrase saved</string>

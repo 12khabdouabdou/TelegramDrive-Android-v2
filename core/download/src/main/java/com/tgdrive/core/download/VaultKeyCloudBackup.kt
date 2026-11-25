@@ -6,6 +6,7 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.telegram.TelegramMessage
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -33,8 +34,7 @@ class VaultKeyCloudBackup @Inject constructor(
             val channelId = telegramClient.getOrCreateSystemChannel()
                 ?: error("Telegram System channel is not available")
             val previousBackups = runCatching {
-                telegramClient.fetchMessages(channelId, 0L, 50)
-                    .filter { it.fileName == VAULT_KEY_CLOUD_FILE }
+                findVaultBackupMessages(channelId, stopOnFirstPageMatch = false)
             }.getOrDefault(emptyList())
 
             val dir = File(ctx.cacheDir, "vault_sync").apply { mkdirs() }
@@ -64,13 +64,14 @@ class VaultKeyCloudBackup @Inject constructor(
         runCatching {
             val channelId = telegramClient.getOrCreateSystemChannel()
                 ?: error("Telegram System channel is not available")
-            val match = telegramClient.fetchMessages(channelId, 0L, 50)
-                .filter { it.fileName == VAULT_KEY_CLOUD_FILE && it.fileRemoteId.isNotBlank() }
+            val match = findVaultBackupMessages(channelId, stopOnFirstPageMatch = true)
+                .filter { it.fileRemoteId.isNotBlank() }
                 .maxByOrNull { it.date }
                 ?: error("No cloud Vault Key backup found in TelegramDrive System channel")
 
             val dir = File(ctx.cacheDir, "vault_sync").apply { mkdirs() }
             val dest = File(dir, "restore_${UUID.randomUUID()}.tgenc")
+            var downloadedFile: File? = null
             try {
                 val terminal = telegramClient.downloadFile(match.fileRemoteId, dest.absolutePath)
                     .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
@@ -78,13 +79,15 @@ class VaultKeyCloudBackup @Inject constructor(
                 if (terminal is DownloadUpdate.Failed) {
                     error(terminal.message)
                 }
-                val downloadedFile = File((terminal as DownloadUpdate.Done).localPath)
-                val wrappedBytes = downloadedFile.readBytes()
+                val resolvedFile = File((terminal as DownloadUpdate.Done).localPath)
+                downloadedFile = resolvedFile
+                val wrappedBytes = resolvedFile.readBytes()
                 val ok = backupCrypto.unwrapAndImportVaultKey(wrappedBytes, recoveryPassphrase)
                 if (!ok) error("Restored Vault Key payload had invalid length")
                 backupCrypto.vaultKeyFingerprint()
             } finally {
                 runCatching { dest.delete() }
+                downloadedFile?.let { f -> runCatching { f.delete() } }
             }
         }
     }
@@ -92,11 +95,31 @@ class VaultKeyCloudBackup @Inject constructor(
     suspend fun hasCloudBackup(): Boolean = withContext(dispatchers.io) {
         try {
             val channelId = telegramClient.getOrCreateSystemChannel() ?: return@withContext false
-            telegramClient.fetchMessages(channelId, 0L, 50).any { it.fileName == VAULT_KEY_CLOUD_FILE }
+            findVaultBackupMessages(channelId, stopOnFirstPageMatch = true).isNotEmpty()
         } catch (t: Throwable) {
             Log.w("VaultKeyCloudBackup: hasCloudBackup check failed", t)
             false
         }
+    }
+
+    private suspend fun findVaultBackupMessages(
+        channelId: Long,
+        stopOnFirstPageMatch: Boolean,
+        maxPages: Int = 10,
+        pageSize: Int = 100,
+    ): List<TelegramMessage> {
+        val matches = mutableListOf<TelegramMessage>()
+        var fromMessageId = 0L
+        repeat(maxPages) {
+            val page = telegramClient.fetchMessages(channelId, fromMessageId, pageSize)
+            if (page.isEmpty()) return matches
+            matches += page.filter { it.fileName == VAULT_KEY_CLOUD_FILE }
+            if (stopOnFirstPageMatch && matches.isNotEmpty()) return matches
+            val oldestId = page.minOfOrNull { it.id } ?: return matches
+            if (page.size < pageSize || oldestId == fromMessageId) return matches
+            fromMessageId = oldestId
+        }
+        return matches
     }
 
     companion object {

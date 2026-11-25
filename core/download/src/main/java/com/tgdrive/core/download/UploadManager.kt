@@ -38,7 +38,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -48,6 +47,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -204,33 +204,42 @@ class UploadManager @Inject constructor(
                 }
                 val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
                 val claimedNames = ConcurrentHashMap.newKeySet<String>()
-                existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+                existingRows.forEach { claimedNames.add(claimedNameKey(it.virtualPath, it.fileName)) }
 
-                val jobs = preparedIds.mapNotNull { (id, file) ->
-                    val spec = RetrySpec.SingleFile(resolvedChatId, file, options, virtualPath = options.virtualPath)
-                    retrySpecs[id] = spec
-                    val shownName = if (options.encryption.enabled) {
-                        "${sanitizeLeafName(file.displayName)}.tgenc"
-                    } else {
-                        sanitizeLeafName(file.displayName)
+                val results = supervisorScope {
+                    val jobs = preparedIds.mapNotNull { (id, file) ->
+                        val spec = RetrySpec.SingleFile(resolvedChatId, file, options, virtualPath = options.virtualPath)
+                        retrySpecs[id] = spec
+                        val shownName = if (options.encryption.enabled) {
+                            "${sanitizeLeafName(file.displayName)}.tgenc"
+                        } else {
+                            sanitizeLeafName(file.displayName)
+                        }
+                        if (id !in cancelledIds) {
+                            persistPendingSpec(
+                                id = id,
+                                spec = spec,
+                                displayName = shownName,
+                                totalBytes = file.sizeBytes,
+                                status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
+                            )
+                        }
+                        if (id in cancelledIds || id in pausedIds) return@mapNotNull null
+                        val job = async {
+                            executeSingleFileTask(id, spec, claimedNames, existingRows)
+                        }
+                        activeJobs[id] = job
+                        job
                     }
-                    if (id !in cancelledIds) {
-                        persistPendingSpec(
-                            id = id,
-                            spec = spec,
-                            displayName = shownName,
-                            totalBytes = file.sizeBytes,
-                            status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
-                        )
+                    jobs.map { job ->
+                        try {
+                            job.await()
+                        } catch (e: CancellationException) {
+                            currentCoroutineContext().ensureActive()
+                            false
+                        }
                     }
-                    if (id in cancelledIds || id in pausedIds) return@mapNotNull null
-                    val job = async {
-                        executeSingleFileTask(id, spec, claimedNames, existingRows)
-                    }
-                    activeJobs[id] = job
-                    job
                 }
-                val results = jobs.awaitAll()
                 if (results.any { it }) {
                     _completedChatEvents.tryEmit(resolvedChatId)
                 }
@@ -256,7 +265,7 @@ class UploadManager @Inject constructor(
 
                 val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
                 val claimedNames = ConcurrentHashMap.newKeySet<String>()
-                existingRows.forEach { claimedNames.add(it.fileName.lowercase(Locale.US)) }
+                existingRows.forEach { claimedNames.add(claimedNameKey(it.virtualPath, it.fileName)) }
 
                 val prepared = scanned.mapIndexed { idx, entry ->
                     val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
@@ -291,29 +300,38 @@ class UploadManager @Inject constructor(
                     id to spec
                 }
 
-                val jobs = prepared.mapNotNull { (id, spec) ->
-                    val shownName = if (options.encryption.enabled) {
-                        "${sanitizeLeafName(spec.file.displayName)}.tgenc"
-                    } else {
-                        sanitizeLeafName(spec.file.displayName)
+                val results = supervisorScope {
+                    val jobs = prepared.mapNotNull { (id, spec) ->
+                        val shownName = if (options.encryption.enabled) {
+                            "${sanitizeLeafName(spec.file.displayName)}.tgenc"
+                        } else {
+                            sanitizeLeafName(spec.file.displayName)
+                        }
+                        if (id !in cancelledIds) {
+                            persistPendingSpec(
+                                id = id,
+                                spec = spec,
+                                displayName = shownName,
+                                totalBytes = spec.file.sizeBytes,
+                                status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
+                            )
+                        }
+                        if (id in cancelledIds || id in pausedIds) return@mapNotNull null
+                        val job = async {
+                            executeSingleFileTask(id, spec, claimedNames, existingRows)
+                        }
+                        activeJobs[id] = job
+                        job
                     }
-                    if (id !in cancelledIds) {
-                        persistPendingSpec(
-                            id = id,
-                            spec = spec,
-                            displayName = shownName,
-                            totalBytes = spec.file.sizeBytes,
-                            status = if (id in pausedIds) UploadStatus.PAUSED.name else UploadStatus.QUEUED.name,
-                        )
+                    jobs.map { job ->
+                        try {
+                            job.await()
+                        } catch (e: CancellationException) {
+                            currentCoroutineContext().ensureActive()
+                            false
+                        }
                     }
-                    if (id in cancelledIds || id in pausedIds) return@mapNotNull null
-                    val job = async {
-                        executeSingleFileTask(id, spec, claimedNames, existingRows)
-                    }
-                    activeJobs[id] = job
-                    job
                 }
-                val results = jobs.awaitAll()
                 if (results.any { it }) {
                     _completedChatEvents.tryEmit(resolvedChatId)
                 }
@@ -624,8 +642,10 @@ class UploadManager @Inject constructor(
         }
         val effectiveMime = if (options.encryption.enabled) "application/octet-stream" else item.mimeType.ifBlank { guessMimeType(rawName) }
 
+        val normVpath = spec.virtualPath.trim('/')
         val existingMatch = existingRowsSnapshot.firstOrNull {
-            it.fileName.equals(desiredName, ignoreCase = true)
+            it.virtualPath.trim('/').equals(normVpath, ignoreCase = true) &&
+                it.fileName.equals(desiredName, ignoreCase = true)
         }
         var targetName = desiredName
         when (options.conflictStrategy) {
@@ -637,14 +657,14 @@ class UploadManager @Inject constructor(
                     activeJobs.remove(id)
                     return false
                 }
-                claimedNames.add(targetName.lowercase(Locale.US))
+                claimedNames.add(claimedNameKey(normVpath, targetName))
             }
             UploadConflictStrategy.KEEP_BOTH -> {
-                targetName = claimUniqueName(desiredName, claimedNames)
+                targetName = claimUniqueName(normVpath, desiredName, claimedNames)
                 uploadTracker.updatePhase(id, UploadStatus.QUEUED, fileName = targetName)
             }
             UploadConflictStrategy.REPLACE -> {
-                claimedNames.add(targetName.lowercase(Locale.US))
+                claimedNames.add(claimedNameKey(normVpath, targetName))
             }
         }
 
@@ -725,7 +745,7 @@ class UploadManager @Inject constructor(
                     return@withPermit splitOk
                 }
 
-                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled) {
+                val encryptedThumbBytes: ByteArray? = if (options.encryption.enabled && options.encryption.useVaultKey) {
                     runCatching {
                         mediaThumbnailCache.buildEncryptedThumbnailBytes(
                             localPath = tempRaw.absolutePath,
@@ -1067,6 +1087,7 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
+                                useVaultKey = request.encryption.useVaultKey,
                                 zipPassword = password,
                                 virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
@@ -1103,6 +1124,7 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
+                                useVaultKey = request.encryption.useVaultKey,
                                 zipPassword = password,
                                 virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
@@ -1210,6 +1232,7 @@ class UploadManager @Inject constructor(
         chatId: Long,
         part: com.tgdrive.core.zip.ZipPartOutput,
         isEncrypted: Boolean,
+        useVaultKey: Boolean = true,
         zipPassword: String?,
         virtualPath: String = "",
         uploadedParts: MutableList<UploadedZipPartRecord>,
@@ -1232,7 +1255,7 @@ class UploadManager @Inject constructor(
             fileName = partName,
             mimeType = "application/zip",
         )
-        val partThumb = if (isEncrypted) {
+        val partThumb = if (isEncrypted && useVaultKey) {
             runCatching {
                 mediaThumbnailCache.generateAndSyncEncryptedThumb(
                     chatId = chatId,
@@ -1401,8 +1424,15 @@ class UploadManager @Inject constructor(
         return available >= requiredBytes + FREE_SPACE_SAFETY_BYTES
     }
 
-    private fun claimUniqueName(desiredName: String, claimedNames: MutableSet<String>): String {
-        if (claimedNames.add(desiredName.lowercase(Locale.US))) return desiredName
+    private fun claimedNameKey(virtualPath: String, fileName: String): String =
+        "${virtualPath.trim('/').lowercase(Locale.US)}\u0000${fileName.lowercase(Locale.US)}"
+
+    private fun claimUniqueName(
+        virtualPath: String,
+        desiredName: String,
+        claimedNames: MutableSet<String>,
+    ): String {
+        if (claimedNames.add(claimedNameKey(virtualPath, desiredName))) return desiredName
         val isEnc = BackupCrypto.isEncryptedFileName(desiredName)
         val inner = if (isEnc) BackupCrypto.stripEncryptedExtension(desiredName) else desiredName
         val dot = inner.lastIndexOf('.')
@@ -1412,7 +1442,7 @@ class UploadManager @Inject constructor(
         while (true) {
             val candidateInner = "$stem ($index)$ext"
             val candidate = if (isEnc) "$candidateInner${BackupCrypto.ENCRYPTED_EXT}" else candidateInner
-            if (claimedNames.add(candidate.lowercase(Locale.US))) return candidate
+            if (claimedNames.add(claimedNameKey(virtualPath, candidate))) return candidate
             index++
         }
     }
@@ -1902,13 +1932,18 @@ class UploadManager @Inject constructor(
     }
 
     private fun encryptSecretHex(raw: String): String? = runCatching {
-        val out = ByteArrayOutputStream()
-        BackupCrypto.encryptStream(
-            keyBytes = backupCrypto.vaultKey(),
-            input = ByteArrayInputStream(raw.toByteArray(Charsets.UTF_8)),
-            output = out,
-        )
-        out.toByteArray().joinToString("") { "%02x".format(it) }
+        val key = backupCrypto.vaultKey()
+        try {
+            val out = ByteArrayOutputStream()
+            BackupCrypto.encryptStream(
+                keyBytes = key,
+                input = ByteArrayInputStream(raw.toByteArray(Charsets.UTF_8)),
+                output = out,
+            )
+            out.toByteArray().joinToString("") { "%02x".format(it) }
+        } finally {
+            key.fill(0)
+        }
     }.getOrNull()
 
     private fun decryptSecretHex(hex: String): String? = runCatching {
@@ -1916,13 +1951,18 @@ class UploadManager @Inject constructor(
         val bytes = ByteArray(hex.length / 2) { idx ->
             hex.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
         }
-        val out = ByteArrayOutputStream()
-        BackupCrypto.decryptStream(
-            keyBytes = backupCrypto.vaultKey(),
-            input = ByteArrayInputStream(bytes),
-            output = out,
-        )
-        out.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
+        val key = backupCrypto.vaultKey()
+        try {
+            val out = ByteArrayOutputStream()
+            BackupCrypto.decryptStream(
+                keyBytes = key,
+                input = ByteArrayInputStream(bytes),
+                output = out,
+            )
+            out.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
+        } finally {
+            key.fill(0)
+        }
     }.getOrNull()
 
     private fun encodeKvMap(map: Map<String, String>): String =

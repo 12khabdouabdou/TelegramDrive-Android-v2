@@ -8,5 +8,5 @@
     <string name="folders_delete">Delete</string>
     <string name="folders_cancel">Cancel</string>
     <string name="folders_delete_confirm">Are you sure you want to delete \"%1$s\"?</string>
-    <string name="folders_delete_note">This will leave the Telegram channel and remove it from your folder list. Files already in the channel remain on Telegram\'s servers.</string>
+    <string name="folders_delete_note">This will permanently delete the Telegram channel and all files inside it from Telegram and clear local folder cache.</string>
 </resources>

@@ -114,6 +114,12 @@ fun TextViewerScreen(
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var cachedEntry by remember(chatId, messageId) { mutableStateOf<FileCacheEntity?>(null) }
+    val isEncryptedSource = cachedEntry?.isEncryptedVault == true ||
+        cachedEntry?.fileName?.endsWith(".tgenc", ignoreCase = true) == true ||
+        initialLocalPath?.contains("/decrypted/") == true
+    SecureWindowForSensitiveEntry(
+        isSensitive = cachedEntry?.isLocked == true || isEncryptedSource,
+    )
     var localPath by remember(chatId, messageId, initialLocalPath) {
         mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))
     }
@@ -398,6 +404,8 @@ fun TextViewerScreen(
                                     fileName = resolvedTitle,
                                     text = editDraft,
                                     virtualPath = cachedEntry?.virtualPath.orEmpty(),
+                                    mimeType = cachedEntry?.mimeType,
+                                    encryptWithVaultKey = isEncryptedSource,
                                 )
                                 editMode = false
                                 scope.launch { snackbarHostState.showSnackbar(uploadQueuedMsg) }

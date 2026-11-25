@@ -840,6 +840,7 @@ object ZipUploader {
                             zip.createSplitZipFile(listOf(stagedFile), params, true, splitLen)
                         }
                         emittedVolumes = collectOrderedSplitVolumes(workDir, splitBase, splitOutZip)
+                        var emittedCount = 0
                         emittedVolumes.forEach { vol ->
                             currentCoroutineContext().ensureActive()
                             totalParts++
@@ -861,6 +862,7 @@ object ZipUploader {
                                     },
                                 ),
                             )
+                            emittedCount++
                         }
                         totalFiles++
                         totalUncompressed += entry.sizeBytes
@@ -875,7 +877,9 @@ object ZipUploader {
                             ),
                         )
                     } finally {
-                        emittedVolumes.forEach { vol -> runCatching { if (vol.exists()) vol.delete() } }
+                        emittedVolumes.drop(emittedCount).forEach { vol ->
+                            runCatching { if (vol.exists()) vol.delete() }
+                        }
                         stageDir.deleteRecursively()
                     }
                     continue
@@ -1174,9 +1178,38 @@ object ZipUploader {
                 }
             }
             val fileHeaders = headers.filterNot { it.isDirectory }
+            var actualTotalBytes = 0L
+            val copyBuf = ByteArray(64 * 1024)
             fileHeaders.forEachIndexed { idx, header ->
-                zip.extractFile(header, outputDir.absolutePath)
                 val outFile = File(outputDir, header.fileName)
+                outFile.parentFile?.mkdirs()
+                var entryWritten = 0L
+                try {
+                    zip.getInputStream(header).use { input ->
+                        FileOutputStream(outFile).use { output ->
+                            while (true) {
+                                val read = input.read(copyBuf)
+                                if (read <= 0) break
+                                entryWritten += read
+                                actualTotalBytes += read
+                                if (actualTotalBytes > MAX_EXTRACT_TOTAL_BYTES) {
+                                    throw SecurityException("ZIP uncompressed size exceeds 4 GB limit")
+                                }
+                                if (entryWritten > RATIO_CHECK_MIN_BYTES &&
+                                    header.compressedSize > 0L &&
+                                    (entryWritten / header.compressedSize) > MAX_COMPRESSION_RATIO
+                                ) {
+                                    val ratio = entryWritten / header.compressedSize
+                                    throw SecurityException("Suspicious compression ratio ($ratio:1) in entry ${header.fileName}")
+                                }
+                                output.write(copyBuf, 0, read)
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    runCatching { outFile.delete() }
+                    throw t
+                }
                 if (outFile.isFile) extractedFiles.add(outFile)
                 onProgress?.invoke(idx + 1, fileHeaders.size, header.fileName)
             }

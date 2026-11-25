@@ -1,9 +1,13 @@
 package com.tgdrive.feature.settings
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.Build
+import android.os.PersistableBundle
+import android.view.WindowManager
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -370,6 +374,18 @@ fun SettingsScreen(
 
     exportedVaultKey?.let { keyText ->
         val copiedMsg = stringResource(R.string.settings_passvault_copied)
+        DisposableEffect(context, keyText) {
+            val window = context.findFragmentActivity()?.window
+            val hadSecure = ((window?.attributes?.flags ?: 0) and WindowManager.LayoutParams.FLAG_SECURE) != 0
+            if (!hadSecure) {
+                window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+            onDispose {
+                if (!hadSecure) {
+                    window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+        }
         AlertDialog(
             onDismissRequest = { exportedVaultKey = null },
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -406,7 +422,17 @@ fun SettingsScreen(
                 Button(
                     onClick = {
                         val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        cb?.setPrimaryClip(ClipData.newPlainText("TelegramDrive Vault Key", keyText))
+                        val clip = ClipData.newPlainText("TelegramDrive Vault Key", keyText).apply {
+                            description.extras = PersistableBundle().apply {
+                                val key = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    ClipDescription.EXTRA_IS_SENSITIVE
+                                } else {
+                                    "android.content.extra.IS_SENSITIVE"
+                                }
+                                putBoolean(key, true)
+                            }
+                        }
+                        cb?.setPrimaryClip(clip)
                         passvaultNotice = copiedMsg
                         exportedVaultKey = null
                     },
@@ -556,7 +582,7 @@ fun SettingsScreen(
                     enabled = !state.cloudVaultBusy,
                     onClick = {
                         when {
-                            passInput.trim().length < 4 -> dialogErr = shortErr
+                            passInput.trim().length < 8 -> dialogErr = shortErr
                             passInput != confirmInput -> dialogErr = mismatchErr
                             else -> {
                                 scope.launch {

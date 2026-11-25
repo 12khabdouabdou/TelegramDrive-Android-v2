@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.WindowManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -125,6 +126,7 @@ import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadConflictStrategy
+import com.tgdrive.core.download.UploadEncryptionSpec
 import com.tgdrive.core.download.UploadFileItem
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.ai.MediaAiIndexer
@@ -266,10 +268,16 @@ class VideoPlayerViewModel @Inject constructor(
     suspend fun saveEditedTextToDownloads(fileName: String, text: String): Boolean = withContext(dispatchers.io) {
         val dir = File(appContext.cacheDir, "text_edits").apply { mkdirs() }
         val tmp = File(dir, fileName.ifBlank { "edited.txt" })
-        runCatching {
+        try {
             tmp.writeText(text, Charsets.UTF_8)
             saveFileToPublicDownloads(tmp, tmp.name, "text/plain") != null
-        }.getOrDefault(false)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            false
+        } finally {
+            runCatching { tmp.delete() }
+        }
     }
 
     fun reuploadEditedText(
@@ -277,12 +285,15 @@ class VideoPlayerViewModel @Inject constructor(
         fileName: String,
         text: String,
         virtualPath: String = "",
+        mimeType: String? = null,
+        encryptWithVaultKey: Boolean = false,
     ) {
         if (chatId == 0L) return
         viewModelScope.launch(dispatchers.io) {
             val dir = File(appContext.cacheDir, "text_edits").apply { mkdirs() }
             val safeName = fileName.replace(Regex("[/\\\\]"), "_").ifBlank { "edited.txt" }
-            val out = File(dir, "${System.currentTimeMillis()}_$safeName")
+            val uploadName = if (encryptWithVaultKey) safeName.removeSuffix(".tgenc").ifBlank { "edited.txt" } else safeName
+            val out = File(dir, "${System.currentTimeMillis()}_$uploadName")
             out.writeText(text, Charsets.UTF_8)
             val uri = Uri.fromFile(out)
             uploadManager.enqueueFiles(
@@ -290,13 +301,17 @@ class VideoPlayerViewModel @Inject constructor(
                 files = listOf(
                     UploadFileItem(
                         uri = uri,
-                        displayName = safeName,
-                        mimeType = "text/plain",
+                        displayName = uploadName,
+                        mimeType = mimeType?.takeIf { it.isNotBlank() } ?: "text/plain",
                         sizeBytes = out.length(),
                     ),
                 ),
                 options = NormalUploadOptions(
                     conflictStrategy = UploadConflictStrategy.REPLACE,
+                    encryption = UploadEncryptionSpec(
+                        enabled = encryptWithVaultKey,
+                        useVaultKey = true,
+                    ),
                     virtualPath = virtualPath,
                 ),
             )
@@ -688,6 +703,23 @@ private tailrec fun Context.findActivity(): Activity? =
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
+internal fun SecureWindowForSensitiveEntry(isSensitive: Boolean) {
+    val ctx = LocalContext.current
+    DisposableEffect(ctx, isSensitive) {
+        val window = if (isSensitive) ctx.findActivity()?.window else null
+        val hadSecure = ((window?.attributes?.flags ?: 0) and WindowManager.LayoutParams.FLAG_SECURE) != 0
+        if (window != null && !hadSecure) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        onDispose {
+            if (window != null && !hadSecure) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
+    }
+}
+
+@Composable
 fun VideoPlayerScreen(
     messageId: Long,
     onBack: () -> Unit,
@@ -747,6 +779,11 @@ private fun VideoPlayerBody(
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var cachedEntry by remember(chatId, messageId, initialLocalPath) { mutableStateOf<FileCacheEntity?>(null) }
+    SecureWindowForSensitiveEntry(
+        isSensitive = cachedEntry?.isLocked == true ||
+            cachedEntry?.isEncryptedVault == true ||
+            initialLocalPath?.contains("/decrypted/") == true,
+    )
     var localPath by remember(chatId, messageId, initialLocalPath) {
         mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))
     }
@@ -855,7 +892,16 @@ private fun VideoPlayerBody(
             isStreamingBuffering = false
             return@LaunchedEffect
         }
+        val isEncryptedEntry = cachedEntry?.let {
+            it.isEncryptedVault || it.fileName.endsWith(".tgenc", ignoreCase = true)
+        } == true
         val path = vm.getLocalPath(messageId, chatId)
+        if (isEncryptedEntry) {
+            useProgressiveStream = false
+            isStreamingBuffering = false
+            playbackError = "Encrypted video must be decrypted before playback"
+            return@LaunchedEffect
+        }
         if (path != null && path != localPath) {
             localPath = path
             useProgressiveStream = false

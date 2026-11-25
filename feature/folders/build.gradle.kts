@@ -22,6 +22,7 @@ dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:telegram"))
     implementation(project(":core:db"))
+    implementation(project(":core:download"))
     implementation(project(":designsystem"))
 
     implementation(platform(libs.compose.bom))

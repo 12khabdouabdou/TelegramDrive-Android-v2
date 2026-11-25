@@ -342,7 +342,9 @@ class MediaThumbnailCache @Inject constructor(
     }
 
     private suspend fun resolveThumbnailInternal(entity: FileCacheEntity): String? = withContext(dispatchers.io) {
-        if (entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)) return@withContext null
+        if (entity.isLocked || entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)) {
+            return@withContext null
+        }
         val pinned = offlinePinStore.getPinnedFilePathSync(entity.chatId, entity.messageId)
         val dlLocal = downloadManager.findItem(entity.chatId, entity.messageId)
             ?.takeIf { it.status == DownloadStatus.DONE }

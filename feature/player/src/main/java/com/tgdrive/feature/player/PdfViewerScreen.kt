@@ -167,6 +167,11 @@ fun PdfViewerScreen(
     var loading by remember(chatId, messageId, initialLocalPath) { mutableStateOf(true) }
     var error by remember(chatId, messageId, initialLocalPath) { mutableStateOf<String?>(null) }
     var cachedEntry by remember(chatId, messageId, initialLocalPath) { mutableStateOf<FileCacheEntity?>(null) }
+    SecureWindowForSensitiveEntry(
+        isSensitive = cachedEntry?.isLocked == true ||
+            cachedEntry?.isEncryptedVault == true ||
+            initialLocalPath?.contains("/decrypted/") == true,
+    )
     var entryChecked by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
     var localPath by remember(chatId, messageId, initialLocalPath) {
         mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))

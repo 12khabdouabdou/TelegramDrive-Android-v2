@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import com.tgdrive.core.db.entity.SyncedFileEntity
 import kotlinx.coroutines.flow.Flow
 
@@ -34,8 +35,26 @@ interface SyncedFileDao {
     """)
     suspend fun findBySha(sha256: String): SyncedFileEntity?
 
+    @Query("""
+        SELECT id FROM synced_files
+        WHERE local_path = :path AND folder_id IS NULL
+        LIMIT 1
+    """)
+    suspend fun findSavedMessagesId(path: String): Long?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(file: SyncedFileEntity): Long
+    suspend fun insertRaw(file: SyncedFileEntity): Long
+
+    @Transaction
+    suspend fun upsert(file: SyncedFileEntity): Long {
+        val target = if (file.folderId == null && file.id == 0L) {
+            val existingId = findSavedMessagesId(file.localPath)
+            if (existingId != null) file.copy(id = existingId) else file
+        } else {
+            file
+        }
+        return insertRaw(target)
+    }
 
     @Query("DELETE FROM synced_files WHERE id = :id")
     suspend fun deleteById(id: Long)

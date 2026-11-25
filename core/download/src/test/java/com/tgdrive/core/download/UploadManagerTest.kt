@@ -23,7 +23,9 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.unmockkStatic
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -487,5 +489,102 @@ class UploadManagerTest {
         val completed = tracker.state.value.items.single()
         assertThat(completed.status).isEqualTo(UploadStatus.DONE)
         coVerify(exactly = 1) { tg.uploadFile(88L, any(), "wifi.bin", any(), any()) }
+    }
+
+    @Test
+    fun `REPLACE conflict strategy scopes replacement to matching virtualPath`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "report.pdf").apply { writeBytes("updated-report".toByteArray()) }
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } returns
+                UploadResult(messageId = 99L, remoteId = "rem99")
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(42L) } returns listOf(
+                FileCacheEntity(
+                    messageId = 10L,
+                    chatId = 42L,
+                    fileName = "report.pdf",
+                    fileSize = 10L,
+                    mimeType = "application/pdf",
+                    thumbnailPath = null,
+                    remoteId = "r10",
+                    date = 1L,
+                    virtualPath = "Work",
+                ),
+                FileCacheEntity(
+                    messageId = 20L,
+                    chatId = 42L,
+                    fileName = "report.pdf",
+                    fileSize = 10L,
+                    mimeType = "application/pdf",
+                    thumbnailPath = null,
+                    remoteId = "r20",
+                    date = 1L,
+                    virtualPath = "Personal",
+                ),
+            )
+        }
+        val (manager, tracker) = createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 42L,
+            files = listOf(UploadFileItem(fileUri(src), "report.pdf", "application/pdf", src.length())),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.REPLACE,
+                virtualPath = "Personal",
+            ),
+        )
+        advanceUntilIdle()
+
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.DONE)
+        coVerify(exactly = 1) { tg.deleteMessage(42L, 20L) }
+        coVerify(exactly = 0) { tg.deleteMessage(42L, 10L) }
+    }
+
+    @Test
+    fun `pausing one file in a batch does not cancel sibling uploads`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val fileA = File(tmp, "a.bin").apply { writeBytes("alpha".toByteArray()) }
+        val fileB = File(tmp, "b.bin").apply { writeBytes("beta".toByteArray()) }
+        val aStarted = CompletableDeferred<Unit>()
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } coAnswers {
+                val name = thirdArg<String>()
+                if (name == "a.bin") {
+                    aStarted.complete(Unit)
+                    awaitCancellation()
+                }
+                UploadResult(messageId = 701L, remoteId = "rem701")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(55L) } returns emptyList()
+        }
+        val (manager, tracker) = createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 55L,
+            files = listOf(
+                UploadFileItem(fileUri(fileA), "a.bin", "application/octet-stream", fileA.length()),
+                UploadFileItem(fileUri(fileB), "b.bin", "application/octet-stream", fileB.length()),
+            ),
+        )
+        runCurrent()
+        aStarted.await()
+
+        val idA = tracker.state.value.items.first { it.fileName == "a.bin" }.id
+        manager.pause(idA)
+        advanceUntilIdle()
+
+        val items = tracker.state.value.items.associateBy { it.fileName }
+        assertThat(items["a.bin"]?.status).isEqualTo(UploadStatus.PAUSED)
+        assertThat(items["b.bin"]?.status).isEqualTo(UploadStatus.DONE)
     }
 }

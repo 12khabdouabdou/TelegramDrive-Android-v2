@@ -18,6 +18,9 @@ interface ZipEntryDao {
     @Query("DELETE FROM zip_entries WHERE chat_id = :chatId AND zip_message_id = :zipMessageId")
     suspend fun deleteForZip(chatId: Long, zipMessageId: Long)
 
+    @Query("DELETE FROM zip_entries WHERE chat_id = :chatId")
+    suspend fun deleteForChat(chatId: Long)
+
     @Query("SELECT * FROM zip_entries ORDER BY indexed_at DESC")
     suspend fun getAll(): List<ZipEntryEntity>
 

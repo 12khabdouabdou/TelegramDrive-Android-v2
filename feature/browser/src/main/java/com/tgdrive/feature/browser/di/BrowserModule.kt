@@ -76,7 +76,33 @@ object BrowserModule {
                     com.tgdrive.core.common.Log.w("ZipExtractor: Zip-Slip entry rejected: '${header.fileName}'")
                     return null
                 }
-                zip.extractFile(header, outputDir.absolutePath)
+                targetFile.parentFile?.mkdirs()
+                var actualWritten = 0L
+                val buf = ByteArray(64 * 1024)
+                try {
+                    zip.getInputStream(header).use { input ->
+                        java.io.FileOutputStream(targetFile).use { output ->
+                            while (true) {
+                                val read = input.read(buf)
+                                if (read <= 0) break
+                                actualWritten += read
+                                if (actualWritten > 2L * 1024 * 1024 * 1024) {
+                                    throw SecurityException("Entry '$entryName' exceeds 2 GB actual size limit")
+                                }
+                                if (actualWritten > 10L * 1024 * 1024 &&
+                                    header.compressedSize > 0L &&
+                                    (actualWritten / header.compressedSize) > 100L
+                                ) {
+                                    throw SecurityException("Suspicious actual compression ratio in '$entryName'")
+                                }
+                                output.write(buf, 0, read)
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    runCatching { targetFile.delete() }
+                    throw t
+                }
                 targetFile.absolutePath
             }
         } catch (t: Throwable) {

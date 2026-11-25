@@ -68,10 +68,24 @@ class BackupCrypto @Inject constructor(
     }
 
     /** Password string derived from [vaultKey] for AES-256 encrypted ZIP archives. */
-    fun zipVaultPassword(): String = Base64.getEncoder().encodeToString(vaultKey())
+    fun zipVaultPassword(): String {
+        val key = vaultKey()
+        return try {
+            Base64.getEncoder().encodeToString(key)
+        } finally {
+            key.fill(0)
+        }
+    }
 
     /** Exports the active 256-bit Device Vault Key as Base64 for manual backup/restore. */
-    fun exportVaultKeyBase64(): String = Base64.getEncoder().encodeToString(vaultKey())
+    fun exportVaultKeyBase64(): String {
+        val key = vaultKey()
+        return try {
+            Base64.getEncoder().encodeToString(key)
+        } finally {
+            key.fill(0)
+        }
+    }
 
     /** Short verification fingerprint (e.g. `A1B2-C3D4`) for displaying the active Vault Key. */
     fun vaultKeyFingerprint(): String {
@@ -105,7 +119,7 @@ class BackupCrypto @Inject constructor(
     /** Wraps the 256-bit Device Vault Key in an AES-256 `TGE2` container protected by [recoveryPassphrase]. */
     fun wrapVaultKeyWithPassphrase(recoveryPassphrase: String): ByteArray {
         val cleanPass = recoveryPassphrase.trim()
-        require(cleanPass.length >= 4) { "Recovery passphrase must be at least 4 characters" }
+        require(cleanPass.length >= 8) { "Recovery passphrase must be at least 8 characters" }
         val passChars = cleanPass.toCharArray()
         val key = vaultKey()
         return try {
@@ -171,8 +185,8 @@ class BackupCrypto @Inject constructor(
 
     fun activeBackupZipPassword(useCustomPassphrase: Boolean): String {
         if (useCustomPassphrase) {
-            val custom = getCustomBackupPassphrase()
-            if (!custom.isNullOrBlank()) return custom
+            return getCustomBackupPassphrase()
+                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
         }
         return zipVaultPassword()
     }
@@ -183,7 +197,12 @@ class BackupCrypto @Inject constructor(
         useCustomPassphrase: Boolean,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
     ) {
-        val custom = if (useCustomPassphrase) getCustomBackupPassphrase() else null
+        val custom = if (useCustomPassphrase) {
+            getCustomBackupPassphrase()
+                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
+        } else {
+            null
+        }
         encryptFile(
             inputFile = inputFile,
             outputFile = outputFile,
@@ -536,22 +555,28 @@ class BackupCrypto @Inject constructor(
                 cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
                 cipher.updateAAD(buildAad(chunkIdx, flag))
                 val plain = cipher.doFinal(cipherBytes)
-
-                when (flag) {
-                    FLAG_DATA -> {
-                        if (plain.isNotEmpty()) {
-                            output.write(plain)
-                            totalWritten += plain.size
-                            onBytesProcessed?.invoke(totalWritten)
+                try {
+                    when (flag) {
+                        FLAG_DATA -> {
+                            if (plain.isNotEmpty()) {
+                                output.write(plain)
+                                totalWritten += plain.size
+                                onBytesProcessed?.invoke(totalWritten)
+                            }
                         }
+                        FLAG_EOF -> {
+                            if (plain.isNotEmpty()) throw AEADBadTagException("Unexpected EOF payload")
+                            sawEof = true
+                        }
+                        else -> throw AEADBadTagException("Unknown chunk flag: $flag")
                     }
-                    FLAG_EOF -> {
-                        if (plain.isNotEmpty()) throw AEADBadTagException("Unexpected EOF payload")
-                        sawEof = true
-                    }
-                    else -> throw AEADBadTagException("Unknown chunk flag: $flag")
+                } finally {
+                    plain.fill(0)
                 }
                 chunkIdx++
+            }
+            if (dis.read() != -1) {
+                throw AEADBadTagException("Unexpected trailing data after EOF")
             }
             output.flush()
         }

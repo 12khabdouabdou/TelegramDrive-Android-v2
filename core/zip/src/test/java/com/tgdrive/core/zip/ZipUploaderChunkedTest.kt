@@ -300,4 +300,55 @@ class ZipUploaderChunkedTest {
         assertThat(extracted).hasSize(1)
         assertThat(extracted.first().readBytes()).isEqualTo(payload)
     }
+
+    @Test
+    fun `pipelined split volumes survive producer exit until consumer consumes them`(@TempDir tmp: File) = runTest {
+        val workDir = File(tmp, "pipe_split_work")
+        val limitBytes = 90 * 1024L
+        val payload = randomBytes(190 * 1024, 99L)
+        val entries = listOf(
+            ZipSourceEntry(
+                relativePath = "Videos/stream.bin",
+                sizeBytes = payload.size.toLong(),
+                openStream = { ByteArrayInputStream(payload) },
+            ),
+        )
+
+        val observedSizes = mutableListOf<Long>()
+        val summary = ZipUploader.zipSourcesInParts(
+            entries = entries,
+            workDir = workDir,
+            baseZipName = "SplitPipe",
+            maxPartBytes = limitBytes,
+            password = null,
+            checkFreeSpace = false,
+            enablePipeline = true,
+        ) { part ->
+            kotlinx.coroutines.yield()
+            assertThat(part.partFile.exists()).isTrue()
+            assertThat(part.partFile.length()).isGreaterThan(0L)
+            observedSizes.add(part.partFile.length())
+        }
+
+        assertThat(summary.hadSplitVolumes).isTrue()
+        assertThat(observedSizes.size).isAtLeast(2)
+        assertThat(workDir.listFiles().orEmpty().filter { it.isFile }).isEmpty()
+    }
+
+    @Test
+    fun `extractAll enforces byte-counted compression ratio cap and cleans partial file`(@TempDir tmp: File) {
+        val bombZip = File(tmp, "bomb.zip")
+        java.util.zip.ZipOutputStream(bombZip.outputStream()).use { zos ->
+            zos.putNextEntry(java.util.zip.ZipEntry("zeros.bin"))
+            val chunk = ByteArray(1024 * 1024)
+            repeat(12) { zos.write(chunk) }
+            zos.closeEntry()
+        }
+        val outDir = File(tmp, "bomb_out")
+
+        assertThrows<SecurityException> {
+            ZipUploader.extractAll(bombZip.absolutePath, outDir, password = null)
+        }
+        assertThat(File(outDir, "zeros.bin").exists()).isFalse()
+    }
 }

@@ -67,10 +67,12 @@ open class KeystoreHelper @Inject constructor(
         if (force) {
             resetSecureStorageInternal()
         }
-        // Attempt 1: create + canary read so lazy AEADBadTagException surfaces here.
+        // Attempt 1: create + canary read/write so lazy AEADBadTagException surfaces here.
         try {
             val prefs = createEncryptedPrefs()
-            prefs.getString(KEY_CANARY, null)
+            if (prefs.getString(KEY_CANARY, null) == null) {
+                prefs.edit().putString(KEY_CANARY, "ok").commit()
+            }
             _encryptionAvailable = true
             return prefs
         } catch (t: Throwable) {
@@ -81,14 +83,30 @@ open class KeystoreHelper @Inject constructor(
         resetSecureStorageInternal()
         try {
             val prefs = createEncryptedPrefs()
-            prefs.getString(KEY_CANARY, null)
+            if (prefs.getString(KEY_CANARY, null) == null) {
+                prefs.edit().putString(KEY_CANARY, "ok").commit()
+            }
             _encryptionAvailable = true
             return prefs
         } catch (t: Throwable) {
-            Log.e("KeystoreHelper: recovery failed — falling back to PLAIN SharedPreferences (encryption disabled)", t)
+            Log.e("KeystoreHelper: recovery failed — Keystore unavailable, refusing sensitive plaintext writes", t)
             _encryptionAvailable = false
         }
         return ctx.getSharedPreferences(FALLBACK_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private fun isCryptoOrKeystoreError(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            if (cur is java.security.GeneralSecurityException ||
+                cur is SecurityException ||
+                cur is java.security.ProviderException
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
     }
 
     private fun createEncryptedPrefs(): SharedPreferences {
@@ -111,7 +129,11 @@ open class KeystoreHelper @Inject constructor(
         return try {
             block(openEncryptedPrefs(force = false))
         } catch (t: Throwable) {
-            Log.w("KeystoreHelper: read failed — attempting recovery", t)
+            if (!isCryptoOrKeystoreError(t)) {
+                Log.w("KeystoreHelper: read failed (non-crypto error; preserving keys)", t)
+                return null
+            }
+            Log.w("KeystoreHelper: crypto read failed — attempting recovery", t)
             try {
                 val recovered = openEncryptedPrefs(force = true, expectedGeneration = genBefore)
                 block(recovered)
@@ -128,15 +150,17 @@ open class KeystoreHelper @Inject constructor(
             val editor = openEncryptedPrefs(force = false).edit()
             block(editor)
             editor.commit()
-            true
         } catch (t: Throwable) {
-            Log.w("KeystoreHelper: write failed — attempting recovery", t)
+            if (!isCryptoOrKeystoreError(t)) {
+                Log.w("KeystoreHelper: write failed (non-crypto error; preserving keys)", t)
+                return false
+            }
+            Log.w("KeystoreHelper: crypto write failed — attempting recovery", t)
             try {
                 val recovered = openEncryptedPrefs(force = true, expectedGeneration = genBefore)
                 val editor = recovered.edit()
                 block(editor)
                 editor.commit()
-                true
             } catch (t2: Throwable) {
                 Log.e("KeystoreHelper: write failed even after recovery", t2)
                 false
@@ -144,11 +168,25 @@ open class KeystoreHelper @Inject constructor(
         }
     }
 
-    open fun getString(key: String, default: String? = null): String? =
-        safeRead { it.getString(key, default) } ?: default
+    open fun getString(key: String, default: String? = null): String? {
+        val result = safeRead { it.getString(key, default) }
+        if (!_encryptionAvailable && key in SENSITIVE_KEYS) {
+            Log.e("KeystoreHelper: refusing plaintext fallback read for sensitive key '$key'")
+            return default
+        }
+        return result ?: default
+    }
 
-    open fun putString(key: String, value: String): Boolean =
-        safeWrite { it.putString(key, value) }
+    open fun putString(key: String, value: String): Boolean {
+        if (!_encryptionAvailable && key in SENSITIVE_KEYS) {
+            openEncryptedPrefs(force = false)
+            if (!_encryptionAvailable) {
+                Log.e("KeystoreHelper: refusing plaintext fallback write for sensitive key '$key'")
+                return false
+            }
+        }
+        return safeWrite { it.putString(key, value) }
+    }
 
     open fun remove(key: String): Boolean =
         safeWrite { it.remove(key) }
@@ -251,5 +289,9 @@ open class KeystoreHelper @Inject constructor(
         const val KEY_API_HASH = "telegram_api_hash"
         private const val KEY_CANARY = "_keystore_canary"
         private const val KEY_TDLIB_SESSION_KEY = "tdlib_session_key_b64"
+        private val SENSITIVE_KEYS = setOf(
+            "tgdrive_backup_vault_key_v1",
+            "tgdrive_backup_custom_passphrase_v1",
+        )
     }
 }

@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
@@ -72,7 +71,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -87,6 +85,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.tgdrive.core.common.FileBucket
@@ -119,7 +120,9 @@ fun VaultScreen(
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbarMsg by vm.snackbar.collectAsStateWithLifecycle()
     val decryptedOpenEvent by vm.decryptedOpenEvent.collectAsStateWithLifecycle()
+    val externalOpenEvent by vm.externalOpenEvent.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val haptics = LocalHapticFeedback.current
     val snackbarHostState = remember { SnackbarHostState() }
     val selectionMode = state.selectedIds.isNotEmpty()
@@ -130,6 +133,35 @@ fun VaultScreen(
     val bioTitle = stringResource(R.string.vault_biometric_title)
     val bioSubtitle = stringResource(R.string.vault_biometric_subtitle)
     val noAppMsg = stringResource(R.string.browser_no_app_error)
+
+    DisposableEffect(lifecycleOwner, state.biometricRequired) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && state.biometricRequired) {
+                promptFired = false
+                vm.lock()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(externalOpenEvent?.id) {
+        val ev = externalOpenEvent ?: return@LaunchedEffect
+        vm.clearExternalOpenEvent()
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", ev.file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, ev.mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (t: Throwable) {
+            Log.w("VaultScreen: failed opening hidden file", t)
+            snackbarHostState.showSnackbar(noAppMsg)
+        }
+    }
 
     DisposableEffect(context) {
         val window = context.findActivity()?.window
@@ -255,7 +287,7 @@ fun VaultScreen(
                                 )
                             }
                             val hasLocked = state.items.any {
-                                it.messageId in state.selectedIds && it.isLocked
+                                (it.chatId to it.messageId) in state.selectedIds && it.isLocked
                             }
                             if (hasLocked) {
                                 IconButton(onClick = vm::unhideSelected) {
@@ -267,7 +299,7 @@ fun VaultScreen(
                                 }
                             }
                             val hasTgenc = state.items.any {
-                                it.messageId in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
+                                (it.chatId to it.messageId) in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
                             }
                             if (hasTgenc) {
                                 IconButton(onClick = { showBatchDecryptDialog = true }) {
@@ -358,10 +390,10 @@ fun VaultScreen(
                             VaultGridCard(
                                 item = item,
                                 decryptedThumbBytes = thumbBytes,
-                                isSelected = item.messageId in state.selectedIds,
+                                isSelected = (item.chatId to item.messageId) in state.selectedIds,
                                 onClick = {
                                     if (selectionMode) {
-                                        vm.toggleSelection(item.messageId)
+                                        vm.toggleSelection(item.chatId, item.messageId)
                                     } else {
                                         vm.openUnlockedVaultItem(
                                             item = item,
@@ -375,7 +407,7 @@ fun VaultScreen(
                                 },
                                 onLongClick = {
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    vm.toggleSelection(item.messageId)
+                                    vm.toggleSelection(item.chatId, item.messageId)
                                 },
                             )
                         }
@@ -405,7 +437,7 @@ fun VaultScreen(
 
     if (showBatchDecryptDialog) {
         val tgencCount = state.items.count {
-            it.messageId in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
+            (it.chatId to it.messageId) in state.selectedIds && BackupCrypto.isEncryptedFileName(it.fileName)
         }
         BatchDecryptPassphraseDialog(
             count = tgencCount,

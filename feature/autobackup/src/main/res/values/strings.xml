@@ -162,6 +162,6 @@
     <string name="backup_passphrase_confirm">Confirm passphrase</string>
     <string name="backup_use_vault_key">Use Vault Key</string>
     <string name="backup_passphrase_error_empty">Passphrase cannot be empty</string>
-    <string name="backup_passphrase_error_short">Use at least 4 characters</string>
+    <string name="backup_passphrase_error_short">Use at least 8 characters</string>
     <string name="backup_passphrase_error_mismatch">Passphrases do not match</string>
 </resources>

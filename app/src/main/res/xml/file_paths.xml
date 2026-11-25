@@ -24,7 +24,6 @@
         this entry, FileProvider.getUriForFile() throws IllegalArgumentException
         and "Open in external app" silently fails (test checklist §16).
     -->
-    <files-path name="tdlib_root" path="tgdrive_tdlib/" />
     <files-path name="tdlib_files" path="tgdrive_tdlib/files/" />
     <files-path name="tdlib_thumbs" path="tgdrive_tdlib/thumbnails/" />
     <files-path name="offline_pins" path="offline_pins/" />
