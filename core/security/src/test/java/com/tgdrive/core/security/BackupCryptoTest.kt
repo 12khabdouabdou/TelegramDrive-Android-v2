@@ -315,7 +315,7 @@ class BackupCryptoTest {
             useCustomPassphrase = true,
             totalBytes = payload.size.toLong(),
         )
-        assertThat(BackupCrypto.detectMagicFormat(customOut)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        assertThat(BackupCrypto.detectMagicFormat(customOut.readBytes())).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
         val customDec = File(tmp, "custom_dec.bin")
         crypto.decryptFile(customOut, customDec)
         assertThat(customDec.readBytes()).isEqualTo(payload)
