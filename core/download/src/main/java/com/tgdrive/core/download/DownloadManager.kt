@@ -127,7 +127,8 @@ class DownloadManager @Inject constructor(
         if (existing != null) {
             if (existing.status == DownloadStatus.DONE) {
                 val fileExists = runCatching {
-                    existing.localPath != null && File(existing.localPath).exists()
+                    val f = existing.localPath?.let(::File)
+                    f != null && f.isFile && f.length() > 0L
                 }.getOrDefault(false)
                 if (fileExists) {
                     if (item.pinOfflineWhenDone && existing.localPath != null) {
@@ -190,6 +191,55 @@ class DownloadManager @Inject constructor(
             autoPausedForWifi = waitForWifi,
         )
         _state.update { it.copy(items = it.items + queuedItem) }
+        persistQueue()
+        if (!waitForWifi) {
+            TransferKeepAliveWorker.ensureRunning(ctx)
+            dispatchQueue()
+        } else {
+            updateNotification(force = true)
+        }
+    }
+
+    /**
+     * Cancels any in-flight job for [item], discards any cached copy (including offline-pinned),
+     * and enqueues a clean re-download from Telegram.
+     */
+    fun forceRedownload(item: DownloadItem) {
+        val k = keyFor(item.chatId, item.id)
+        manuallyPausedKeys.remove(k)
+        jobs[k]?.cancel()
+        jobs.remove(k)
+        speedSamples.remove(k)
+
+        val existing = findItem(item.chatId, item.id)
+        val pinnedPath = offlinePinStore.getPinnedFilePathSync(item.chatId, item.id)
+        val oldPath = existing?.localPath
+        if (oldPath != null && oldPath != pinnedPath) {
+            runCatching { File(oldPath).delete() }
+        }
+        val keepPinned = existing?.pinOfflineWhenDone == true || item.pinOfflineWhenDone
+        if (pinnedPath != null) {
+            scope.launch { offlinePinStore.unpinFile(item.chatId, item.id) }
+        }
+
+        val waitForWifi = wifiOnlyEnabled && !networkMonitor.isCurrentlyUnmetered()
+        val initialStatus = if (waitForWifi) DownloadStatus.PAUSED else DownloadStatus.QUEUED
+        val initialErr = if (waitForWifi) WIFI_WAIT_MESSAGE else null
+        val freshItem = item.copy(
+            status = initialStatus,
+            progress = 0f,
+            downloadedBytes = 0L,
+            speedBytesPerSec = 0L,
+            etaSeconds = null,
+            localPath = null,
+            errorMessage = initialErr,
+            pinOfflineWhenDone = keepPinned,
+            autoPausedForWifi = waitForWifi,
+        )
+        _state.update { s ->
+            val without = s.items.filterNot { matchesKey(it, item.chatId, item.id) }
+            s.copy(items = without + freshItem)
+        }
         persistQueue()
         if (!waitForWifi) {
             TransferKeepAliveWorker.ensureRunning(ctx)
@@ -473,8 +523,13 @@ class DownloadManager @Inject constructor(
         try {
             downloadsDir.mkdirs()
             Log.i("DownloadManager: starting download for '${item.fileName}' (chat=${item.chatId}, id=${item.id})")
-            telegramClient.downloadFile(item.remoteId, "")
-                .collect { upd ->
+            var activeRemoteId = item.remoteId
+            var retriedWithRefresh = false
+            while (true) {
+                var needsRefreshRetry = false
+                var terminalReached = false
+                telegramClient.downloadFile(activeRemoteId, "")
+                    .collect { upd ->
                         when (upd) {
                             is DownloadUpdate.Progress -> {
                                 val now = System.currentTimeMillis()
@@ -508,6 +563,7 @@ class DownloadManager @Inject constructor(
                                 updateNotification(force = false)
                             }
                             is DownloadUpdate.Done -> {
+                                terminalReached = true
                                 val latestItem = findItem(item.chatId, item.id) ?: item
                                 val finalPath = if (latestItem.pinOfflineWhenDone) {
                                     offlinePinStore.pinFile(item.chatId, item.id, upd.localPath, item.fileName) ?: upd.localPath
@@ -539,21 +595,52 @@ class DownloadManager @Inject constructor(
                                 updateNotification(force = true)
                             }
                             is DownloadUpdate.Failed -> {
-                                Log.w("DownloadManager: failed — ${upd.message}")
-                                updateItem(item.chatId, item.id) {
-                                    it.copy(
-                                        status = DownloadStatus.FAILED,
-                                        speedBytesPerSec = 0L,
-                                        etaSeconds = null,
-                                        errorMessage = upd.message,
-                                        autoPausedForWifi = false,
-                                    )
+                                if (!retriedWithRefresh && item.chatId != 0L && item.id != 0L) {
+                                    needsRefreshRetry = true
+                                } else {
+                                    terminalReached = true
+                                    Log.w("DownloadManager: failed — ${upd.message}")
+                                    updateItem(item.chatId, item.id) {
+                                        it.copy(
+                                            status = DownloadStatus.FAILED,
+                                            speedBytesPerSec = 0L,
+                                            etaSeconds = null,
+                                            errorMessage = upd.message,
+                                            autoPausedForWifi = false,
+                                        )
+                                    }
+                                    persistQueue()
+                                    updateNotification(force = true)
                                 }
-                                persistQueue()
-                                updateNotification(force = true)
                             }
                         }
                     }
+                if (needsRefreshRetry && !retriedWithRefresh) {
+                    retriedWithRefresh = true
+                    val refreshed = telegramClient.refreshMessageRemoteId(item.chatId, item.id)
+                    if (!refreshed.isNullOrBlank()) {
+                        activeRemoteId = refreshed
+                        updateItem(item.chatId, item.id) { it.copy(remoteId = refreshed) }
+                        speedSamples[key] = SpeedSample(System.currentTimeMillis(), 0L, 0L)
+                        continue
+                    }
+                    Log.w("DownloadManager: refresh retry unavailable — marking failed")
+                    updateItem(item.chatId, item.id) {
+                        it.copy(
+                            status = DownloadStatus.FAILED,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            errorMessage = it.errorMessage ?: "Download failed",
+                            autoPausedForWifi = false,
+                        )
+                    }
+                    persistQueue()
+                    updateNotification(force = true)
+                } else if (!terminalReached && !needsRefreshRetry) {
+                    break
+                }
+                if (!needsRefreshRetry) break
+            }
         } catch (t: Throwable) {
             if (t is CancellationException) {
                 if (key in manuallyPausedKeys) {
@@ -589,14 +676,18 @@ class DownloadManager @Inject constructor(
         val localPath = item.localPath ?: return null
         val src = File(localPath)
         if (!src.isFile || src.length() <= 0L) return null
-        val ext = item.fileName.substringAfterLast('.', "").lowercase()
-        val mime = runCatching {
-            MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext)
-        }.getOrNull() ?: "application/octet-stream"
+        val safeName = sanitizeDownloadFileName(item.fileName)
+        val ext = safeName.substringAfterLast('.', "").lowercase()
+        val mime = when (ext) {
+            "pdf" -> "application/pdf"
+            else -> runCatching {
+                MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext)
+            }.getOrNull() ?: "application/octet-stream"
+        }
         return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, item.fileName)
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
                     put(MediaStore.Downloads.MIME_TYPE, mime)
                     put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
                     put(MediaStore.Downloads.IS_PENDING, 1)
@@ -621,7 +712,7 @@ class DownloadManager @Inject constructor(
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
                     "TelegramDrive",
                 ).apply { mkdirs() }
-                val dest = File(dlDir, item.fileName)
+                val dest = File(dlDir, safeName)
                 src.copyTo(dest, overwrite = true)
                 dest
             }
@@ -696,6 +787,15 @@ class DownloadManager @Inject constructor(
     companion object {
         private const val DOWNLOAD_NOTIF_ID = 50001
         private const val WIFI_WAIT_MESSAGE = "Waiting for Wi-Fi…"
+
+        internal fun sanitizeDownloadFileName(raw: String): String {
+            val cleaned = raw
+                .substringAfterLast('/')
+                .substringAfterLast('\\')
+                .replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001F]"), "_")
+                .trim(' ', '.')
+            return cleaned.ifBlank { "download" }
+        }
     }
 
     private fun updateItem(chatId: Long, id: Long, transform: (DownloadItem) -> DownloadItem) {

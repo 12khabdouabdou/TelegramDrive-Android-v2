@@ -110,7 +110,7 @@ fun GlobalSearchScreen(
     onOpenFolder: (chatId: Long, folderTitle: String) -> Unit,
     onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
-    onOpenPdf: (Long) -> Unit = {},
+    onOpenPdf: (Long, Long) -> Unit = { _, _ -> },
     onOpenZip: (Long) -> Unit = {},
     onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenZipEntry: (chatId: Long, zipMessageId: Long, entryPath: String) -> Unit = { _, _, _ -> },

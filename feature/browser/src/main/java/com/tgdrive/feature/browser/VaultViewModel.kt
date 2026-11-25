@@ -253,7 +253,7 @@ class VaultViewModel @Inject constructor(
         onOpenZip: (Long) -> Unit,
         onOpenVideo: (Long, Long) -> Unit,
         onOpenImage: (Long, Long) -> Unit,
-        onOpenPdf: (Long) -> Unit,
+        onOpenPdf: (Long, Long) -> Unit,
         onOpenText: (Long, Long) -> Unit,
     ) {
         if (BackupCrypto.isEncryptedFileName(item.fileName)) {
@@ -279,7 +279,7 @@ class VaultViewModel @Inject constructor(
             }
             bucket == FileBucket.PDF -> {
                 enqueueIfMissing()
-                onOpenPdf(item.messageId)
+                onOpenPdf(item.chatId, item.messageId)
             }
             isTextPreviewable(item.mimeType, item.fileName) -> {
                 enqueueIfMissing()

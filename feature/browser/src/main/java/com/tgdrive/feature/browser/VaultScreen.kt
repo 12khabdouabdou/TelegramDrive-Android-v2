@@ -108,7 +108,7 @@ fun VaultScreen(
     onOpenZip: (Long) -> Unit = {},
     onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
-    onOpenPdf: (Long) -> Unit = {},
+    onOpenPdf: (Long, Long) -> Unit = { _, _ -> },
     onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenLocalVideo: (String) -> Unit = {},
     onOpenLocalPdf: (String, String) -> Unit = { _, _ -> },

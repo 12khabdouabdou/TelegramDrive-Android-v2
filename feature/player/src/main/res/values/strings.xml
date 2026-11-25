@@ -82,6 +82,14 @@
     <string name="player_pdf_ocr_no_matches">No text matches yet — scan pages to search</string>
     <string name="player_pdf_save_downloads">Save PDF to Downloads</string>
     <string name="player_pdf_share">Share PDF</string>
+    <string name="player_pdf_open_external">Open in external app</string>
+    <string name="player_pdf_redownload">Re-download</string>
+    <string name="player_pdf_resume_download">Resume download</string>
+    <string name="player_pdf_paused">Download paused</string>
+    <string name="player_pdf_password_protected">This PDF is password-protected. Open it with an external PDF reader.</string>
+    <string name="player_pdf_invalid_file">Downloaded file is incomplete or not a valid PDF.</string>
+    <string name="player_pdf_missing_entry">Could not start PDF download</string>
+    <string name="player_pdf_no_external_app">No PDF viewer app found on this device</string>
     <string name="player_saved_downloads">Saved to Downloads/TelegramDrive</string>
     <string name="player_save_failed">Could not save file</string>
     <string name="player_text_smaller">Smaller text</string>

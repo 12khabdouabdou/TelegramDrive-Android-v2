@@ -522,19 +522,21 @@ fun interface PdfPageRenderer {
  * Default [PdfPageRenderer] backed by [android.graphics.pdf.PdfRenderer].
  */
 class DefaultPdfPageRenderer : PdfPageRenderer {
-    override fun renderFirstPage(pdfFile: File, targetSizePx: Int): Bitmap? {
+    override fun renderFirstPage(pdfFile: File, targetSizePx: Int): Bitmap? = synchronized(PDF_RENDER_LOCK) {
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
         var page: PdfRenderer.Page? = null
-        return try {
+        try {
             pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
             renderer = PdfRenderer(pfd)
-            if (renderer.pageCount <= 0) return null
+            if (renderer.pageCount <= 0) return@synchronized null
             page = renderer.openPage(0)
-            val maxDim = maxOf(page.width, page.height).coerceAtLeast(1)
-            val scale = (targetSizePx.toFloat() / maxDim.toFloat()).coerceAtMost(1f).coerceAtLeast(0.1f)
-            val w = (page.width * scale).toInt().coerceAtLeast(1)
-            val h = (page.height * scale).toInt().coerceAtLeast(1)
+            val pw = page.width.coerceAtLeast(1)
+            val ph = page.height.coerceAtLeast(1)
+            val scale = minOf(targetSizePx.toFloat() / pw.toFloat(), targetSizePx.toFloat() / ph.toFloat())
+                .coerceIn(0.05f, 2f)
+            val w = (pw * scale).toInt().coerceIn(48, targetSizePx)
+            val h = (ph * scale).toInt().coerceIn(48, targetSizePx)
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.eraseColor(Color.WHITE)
             page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -547,6 +549,10 @@ class DefaultPdfPageRenderer : PdfPageRenderer {
             runCatching { renderer?.close() }
             runCatching { pfd?.close() }
         }
+    }
+
+    private companion object {
+        private val PDF_RENDER_LOCK = Any()
     }
 }
 

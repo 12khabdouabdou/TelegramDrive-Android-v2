@@ -121,6 +121,7 @@ import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadConflictStrategy
@@ -166,6 +167,7 @@ class VideoPlayerViewModel @Inject constructor(
     private val trashEntryDao: TrashEntryDao,
     private val cloudSyncManager: CloudSyncManager,
     private val mediaAiIndexer: MediaAiIndexer,
+    private val mediaThumbnailCache: MediaThumbnailCache,
     private val uploadManager: UploadManager,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val appContext: Context,
@@ -471,6 +473,40 @@ class VideoPlayerViewModel @Inject constructor(
                 totalBytes = entry.fileSize,
             ),
         )
+    }
+
+    fun forceRedownload(entry: FileCacheEntity) {
+        if (entry.remoteId.isBlank()) return
+        downloadManager.forceRedownload(
+            DownloadItem(
+                id = entry.messageId,
+                chatId = entry.chatId,
+                remoteId = entry.remoteId,
+                fileName = entry.fileName,
+                totalBytes = entry.fileSize,
+            ),
+        )
+    }
+
+    fun ensurePdfThumbnail(
+        chatId: Long,
+        messageId: Long,
+        localPath: String,
+        fileName: String,
+    ) {
+        if (chatId == 0L || messageId == 0L || localPath.isBlank()) return
+        if (mediaThumbnailCache.getCachedThumbnailPath(chatId, messageId) != null) return
+        persistScope.launch {
+            runCatching {
+                mediaThumbnailCache.generateFromLocalFile(
+                    chatId = chatId,
+                    messageId = messageId,
+                    localPath = localPath,
+                    mimeType = "application/pdf",
+                    fileName = fileName,
+                )
+            }
+        }
     }
 
     fun cancelStream(fileId: Int) {

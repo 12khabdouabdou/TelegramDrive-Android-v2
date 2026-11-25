@@ -214,7 +214,7 @@ class CategoryFilesViewModel @Inject constructor(
         folderTitle: String,
         onOpenVideo: (Long, Long) -> Unit,
         onOpenImage: (Long, Long) -> Unit,
-        onOpenPdf: (Long) -> Unit,
+        onOpenPdf: (Long, Long) -> Unit,
         onOpenZip: (Long) -> Unit,
         onOpenText: (Long, Long) -> Unit,
         onOpenFolder: (Long, String) -> Unit,
@@ -254,7 +254,7 @@ class CategoryFilesViewModel @Inject constructor(
             }
             bucket == FileBucket.PDF -> {
                 enqueueIfNeeded()
-                onOpenPdf(file.messageId)
+                onOpenPdf(file.chatId, file.messageId)
             }
             isTextPreviewable(file.mimeType, file.fileName) -> {
                 enqueueIfNeeded()
@@ -301,7 +301,7 @@ fun CategoryFilesScreen(
     onBack: () -> Unit,
     onOpenVideo: (Long, Long) -> Unit,
     onOpenImage: (Long, Long) -> Unit,
-    onOpenPdf: (Long) -> Unit,
+    onOpenPdf: (Long, Long) -> Unit,
     onOpenZip: (Long) -> Unit,
     onOpenText: (Long, Long) -> Unit,
     onOpenFolder: (Long, String) -> Unit,

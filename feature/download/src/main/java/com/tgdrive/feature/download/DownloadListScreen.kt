@@ -91,7 +91,9 @@ import com.tgdrive.designsystem.components.GlassPanel
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.upload.DecryptFileDialog
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
@@ -261,36 +263,45 @@ fun DownloadListScreen(
         }
     }
 
-    fun openLocalFile(file: File, mimeType: String?) {
+    fun openLocalFile(
+        file: File,
+        mimeType: String?,
+        displayName: String = file.name,
+    ) {
         if (!file.exists()) {
             scope.launch { snackbarHostState.showSnackbar(openFailedMsg) }
             return
         }
-        val ext = file.extension.lowercase()
+        val ext = displayName.substringAfterLast('.', "")
+            .ifBlank { file.extension }
+            .lowercase()
         val resolvedMime = mimeType?.takeIf { it.isNotBlank() }
-            ?: runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }.getOrNull()
+            ?: when (ext) {
+                "pdf" -> "application/pdf"
+                else -> runCatching { MimeTypeMap.getSingleton()?.getMimeTypeFromExtension(ext) }.getOrNull()
+            }
             ?: "*/*"
         val isVideo = resolvedMime.startsWith("video/", ignoreCase = true) ||
             ext in setOf("mp4", "m4v", "mkv", "mov", "webm", "avi", "3gp", "ts", "flv")
         val isAudio = resolvedMime.startsWith("audio/", ignoreCase = true) ||
             ext in setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "aiff")
         val isPdf = resolvedMime.equals("application/pdf", ignoreCase = true) || ext == "pdf"
-        val isText = isTextPreviewable(resolvedMime, file.name)
+        val isText = isTextPreviewable(resolvedMime, displayName)
         when {
             isVideo && onOpenLocalVideo != null -> {
                 onOpenLocalVideo(file.absolutePath)
                 return
             }
             isAudio && onPlayLocalAudio != null -> {
-                onPlayLocalAudio(file.absolutePath, file.name)
+                onPlayLocalAudio(file.absolutePath, displayName)
                 return
             }
             isPdf && onOpenLocalPdf != null -> {
-                onOpenLocalPdf(file.absolutePath, file.name)
+                onOpenLocalPdf(file.absolutePath, displayName)
                 return
             }
             isText && onOpenLocalText != null -> {
-                onOpenLocalText(file.absolutePath, file.name)
+                onOpenLocalText(file.absolutePath, displayName)
                 return
             }
         }
@@ -484,7 +495,7 @@ fun DownloadListScreen(
                                             decryptError = null
                                             decryptTarget = item
                                         } else {
-                                            openLocalFile(file, null)
+                                            openLocalFile(file, null, item.fileName)
                                         }
                                     },
                                     onDecrypt = {
@@ -495,7 +506,9 @@ fun DownloadListScreen(
                                     onResume = { vm.downloadManager.resume(item.chatId, item.id) },
                                     onSaveToDownloads = {
                                         scope.launch {
-                                            val saved = vm.downloadManager.saveCompletedToDownloads(item)
+                                            val saved = withContext(Dispatchers.IO) {
+                                                vm.downloadManager.saveCompletedToDownloads(item)
+                                            }
                                             snackbarHostState.showSnackbar(
                                                 if (saved != null) savedDownloadsMsg else openFailedMsg,
                                             )
@@ -549,7 +562,7 @@ fun DownloadListScreen(
                         is DecryptOutcome.Success -> {
                             decryptInProgress = false
                             decryptTarget = null
-                            openLocalFile(outcome.file, outcome.mimeType)
+                            openLocalFile(outcome.file, outcome.mimeType, outcome.displayName)
                         }
                         is DecryptOutcome.WrongPassphrase -> {
                             decryptInProgress = false

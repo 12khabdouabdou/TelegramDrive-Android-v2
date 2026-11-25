@@ -104,6 +104,7 @@ class MediaThumbnailCache @Inject constructor(
 
         val saved = writeThumbnailJpeg(chatId, messageId, rawBmp)
         if (saved != null) {
+            failedAtMs.remove(chatId to messageId)
             runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, saved) }
         }
         saved
@@ -449,6 +450,32 @@ class MediaThumbnailCache @Inject constructor(
                     }
                 }
             }
+            FileBucket.PDF -> {
+                if (entity.fileSize > MAX_REMOTE_PDF_BYTES) return@withContext null
+                semaphore.withPermit {
+                    var activeRemoteId = entity.remoteId
+                    var terminal = telegramClient.downloadFile(activeRemoteId, "")
+                        .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                        .first()
+                    if (terminal !is DownloadUpdate.Done && entity.chatId != 0L && entity.messageId != 0L) {
+                        val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
+                        if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
+                            activeRemoteId = refreshed
+                            terminal = telegramClient.downloadFile(activeRemoteId, "")
+                                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                                .first()
+                        }
+                    }
+                    if (terminal !is DownloadUpdate.Done) return@withPermit null
+                    generateFromLocalFile(
+                        entity.chatId,
+                        entity.messageId,
+                        terminal.localPath,
+                        entity.mimeType,
+                        entity.fileName,
+                    )
+                }
+            }
             else -> null
         }
     }
@@ -544,24 +571,26 @@ class MediaThumbnailCache @Inject constructor(
         }
     }
 
-    private fun decodePdfFirstPage(path: String): Bitmap? {
+    private fun decodePdfFirstPage(path: String): Bitmap? = synchronized(PDF_RENDER_LOCK) {
+        val srcFile = File(path)
+        if (!srcFile.isFile || srcFile.length() < 5L) return@synchronized null
         val pfd = runCatching {
-            ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
-        }.getOrNull() ?: return null
-        return pfd.use { fd ->
+            ParcelFileDescriptor.open(srcFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        }.getOrNull() ?: return@synchronized null
+        pfd.use { fd ->
             runCatching {
                 PdfRenderer(fd).use { renderer ->
                     if (renderer.pageCount <= 0) return@runCatching null
                     renderer.openPage(0).use { page ->
-                        val targetW = TARGET_MAX_PX
-                        val ratio = targetW.toFloat() / page.width.coerceAtLeast(1).toFloat()
-                        val targetH = (page.height * ratio).toInt().coerceIn(120, 640)
+                        val (targetW, targetH) = computePdfThumbDimensions(page.width, page.height, TARGET_MAX_PX)
                         val bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
                         Canvas(bmp).drawColor(Color.WHITE)
                         page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                         bmp
                     }
                 }
+            }.onFailure { t ->
+                Log.w("MediaThumbnailCache: failed rendering PDF thumb for ${srcFile.name}", t)
             }.getOrNull()
         }
     }
@@ -613,7 +642,22 @@ class MediaThumbnailCache @Inject constructor(
         const val ENCRYPTED_THUMB_EXT = ".tgethumb"
         private const val TARGET_MAX_PX = 360
         private const val MAX_REMOTE_IMAGE_BYTES = 15L * 1024 * 1024
+        private const val MAX_REMOTE_PDF_BYTES = 25L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024
         private const val FAIL_COOLDOWN_MS = 5L * 60 * 1000L
+        private val PDF_RENDER_LOCK = Any()
+
+        internal fun computePdfThumbDimensions(
+            pageWidth: Int,
+            pageHeight: Int,
+            maxDim: Int = TARGET_MAX_PX,
+        ): Pair<Int, Int> {
+            val w = pageWidth.coerceAtLeast(1)
+            val h = pageHeight.coerceAtLeast(1)
+            val scale = minOf(maxDim.toFloat() / w, maxDim.toFloat() / h)
+            val targetW = (w * scale).toInt().coerceIn(48, maxDim)
+            val targetH = (h * scale).toInt().coerceIn(48, maxDim)
+            return targetW to targetH
+        }
     }
 }

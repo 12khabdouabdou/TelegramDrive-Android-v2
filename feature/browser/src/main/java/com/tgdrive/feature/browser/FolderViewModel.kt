@@ -81,6 +81,7 @@ private val THUMBNAILABLE_EXTS =
         "webm",
         "avi",
         "3gp",
+        "pdf",
     )
 
 data class DecryptDialogState(
@@ -1540,46 +1541,85 @@ class FolderViewModel
         }
 
         fun copyToDownloads(messageId: Long) {
-            val localPath =
-                getLocalPath(messageId) ?: run {
-                    _error.value = "Download the file first"
-                    return
-                }
             val item = _items.value.find { it.messageId == messageId } ?: return
             viewModelScope.launch(dispatchers.io) {
                 try {
-                    val source = File(localPath)
+                    var localPath = getLocalPath(messageId)
+                    if (localPath == null) {
+                        if (item.remoteId.isEmpty()) {
+                            _error.value = "File has no remote ID — can't download"
+                            return@launch
+                        }
+                        showSnackbar("Downloading ${item.fileName}…")
+                        downloadFile(item)
+                        val terminal = downloadManager.state
+                            .map { st ->
+                                st.items.find { it.id == messageId && (it.chatId == 0L || it.chatId == item.chatId) }
+                            }
+                            .first { dl ->
+                                dl == null ||
+                                    dl.status == DownloadStatus.DONE ||
+                                    dl.status == DownloadStatus.FAILED ||
+                                    dl.status == DownloadStatus.CANCELLED
+                            }
+                        if (terminal?.status != DownloadStatus.DONE) {
+                            _error.value = terminal?.errorMessage ?: "Download failed"
+                            return@launch
+                        }
+                        localPath = terminal.localPath ?: getLocalPath(messageId)
+                    }
+                    val source = localPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L } ?: run {
+                        _error.value = "Downloaded file is missing"
+                        return@launch
+                    }
+                    val safeName = item.fileName
+                        .substringAfterLast('/')
+                        .substringAfterLast('\\')
+                        .replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001F]"), "_")
+                        .trim(' ', '.')
+                        .ifBlank { "download" }
+                    val mime = when {
+                        safeName.endsWith(".pdf", ignoreCase = true) -> "application/pdf"
+                        !item.mimeType.isNullOrBlank() -> item.mimeType
+                        else -> "application/octet-stream"
+                    }
                     if (android.os.Build.VERSION.SDK_INT >= 29) {
                         val values =
                             android.content.ContentValues().apply {
-                                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, item.fileName)
-                                put(
-                                    android.provider.MediaStore.Downloads.MIME_TYPE,
-                                    item.mimeType ?: "application/octet-stream",
-                                )
+                                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName)
+                                put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
                                 put(
                                     android.provider.MediaStore.Downloads.RELATIVE_PATH,
-                                    android.os.Environment.DIRECTORY_DOWNLOADS,
+                                    "${android.os.Environment.DIRECTORY_DOWNLOADS}/TelegramDrive",
                                 )
+                                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
                             }
+                        val resolver = appContext.contentResolver
                         val uri =
-                            appContext.contentResolver.insert(
+                            resolver.insert(
                                 android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                                 values,
                             ) ?: throw IllegalStateException("Could not create MediaStore entry")
-                        appContext.contentResolver.openOutputStream(uri)?.use { out ->
-                            source.inputStream().use { it.copyTo(out) }
-                        } ?: throw IllegalStateException("Could not open Downloads stream")
+                        try {
+                            resolver.openOutputStream(uri)?.use { out ->
+                                source.inputStream().use { it.copyTo(out) }
+                            } ?: throw IllegalStateException("Could not open Downloads stream")
+                            values.clear()
+                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                            resolver.update(uri, values, null, null)
+                        } catch (t: Throwable) {
+                            runCatching { resolver.delete(uri, null, null) }
+                            throw t
+                        }
                     } else {
                         @Suppress("DEPRECATION")
                         val dir =
                             android.os.Environment.getExternalStoragePublicDirectory(
                                 android.os.Environment.DIRECTORY_DOWNLOADS,
-                            )
-                        val safeName = item.fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                            ).let { File(it, "TelegramDrive").apply { mkdirs() } }
                         source.copyTo(File(dir, safeName), overwrite = true)
                     }
-                    showSnackbar("Saved to Downloads")
+                    showSnackbar("Saved to Downloads/TelegramDrive")
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
@@ -1641,7 +1681,8 @@ class FolderViewModel
             val ext = entity.fileName.substringAfterLast('.', "").lowercase()
             return ext in THUMBNAILABLE_EXTS ||
                 entity.mimeType?.startsWith("image/") == true ||
-                entity.mimeType?.startsWith("video/") == true
+                entity.mimeType?.startsWith("video/") == true ||
+                entity.mimeType.equals("application/pdf", ignoreCase = true)
         }
 
         private fun TelegramMessage.toCacheEntity(chatId: Long): FileCacheEntity =

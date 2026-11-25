@@ -863,16 +863,16 @@ class TdLibTelegramClient(
         }
     }
 
-    private fun decodeUploadPdfThumb(localPath: String): Bitmap? {
+    private fun decodeUploadPdfThumb(localPath: String): Bitmap? = synchronized(PDF_RENDER_LOCK) {
         val pfd = ParcelFileDescriptor.open(File(localPath), ParcelFileDescriptor.MODE_READ_ONLY)
-        return pfd.use { fd ->
+        pfd.use { fd ->
             PdfRenderer(fd).use { renderer ->
-                if (renderer.pageCount <= 0) return@use null
+                if (renderer.pageCount <= 0) return@synchronized null
                 renderer.openPage(0).use { page ->
                     val maxDim = 320f
                     val scale = minOf(maxDim / page.width.coerceAtLeast(1), maxDim / page.height.coerceAtLeast(1))
-                    val w = (page.width * scale).toInt().coerceIn(80, 320)
-                    val h = (page.height * scale).toInt().coerceIn(80, 320)
+                    val w = (page.width * scale).toInt().coerceIn(48, 320)
+                    val h = (page.height * scale).toInt().coerceIn(48, 320)
                     val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     Canvas(bmp).drawColor(android.graphics.Color.WHITE)
                     page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -1010,6 +1010,20 @@ class TdLibTelegramClient(
         }
     }
 
+    override suspend fun refreshMessageRemoteId(chatId: Long, messageId: Long): String? = withContext(dispatchers.io) {
+        if (chatId == 0L || messageId == 0L || client == null) return@withContext null
+        try {
+            runCatching { send<TdApi.Chat>(TdApi.GetChat(chatId)) }
+            val msg = send<TdApi.Message>(TdApi.GetMessage(chatId, messageId))
+            msg.extractRemoteId().takeIf { it.isNotBlank() }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("refreshMessageRemoteId failed for chat=$chatId msg=$messageId", t)
+            null
+        }
+    }
+
     override fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate> = flow {
         if (remoteId.isEmpty()) {
             emit(DownloadUpdate.Failed("File has no remote ID"))
@@ -1027,7 +1041,8 @@ class TdLibTelegramClient(
             val initialLocal = file.local
             if (initialLocal?.isDownloadingCompleted == true) {
                 val p = initialLocal.path.orEmpty()
-                if (p.isNotEmpty() && File(p).exists()) {
+                val cachedFile = if (p.isNotEmpty()) File(p) else null
+                if (cachedFile != null && cachedFile.isFile && cachedFile.length() > 0L) {
                     emit(DownloadUpdate.Done(p))
                     return@flow
                 }
@@ -1042,10 +1057,11 @@ class TdLibTelegramClient(
                     if (fLocal != null) {
                         if (fLocal.isDownloadingCompleted) {
                             val pp = fLocal.path.orEmpty()
-                            if (pp.isNotEmpty() && File(pp).exists()) {
+                            val downloadedFile = if (pp.isNotEmpty()) File(pp) else null
+                            if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
                                 channel.trySend(DownloadUpdate.Done(pp))
                             } else {
-                                channel.trySend(DownloadUpdate.Failed("File missing after download"))
+                                channel.trySend(DownloadUpdate.Failed("File missing or empty after download"))
                             }
                             channel.close()
                         } else {
@@ -1076,10 +1092,11 @@ class TdLibTelegramClient(
                                     val rLocal = result.local
                                     if (rLocal?.isDownloadingCompleted == true) {
                                         val pp = rLocal.path.orEmpty()
-                                        if (pp.isNotEmpty() && File(pp).exists()) {
+                                        val downloadedFile = if (pp.isNotEmpty()) File(pp) else null
+                                        if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
                                             channel.trySend(DownloadUpdate.Done(pp))
                                         } else {
-                                            channel.trySend(DownloadUpdate.Failed("File missing after download"))
+                                            channel.trySend(DownloadUpdate.Failed("File missing or empty after download"))
                                         }
                                         channel.close()
                                     } else if (rLocal != null && !rLocal.isDownloadingActive && !rLocal.canBeDownloaded) {
@@ -1333,6 +1350,7 @@ class TdLibTelegramClient(
     }
 
     companion object {
+        private val PDF_RENDER_LOCK = Any()
         private const val UPLOAD_STALL_TIMEOUT_MS = 90_000L
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256

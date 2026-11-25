@@ -173,7 +173,7 @@ fun FolderScreen(
     onOpenLocalText: (String, String) -> Unit = { _, _ -> },
     onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
-    onOpenPdf: (Long) -> Unit = {},
+    onOpenPdf: (Long, Long) -> Unit = { _, _ -> },
     onOpenZip: (Long) -> Unit = {},
     onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onBack: () -> Unit,
@@ -871,7 +871,10 @@ fun FolderScreen(
             item = item,
             isDownloaded = vm.getLocalPath(item.messageId) != null,
             isPinnedOffline = item.isPinnedOffline,
-            onDownload = { vm.downloadFile(item) },
+            onDownload = {
+                vm.downloadFile(item)
+                vm.showSnackbar(context.getString(R.string.browser_downloading_file, item.fileName))
+            },
             onCopyToDownloads = { vm.copyToDownloads(item.messageId) },
             onMove = {
                 vm.clearSelection()
@@ -1577,12 +1580,14 @@ private fun FileGridCell(
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
-    val thumbFile = remember(thumbModel, item.isEncryptedVault) {
-        if (item.isEncryptedVault || thumbModel?.endsWith(".tgethumb", ignoreCase = true) == true) {
+    val thumbFile = remember(item.thumbnailPath, pdfThumbnailPath, item.isEncryptedVault) {
+        if (item.isEncryptedVault) {
             null
         } else {
-            thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+            listOfNotNull(item.thumbnailPath, pdfThumbnailPath)
+                .filterNot { it.endsWith(".tgethumb", ignoreCase = true) }
+                .map(::File)
+                .firstOrNull { it.isFile && it.length() > 0L }
         }
     }
     val partBadge = remember(item.fileName) {
@@ -1626,16 +1631,7 @@ private fun FileGridCell(
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
                     )
-                } else if (decryptedThumbBytes != null) {
-                AsyncImage(
-                    model = decryptedThumbBytes,
-                    contentDescription = item.fileName,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(12.dp)),
-                )
-            } else if (thumbFile != null) {
+                } else if (thumbFile != null) {
                     AsyncImage(
                         model = thumbFile,
                         contentDescription = item.fileName,
@@ -1843,12 +1839,14 @@ private fun FileListRow(
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbModel = item.thumbnailPath ?: pdfThumbnailPath
-    val thumbFile = remember(thumbModel, item.isEncryptedVault) {
-        if (item.isEncryptedVault || thumbModel?.endsWith(".tgethumb", ignoreCase = true) == true) {
+    val thumbFile = remember(item.thumbnailPath, pdfThumbnailPath, item.isEncryptedVault) {
+        if (item.isEncryptedVault) {
             null
         } else {
-            thumbModel?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+            listOfNotNull(item.thumbnailPath, pdfThumbnailPath)
+                .filterNot { it.endsWith(".tgethumb", ignoreCase = true) }
+                .map(::File)
+                .firstOrNull { it.isFile && it.length() > 0L }
         }
     }
     val partBadge = remember(item.fileName) {
@@ -2020,7 +2018,7 @@ private fun handleFileTap(
     vm: FolderViewModel,
     onOpenVideo: (Long, Long) -> Unit,
     onOpenImage: (Long, Long) -> Unit,
-    onOpenPdf: (Long) -> Unit,
+    onOpenPdf: (Long, Long) -> Unit,
     onOpenZip: (Long) -> Unit,
     onOpenText: (Long, Long) -> Unit,
     context: Context,
@@ -2047,7 +2045,7 @@ private fun handleFileTap(
         }
         bucket == FileBucket.PDF -> {
             if (localPath == null) vm.downloadFile(item)
-            onOpenPdf(messageId)
+            onOpenPdf(item.chatId, messageId)
         }
         isTextPreviewable(item.mimeType, item.fileName) -> {
             if (localPath == null) vm.downloadFile(item)

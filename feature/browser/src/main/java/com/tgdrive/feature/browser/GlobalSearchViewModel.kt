@@ -454,7 +454,7 @@ class GlobalSearchViewModel
             folderTitle: String,
             onOpenVideo: (Long, Long) -> Unit,
             onOpenImage: (Long, Long) -> Unit,
-            onOpenPdf: (Long) -> Unit,
+            onOpenPdf: (Long, Long) -> Unit,
             onOpenZip: (Long) -> Unit,
             onOpenText: (Long, Long) -> Unit,
             onOpenFolder: (Long, String) -> Unit,
@@ -498,7 +498,7 @@ class GlobalSearchViewModel
                 bucket == FileBucket.AUDIO -> downloadAndPlayAudio(file, localPath)
                 bucket == FileBucket.PDF -> {
                     enqueueIfNeeded()
-                    onOpenPdf(file.messageId)
+                    onOpenPdf(file.chatId, file.messageId)
                 }
                 isTextPreviewable(file.mimeType, file.fileName) -> {
                     enqueueIfNeeded()

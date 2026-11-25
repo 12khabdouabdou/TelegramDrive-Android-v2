@@ -125,7 +125,7 @@ fun RootNavHost(
                         val encodedAlbum = albumId?.let { Uri.encode(it) }.orEmpty()
                         nav.navigate("image/$msgId?chatId=$chatId&timeline=true&albumId=$encodedAlbum")
                     },
-                    onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
+                    onOpenPdf = { chatId, msgId -> nav.navigate("pdf/$msgId?chatId=$chatId") },
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
                     onOpenZipEntry = { chatId, zipMsgId, entryPath ->
                         nav.navigate("zip/$zipMsgId?chatId=$chatId&entry=${Uri.encode(entryPath)}")
@@ -267,7 +267,7 @@ fun RootNavHost(
                     onOpenZip = { msgId -> nav.navigate("zip/$msgId") },
                     onOpenVideo = { chatId, msgId -> nav.navigate("video/$msgId?chatId=$chatId") },
                     onOpenImage = { chatId, msgId -> nav.navigate("image/$msgId?chatId=$chatId") },
-                    onOpenPdf = { msgId -> nav.navigate("pdf/$msgId") },
+                    onOpenPdf = { chatId, msgId -> nav.navigate("pdf/$msgId?chatId=$chatId") },
                     onOpenText = { chatId, msgId -> nav.navigate("text/$msgId?chatId=$chatId") },
                     onOpenLocalVideo = openLocalVideo,
                     onOpenLocalPdf = openLocalPdf,
@@ -277,11 +277,18 @@ fun RootNavHost(
             }
 
             composable(
-                "pdf/{msgId}",
-                arguments = listOf(navArgument("msgId") { type = NavType.LongType }),
+                "pdf/{msgId}?chatId={chatId}",
+                arguments = listOf(
+                    navArgument("msgId") { type = NavType.LongType },
+                    navArgument("chatId") {
+                        type = NavType.LongType
+                        defaultValue = 0L
+                    },
+                ),
             ) { entry ->
                 val msgId = entry.arguments?.getLong("msgId") ?: return@composable
-                PdfViewerScreen(messageId = msgId, onBack = { nav.popBackStack() })
+                val chatId = entry.arguments?.getLong("chatId") ?: 0L
+                PdfViewerScreen(messageId = msgId, chatId = chatId, onBack = { nav.popBackStack() })
             }
 
             composable(

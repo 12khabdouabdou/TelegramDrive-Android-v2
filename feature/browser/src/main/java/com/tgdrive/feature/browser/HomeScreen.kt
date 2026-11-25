@@ -116,7 +116,7 @@ fun HomeScreen(
     onOpenFolder: (Long, String) -> Unit = { _, _ -> },
     onOpenVideo: (Long, Long) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
-    onOpenPdf: (Long) -> Unit = {},
+    onOpenPdf: (Long, Long) -> Unit = { _, _ -> },
     onOpenZip: (Long) -> Unit = {},
     onOpenText: (Long, Long) -> Unit = { _, _ -> },
     onOpenAnalytics: () -> Unit = {},

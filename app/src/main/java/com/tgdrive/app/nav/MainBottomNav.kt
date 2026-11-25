@@ -101,7 +101,7 @@ fun MainBottomNav(
     onPlayLocalAudio: (String, String) -> Unit = { _, _ -> },
     onOpenImage: (Long, Long) -> Unit = { _, _ -> },
     onOpenTimelineImage: (Long, Long, String?) -> Unit = { chatId, msgId, _ -> onOpenImage(chatId, msgId) },
-    onOpenPdf: (Long) -> Unit = {},
+    onOpenPdf: (Long, Long) -> Unit = { _, _ -> },
     onOpenZip: (Long) -> Unit = {},
     onOpenZipEntry: (Long, Long, String) -> Unit = { _, msgId, _ -> onOpenZip(msgId) },
     onOpenText: (Long, Long) -> Unit = { _, _ -> },

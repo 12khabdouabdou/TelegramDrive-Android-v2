@@ -37,10 +37,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
@@ -53,10 +56,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -67,7 +72,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -95,6 +99,7 @@ import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.designsystem.theme.TgTypography
 import kotlinx.coroutines.CancellationException
@@ -126,38 +131,76 @@ private class PdfRendererSession(
     }
 }
 
+internal fun isLikelyPdfFile(file: File): Boolean {
+    if (!file.isFile || file.length() < 5L) return false
+    return runCatching {
+        val buf = ByteArray(minOf(file.length(), 1024L).toInt())
+        file.inputStream().use { input ->
+            var readTotal = 0
+            while (readTotal < buf.size) {
+                val n = input.read(buf, readTotal, buf.size - readTotal)
+                if (n <= 0) break
+                readTotal += n
+            }
+            String(buf, 0, readTotal, Charsets.ISO_8859_1).contains("%PDF-")
+        }
+    }.getOrDefault(false)
+}
+
 /**
  * In-app PDF viewer with IO-threaded PdfRenderer, white page backing,
- * pinch/double-tap zoom, live page counter, and download retry state.
+ * pinch/double-tap zoom, live page counter, download/retry/pause handling, and external fallback.
  */
 @Composable
 fun PdfViewerScreen(
     messageId: Long,
     onBack: () -> Unit,
+    chatId: Long = 0L,
     initialLocalPath: String? = null,
     initialTitle: String? = null,
     vm: VideoPlayerViewModel = hiltViewModel(),
 ) {
-    var pageCount by remember(messageId, initialLocalPath) { mutableIntStateOf(0) }
-    var session by remember(messageId, initialLocalPath) { mutableStateOf<PdfRendererSession?>(null) }
-    var loading by remember(messageId, initialLocalPath) { mutableStateOf(true) }
-    var error by remember(messageId, initialLocalPath) { mutableStateOf<String?>(null) }
-    var localPath by remember(messageId, initialLocalPath) {
-        mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId))
+    var pageCount by remember(chatId, messageId, initialLocalPath) { mutableIntStateOf(0) }
+    var session by remember(chatId, messageId, initialLocalPath) { mutableStateOf<PdfRendererSession?>(null) }
+    var loading by remember(chatId, messageId, initialLocalPath) { mutableStateOf(true) }
+    var error by remember(chatId, messageId, initialLocalPath) { mutableStateOf<String?>(null) }
+    var cachedEntry by remember(chatId, messageId, initialLocalPath) { mutableStateOf<FileCacheEntity?>(null) }
+    var entryChecked by remember(chatId, messageId, initialLocalPath) { mutableStateOf(false) }
+    var localPath by remember(chatId, messageId, initialLocalPath) {
+        mutableStateOf<String?>(initialLocalPath?.takeIf { it.isNotBlank() } ?: vm.getLocalPath(messageId, chatId))
     }
 
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
-    val downloadItem = downloadState.items.find { it.id == messageId }
+    val downloadItem = downloadState.items.find {
+        it.id == messageId && (chatId == 0L || it.chatId == 0L || it.chatId == chatId)
+    }
     val isDownloading =
         initialLocalPath.isNullOrBlank() && (
             downloadItem?.status == DownloadStatus.DOWNLOADING ||
                 downloadItem?.status == DownloadStatus.QUEUED
             )
-    val isFailed = initialLocalPath.isNullOrBlank() && downloadItem?.status == DownloadStatus.FAILED
+    val isPaused = initialLocalPath.isNullOrBlank() && downloadItem?.status == DownloadStatus.PAUSED
+    val isFailed = initialLocalPath.isNullOrBlank() && (
+        downloadItem?.status == DownloadStatus.FAILED ||
+            downloadItem?.status == DownloadStatus.CANCELLED
+        )
 
-    LaunchedEffect(messageId, initialLocalPath, downloadState.items) {
+    LaunchedEffect(chatId, messageId, initialLocalPath) {
+        if (!initialLocalPath.isNullOrBlank()) {
+            entryChecked = true
+            return@LaunchedEffect
+        }
+        val entry = vm.getCachedEntry(chatId, messageId)
+        cachedEntry = entry
+        entryChecked = true
+        if (vm.getLocalPath(messageId, chatId) == null && entry != null && vm.downloadManager.findItem(chatId, messageId) == null) {
+            vm.ensureDownloaded(entry)
+        }
+    }
+
+    LaunchedEffect(chatId, messageId, initialLocalPath, downloadState.items) {
         if (!initialLocalPath.isNullOrBlank()) return@LaunchedEffect
-        val path = vm.getLocalPath(messageId)
+        val path = vm.getLocalPath(messageId, chatId)
         if (path != null && path != localPath) {
             localPath = path
             error = null
@@ -169,6 +212,37 @@ fun PdfViewerScreen(
         onDispose { current?.closeAsync() }
     }
 
+    val listState = rememberLazyListState()
+    val currentPage by remember(pageCount) {
+        derivedStateOf {
+            if (pageCount <= 0) 0 else (listState.firstVisibleItemIndex + 1).coerceIn(1, pageCount)
+        }
+    }
+    var scale by remember(chatId, messageId, initialLocalPath) { mutableFloatStateOf(1f) }
+    var offset by remember(chatId, messageId, initialLocalPath) { mutableStateOf(Offset.Zero) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var nightMode by remember { mutableStateOf(false) }
+    var showJumpDialog by remember { mutableStateOf(false) }
+    var showOcrSearch by remember { mutableStateOf(false) }
+    var ocrQuery by remember { mutableStateOf("") }
+    var ocrScanning by remember { mutableStateOf(false) }
+    var ocrScannedCount by remember(chatId, messageId, initialLocalPath) { mutableIntStateOf(0) }
+    val ocrTextByPage = remember(chatId, messageId, initialLocalPath) { mutableStateMapOf<Int, String>() }
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val displayTitle = initialTitle?.takeIf { it.isNotBlank() }
+        ?: cachedEntry?.fileName
+        ?: downloadItem?.fileName
+        ?: localPath?.let { File(it).name }
+        ?: "PDF"
+    val savedMsg = stringResource(R.string.player_saved_downloads)
+    val saveFailMsg = stringResource(R.string.player_save_failed)
+    val invalidFileMsg = stringResource(R.string.player_pdf_invalid_file)
+    val passwordProtectedMsg = stringResource(R.string.player_pdf_password_protected)
+    val noExternalAppMsg = stringResource(R.string.player_pdf_no_external_app)
+
     LaunchedEffect(localPath) {
         val path = localPath ?: return@LaunchedEffect
         loading = true
@@ -176,8 +250,14 @@ fun PdfViewerScreen(
         session = null
         try {
             val file = File(path)
-            if (!file.exists()) {
-                error = "PDF file is missing on disk"
+            if (!file.isFile || file.length() <= 0L) {
+                error = invalidFileMsg
+                loading = false
+                return@LaunchedEffect
+            }
+            val validPdf = withContext(Dispatchers.IO) { isLikelyPdfFile(file) }
+            if (!validPdf) {
+                error = invalidFileMsg
                 loading = false
                 return@LaunchedEffect
             }
@@ -195,8 +275,14 @@ fun PdfViewerScreen(
             session = opened
             pageCount = opened.pageCount
             loading = false
+            if (opened.pageCount > 0) {
+                vm.ensurePdfThumbnail(chatId, messageId, path, displayTitle)
+            }
         } catch (e: CancellationException) {
             throw e
+        } catch (_: SecurityException) {
+            error = passwordProtectedMsg
+            loading = false
         } catch (t: Throwable) {
             Log.w("PdfViewer: failed to open PDF", t)
             error = t.message
@@ -204,32 +290,23 @@ fun PdfViewerScreen(
         }
     }
 
-    val listState = rememberLazyListState()
-    val currentPage by remember(pageCount) {
-        derivedStateOf {
-            if (pageCount <= 0) 0 else (listState.firstVisibleItemIndex + 1).coerceIn(1, pageCount)
+    fun openExternally(file: File) {
+        if (!file.isFile || file.length() <= 0L) {
+            scope.launch { snackbarHostState.showSnackbar(invalidFileMsg) }
+            return
+        }
+        runCatching {
+            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/pdf")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(intent)
+        }.onFailure { t ->
+            Log.w("PdfViewer: external viewer failed", t)
+            scope.launch { snackbarHostState.showSnackbar(noExternalAppMsg) }
         }
     }
-    var scale by remember(messageId, initialLocalPath) { mutableFloatStateOf(1f) }
-    var offset by remember(messageId, initialLocalPath) { mutableStateOf(Offset.Zero) }
-    var containerSize by remember { mutableStateOf(IntSize.Zero) }
-    var nightMode by remember { mutableStateOf(false) }
-    var showJumpDialog by remember { mutableStateOf(false) }
-    var showOcrSearch by remember { mutableStateOf(false) }
-    var ocrQuery by remember { mutableStateOf("") }
-    var ocrScanning by remember { mutableStateOf(false) }
-    var ocrScannedCount by remember(messageId, initialLocalPath) { mutableIntStateOf(0) }
-    val ocrTextByPage = remember(messageId, initialLocalPath) { mutableStateMapOf<Int, String>() }
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val snackbarHostState = remember { SnackbarHostState() }
-    val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    val displayTitle = initialTitle?.takeIf { it.isNotBlank() }
-        ?: downloadItem?.fileName
-        ?: localPath?.let { File(it).name }
-        ?: "PDF"
-    val savedMsg = stringResource(R.string.player_saved_downloads)
-    val saveFailMsg = stringResource(R.string.player_save_failed)
     val matchingPages = remember(ocrQuery, ocrTextByPage.toMap()) {
         val q = ocrQuery.trim()
         if (q.isBlank()) {
@@ -311,6 +388,13 @@ fun PdfViewerScreen(
                     }
                 }
                 if (!localPath.isNullOrBlank()) {
+                    IconButton(onClick = { openExternally(File(localPath!!)) }) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                            contentDescription = stringResource(R.string.player_pdf_open_external),
+                            tint = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                     IconButton(onClick = {
                         val src = File(localPath!!)
                         scope.launch {
@@ -463,6 +547,29 @@ fun PdfViewerScreen(
             contentAlignment = Alignment.Center,
         ) {
             when {
+                localPath == null && isPaused -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Pause,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(48.dp),
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            text = downloadItem?.errorMessage ?: stringResource(R.string.player_pdf_paused),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = TgTypography.Display.bodyMedium,
+                        )
+                        Spacer(Modifier.height(14.dp))
+                        Button(onClick = { downloadItem?.let { vm.downloadManager.resume(it.chatId, it.id) } }) {
+                            Text(stringResource(R.string.player_pdf_resume_download))
+                        }
+                    }
+                }
                 localPath == null && isFailed -> {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -481,8 +588,38 @@ fun PdfViewerScreen(
                             style = TgTypography.Display.bodyMedium,
                         )
                         Spacer(Modifier.height(14.dp))
-                        Button(onClick = { downloadItem?.let { vm.downloadManager.enqueue(it) } }) {
+                        Button(
+                            onClick = {
+                                downloadItem?.let { vm.downloadManager.enqueue(it) }
+                                    ?: cachedEntry?.let { vm.ensureDownloaded(it) }
+                            },
+                        ) {
                             Text(stringResource(R.string.player_retry))
+                        }
+                    }
+                }
+                localPath == null && !isDownloading && entryChecked && downloadItem == null -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.ErrorOutline,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(48.dp),
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            text = stringResource(R.string.player_pdf_missing_entry),
+                            color = MaterialTheme.colorScheme.error,
+                            style = TgTypography.Display.bodyMedium,
+                        )
+                        if (cachedEntry != null) {
+                            Spacer(Modifier.height(14.dp))
+                            Button(onClick = { cachedEntry?.let(vm::ensureDownloaded) }) {
+                                Text(stringResource(R.string.player_retry))
+                            }
                         }
                     }
                 }
@@ -526,6 +663,39 @@ fun PdfViewerScreen(
                             text = error ?: stringResource(R.string.player_pdf_error),
                             color = MaterialTheme.colorScheme.error,
                         )
+                        Spacer(Modifier.height(16.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            localPath?.let { path ->
+                                Button(onClick = { openExternally(File(path)) }) {
+                                    Text(stringResource(R.string.player_pdf_open_external))
+                                }
+                            }
+                            val canRedownload = initialLocalPath.isNullOrBlank() && (cachedEntry != null || downloadItem != null)
+                            if (canRedownload) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val entry = cachedEntry
+                                        val dl = downloadItem
+                                        session = null
+                                        localPath = null
+                                        error = null
+                                        if (entry != null) {
+                                            vm.forceRedownload(entry)
+                                        } else if (dl != null) {
+                                            vm.downloadManager.forceRedownload(dl.copy(localPath = null))
+                                        }
+                                    },
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Refresh,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(Modifier.size(6.dp))
+                                    Text(stringResource(R.string.player_pdf_redownload))
+                                }
+                            }
+                        }
                     }
                 }
                 pageCount == 0 || session == null || localPath == null -> {
