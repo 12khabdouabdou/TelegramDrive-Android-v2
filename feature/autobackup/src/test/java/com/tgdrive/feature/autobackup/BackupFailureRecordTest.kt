@@ -36,4 +36,19 @@ class BackupFailureRecordTest {
         assertThat(BackupFailureRecord.decode("")).isEmpty()
         assertThat(BackupFailureRecord.decode("not json")).isEmpty()
     }
+
+    @Test
+    fun `retryablePaths filters blank folder-level and duplicate paths`() {
+        val records = listOf(
+            BackupFailureRecord("folder", "content://tree/abc", "Folder missing", "content://tree/abc"),
+            BackupFailureRecord("blank", " ", "No path", "content://tree/abc"),
+            BackupFailureRecord("photo.jpg", "content://doc/1", "Timeout", "content://tree/abc"),
+            BackupFailureRecord("photo.jpg", "content://doc/1", "Retry", "content://tree/abc"),
+            BackupFailureRecord("doc.pdf", "/storage/emulated/0/doc.pdf", "IO error", "content://tree/def"),
+        )
+        assertThat(BackupFailureRecord.retryablePaths(records)).containsExactly(
+            "content://doc/1",
+            "/storage/emulated/0/doc.pdf",
+        ).inOrder()
+    }
 }

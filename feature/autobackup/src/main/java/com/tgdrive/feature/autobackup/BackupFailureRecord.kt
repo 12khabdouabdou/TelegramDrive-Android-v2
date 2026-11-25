@@ -81,6 +81,13 @@ data class BackupFailureRecord(
             return out
         }
 
+        fun retryablePaths(records: List<BackupFailureRecord>): List<String> = records
+            .asSequence()
+            .filter { it.localPath.isNotBlank() && it.localPath != it.folderUri }
+            .map { it.localPath }
+            .distinct()
+            .toList()
+
         private data class ParsedString(val text: String, val nextIndex: Int)
 
         private fun parseJsonString(src: String, quoteStart: Int): ParsedString? {

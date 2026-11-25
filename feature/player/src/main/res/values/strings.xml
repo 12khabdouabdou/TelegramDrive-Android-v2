@@ -100,6 +100,10 @@
     <string name="player_text_save_copy">Save copy</string>
     <string name="player_text_reupload">Upload edit</string>
     <string name="player_text_upload_queued">Queued edited file for upload</string>
+    <string name="player_text_discard_title">Discard edits?</string>
+    <string name="player_text_discard_message">You have unsaved text edits. Leave the editor without saving or uploading?</string>
+    <string name="player_text_discard_confirm">Discard</string>
+    <string name="player_text_keep_editing">Keep editing</string>
     <string name="player_video_audio_tracks">Audio track</string>
     <string name="player_video_touch_lock">Lock screen</string>
     <string name="player_video_touch_locked_hint">Screen locked · Tap to unlock</string>

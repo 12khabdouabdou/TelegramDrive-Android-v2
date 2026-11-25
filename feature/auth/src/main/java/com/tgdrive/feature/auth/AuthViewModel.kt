@@ -83,6 +83,19 @@ class AuthViewModel @Inject constructor(
         loadStoredApiCreds()
     }
 
+    private fun mapAuthStep(st: AuthorizationState): AuthStep? = when (st) {
+        AuthorizationState.WaitInitialization -> AuthStep.ApiCreds
+        AuthorizationState.WaitPhoneNumber -> AuthStep.Phone
+        AuthorizationState.WaitCode -> AuthStep.Code
+        is AuthorizationState.WaitQrConfirmation -> AuthStep.QrLogin
+        AuthorizationState.WaitEmailAddress -> AuthStep.EmailAddress
+        is AuthorizationState.WaitEmailCode -> AuthStep.EmailCode
+        AuthorizationState.WaitPassword -> AuthStep.Password
+        AuthorizationState.WaitRegistration -> AuthStep.Registration
+        AuthorizationState.Ready -> AuthStep.Done
+        else -> null
+    }
+
     private fun observeAuthState() {
         viewModelScope.launch(dispatchers.io) {
             telegramClient.authState.collect { st ->
@@ -194,7 +207,8 @@ class AuthViewModel @Inject constructor(
                     apiHash = trimmedHash,
                     sessionDir = SESSION_DIR,
                 )
-                _state.update { it.copy(loading = false) }
+                val nextStep = mapAuthStep(telegramClient.authState.value) ?: AuthStep.Phone
+                _state.update { it.copy(loading = false, step = nextStep) }
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -283,6 +297,7 @@ class AuthViewModel @Inject constructor(
     }
 
     private fun runAuthAction(block: suspend () -> Unit) {
+        if (_state.value.loading) return
         viewModelScope.launch(dispatchers.io) {
             _state.update { it.copy(loading = true, error = null) }
             try {

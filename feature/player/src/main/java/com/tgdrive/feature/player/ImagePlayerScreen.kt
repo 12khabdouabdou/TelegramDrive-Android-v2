@@ -120,7 +120,8 @@ fun ImagePlayerScreen(
     val scope = rememberCoroutineScope()
     val downloadState by vm.downloadManager.state.collectAsStateWithLifecycle()
     var siblings by remember(chatId, messageId, timeline, albumId) { mutableStateOf<List<GalleryItemRef>>(emptyList()) }
-    var rotations by remember(chatId, messageId, timeline, albumId) { mutableStateOf<Map<Long, Float>>(emptyMap()) }
+    var rotations by remember(chatId, messageId, timeline, albumId) { mutableStateOf<Map<Pair<Long, Long>, Float>>(emptyMap()) }
+    var initialScrollApplied by remember(chatId, messageId, timeline, albumId) { mutableStateOf(false) }
     var showChrome by remember(chatId, messageId) { mutableStateOf(true) }
     var isCurrentZoomed by remember { mutableStateOf(false) }
     var showExifSheet by remember { mutableStateOf(false) }
@@ -159,9 +160,12 @@ fun ImagePlayerScreen(
     }
     val pagerState = rememberPagerState(initialPage = targetIdx) { pages.size }
 
-    LaunchedEffect(targetIdx, pages.size) {
-        if (pagerState.currentPage != targetIdx && targetIdx < pages.size) {
-            pagerState.scrollToPage(targetIdx)
+    LaunchedEffect(targetIdx, pages.size, siblings.isNotEmpty()) {
+        if (!initialScrollApplied && siblings.isNotEmpty() && targetIdx < pages.size) {
+            if (pagerState.currentPage != targetIdx) {
+                pagerState.scrollToPage(targetIdx)
+            }
+            initialScrollApplied = true
         }
     }
 
@@ -297,7 +301,7 @@ fun ImagePlayerScreen(
                             if (page == pagerState.currentPage) isCurrentZoomed = zoomed
                         },
                         onTap = { showChrome = !showChrome },
-                        rotationDegrees = rotations[ref.messageId] ?: 0f,
+                        rotationDegrees = rotations[ref.chatId to ref.messageId] ?: 0f,
                     )
                 }
                 isFailed -> {
@@ -437,8 +441,9 @@ fun ImagePlayerScreen(
                     }
                     IconButton(
                         onClick = {
-                            val next = (rotations[activeRef.messageId] ?: 0f) + 90f
-                            rotations = rotations + (activeRef.messageId to next)
+                            val key = activeRef.chatId to activeRef.messageId
+                            val next = (rotations[key] ?: 0f) + 90f
+                            rotations = rotations + (key to next)
                         },
                         modifier = Modifier
                             .padding(end = 6.dp)
@@ -580,7 +585,7 @@ fun ImagePlayerScreen(
     if (showCropDialog && activePath != null) {
         var aspectChoice by remember { mutableStateOf<Float?>(null) }
         var saving by remember { mutableStateOf(false) }
-        val activeRotation = rotations[activeRef.messageId] ?: 0f
+        val activeRotation = rotations[activeRef.chatId to activeRef.messageId] ?: 0f
         AlertDialog(
             onDismissRequest = { if (!saving) showCropDialog = false },
             containerColor = MaterialTheme.colorScheme.surfaceContainer,

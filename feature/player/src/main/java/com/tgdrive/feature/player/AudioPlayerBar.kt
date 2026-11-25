@@ -88,6 +88,7 @@ class AudioPlayerViewModel @Inject constructor(
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun AudioPlayerScaffold(
+    showMiniPlayer: Boolean = true,
     content: @Composable () -> Unit,
     vm: AudioPlayerViewModel = hiltViewModel(),
 ) {
@@ -113,7 +114,7 @@ fun AudioPlayerScaffold(
         }
     }
 
-    val isVisible = state.path != null
+    val isVisible = showMiniPlayer && state.path != null
     val hasQueue = state.queue.size > 1
 
     Column(modifier = Modifier.fillMaxSize()) {

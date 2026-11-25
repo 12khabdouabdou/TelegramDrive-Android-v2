@@ -540,6 +540,7 @@ class GlobalSearchViewModel
                         dl == null ||
                             dl.status == DownloadStatus.DONE ||
                             dl.status == DownloadStatus.FAILED ||
+                            dl.status == DownloadStatus.PAUSED ||
                             dl.status == DownloadStatus.CANCELLED
                     }
                 if (terminal?.status == DownloadStatus.DONE) {
@@ -551,6 +552,8 @@ class GlobalSearchViewModel
                     }
                 } else if (terminal?.status == DownloadStatus.FAILED) {
                     _snackbar.value = terminal.errorMessage ?: "Audio download failed"
+                } else if (terminal?.status == DownloadStatus.PAUSED) {
+                    _snackbar.value = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)"
                 }
             }
         }
@@ -590,6 +593,7 @@ class GlobalSearchViewModel
                         dl == null ||
                             dl.status == DownloadStatus.DONE ||
                             dl.status == DownloadStatus.FAILED ||
+                            dl.status == DownloadStatus.PAUSED ||
                             dl.status == DownloadStatus.CANCELLED
                     }
                 when (terminal?.status) {
@@ -609,6 +613,14 @@ class GlobalSearchViewModel
                     DownloadStatus.FAILED -> {
                         _decryptDialog.update { cur ->
                             cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
+                        }
+                    }
+                    DownloadStatus.PAUSED -> {
+                        _decryptDialog.update { cur ->
+                            cur?.copy(
+                                downloading = false,
+                                error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
+                            )
                         }
                     }
                     else -> _decryptDialog.value = null

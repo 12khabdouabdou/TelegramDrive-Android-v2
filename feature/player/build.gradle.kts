@@ -49,4 +49,5 @@ dependencies {
 
     testImplementation(libs.junit5.jupiter.api)
     testImplementation(libs.junit5.jupiter.engine)
+    testImplementation(libs.org.json)
 }

@@ -6,7 +6,9 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.db.dao.SyncLogDao
 import com.tgdrive.feature.autobackup.ActiveBackupRegistry
+import com.tgdrive.feature.autobackup.BackupFailureRecord
 import com.tgdrive.feature.autobackup.BackupNotifier
 import com.tgdrive.feature.autobackup.BackupOrchestrator
 import com.tgdrive.feature.autobackup.BackupScheduler
@@ -14,6 +16,8 @@ import com.tgdrive.feature.autobackup.StagingManager
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 /**
  * WorkManager worker that performs one AutoBackup job.
@@ -50,6 +54,7 @@ class BackupWorker @AssistedInject constructor(
     private val notifier: BackupNotifier,
     private val registry: ActiveBackupRegistry,
     private val scheduler: BackupScheduler,
+    private val syncLogDao: SyncLogDao,
 ) : CoroutineWorker(ctx, params) {
 
     companion object {
@@ -58,6 +63,7 @@ class BackupWorker @AssistedInject constructor(
         const val KEY_JOB_ID = "job_id"
         const val KEY_IS_MANUAL = "is_manual"
         const val KEY_RETRY_PATHS = "retry_paths"
+        const val KEY_RETRY_SOURCE_JOB_ID = "retry_source_job_id"
         const val KEY_OVERRIDE_FOLDER_URI = "override_folder_uri"
         const val KEY_OVERRIDE_TARGET_ID = "override_target_id"
     }
@@ -70,7 +76,17 @@ class BackupWorker @AssistedInject constructor(
             else -> jobId
         }
         val isManual = inputData.getBoolean(KEY_IS_MANUAL, false)
-        val retryPaths = inputData.getStringArray(KEY_RETRY_PATHS)?.toSet()?.takeIf { it.isNotEmpty() }
+        val directRetryPaths = inputData.getStringArray(KEY_RETRY_PATHS)?.toSet()?.takeIf { it.isNotEmpty() }
+        val retrySourceJobId = inputData.getString(KEY_RETRY_SOURCE_JOB_ID)?.takeIf { it.isNotBlank() }
+        val retryPaths = directRetryPaths ?: retrySourceJobId?.let { srcId ->
+            runCatching {
+                syncLogDao.get(srcId)?.failedDetailsJson?.let { raw ->
+                    BackupFailureRecord.retryablePaths(BackupFailureRecord.decode(raw))
+                        .toSet()
+                        .takeIf { it.isNotEmpty() }
+                }
+            }.getOrNull()
+        }
         val overrideFolderUris = inputData.getString(KEY_OVERRIDE_FOLDER_URI)
             ?.takeIf { it.isNotBlank() }
             ?.let { listOf(it) }
@@ -154,13 +170,15 @@ class BackupWorker @AssistedInject constructor(
             if (runAttemptCount < 3) Result.retry()
             else Result.failure(workDataOf(KEY_JOB_ID to effectiveJobId))
         } finally {
-            // These cleanup calls are wrapped in their own try/catch so
-            // they can't cause a secondary crash.
-            try { notifier.cancelForeground() } catch (_: Throwable) {}
-            try { stagingManager.purgeStale() } catch (_: Throwable) {}
-            try { if (registry.active.value?.phase?.isTerminal != true) registry.finish() } catch (_: Throwable) {}
-            if (!isManual) {
-                try { scheduler.armContentUriTriggerIfEnabled() } catch (_: Throwable) {}
+            withContext(NonCancellable) {
+                // These cleanup calls are wrapped in their own try/catch so
+                // they can't cause a secondary crash even during coroutine cancellation.
+                try { notifier.cancelForeground() } catch (_: Throwable) {}
+                try { stagingManager.purgeStale() } catch (_: Throwable) {}
+                try { if (registry.active.value?.phase?.isTerminal != true) registry.finish() } catch (_: Throwable) {}
+                if (!isManual) {
+                    try { scheduler.armContentUriTriggerIfEnabled() } catch (_: Throwable) {}
+                }
             }
         }
     }

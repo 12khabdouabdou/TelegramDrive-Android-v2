@@ -33,6 +33,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -1017,7 +1018,11 @@ class TdLibTelegramClient(
                 try { send<TdApi.Ok>(TdApi.DeleteFile(file.id)) } catch (_: Throwable) {}
             }
 
-            val channel = Channel<DownloadUpdate>(Channel.BUFFERED)
+            val progressChannel = Channel<DownloadUpdate.Progress>(
+                capacity = 1,
+                onBufferOverflow = BufferOverflow.DROP_OLDEST,
+            )
+            val terminal = CompletableDeferred<DownloadUpdate>()
             val dlHandler: (TdApi.File) -> Unit = { f ->
                 try {
                     val fLocal = f.local
@@ -1025,21 +1030,22 @@ class TdLibTelegramClient(
                         if (fLocal.isDownloadingCompleted) {
                             val pp = fLocal.path.orEmpty()
                             val downloadedFile = if (pp.isNotEmpty()) File(pp) else null
-                            if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
-                                channel.trySend(DownloadUpdate.Done(pp))
+                            val doneOrFail = if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
+                                DownloadUpdate.Done(pp)
                             } else {
-                                channel.trySend(DownloadUpdate.Failed("File missing or empty after download"))
+                                DownloadUpdate.Failed("File missing or empty after download")
                             }
-                            channel.close()
+                            terminal.complete(doneOrFail)
+                            progressChannel.close()
                         } else {
                             val total = if (f.size > 0L) f.size else f.expectedSize
-                            channel.trySend(DownloadUpdate.Progress(fLocal.downloadedSize, total))
+                            progressChannel.trySend(DownloadUpdate.Progress(fLocal.downloadedSize, total))
                         }
                     }
                 } catch (t: Throwable) {
                     Log.w("TDLib download handler error", t)
-                    channel.trySend(DownloadUpdate.Failed(t.message ?: "Download update error"))
-                    channel.close()
+                    terminal.complete(DownloadUpdate.Failed(t.message ?: "Download update error"))
+                    progressChannel.close()
                 }
             }
             registerFileHandler(downloadHandlers, file.id, dlHandler)
@@ -1052,53 +1058,79 @@ class TdLibTelegramClient(
                         try {
                             when (result) {
                                 is TdApi.Error -> {
-                                    channel.trySend(DownloadUpdate.Failed(result.message ?: "Error"))
-                                    channel.close()
+                                    terminal.complete(DownloadUpdate.Failed(result.message ?: "Error"))
+                                    progressChannel.close()
                                 }
                                 is TdApi.File -> {
                                     val rLocal = result.local
                                     if (rLocal?.isDownloadingCompleted == true) {
                                         val pp = rLocal.path.orEmpty()
                                         val downloadedFile = if (pp.isNotEmpty()) File(pp) else null
-                                        if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
-                                            channel.trySend(DownloadUpdate.Done(pp))
+                                        val doneOrFail = if (downloadedFile != null && downloadedFile.isFile && downloadedFile.length() > 0L) {
+                                            DownloadUpdate.Done(pp)
                                         } else {
-                                            channel.trySend(DownloadUpdate.Failed("File missing or empty after download"))
+                                            DownloadUpdate.Failed("File missing or empty after download")
                                         }
-                                        channel.close()
+                                        terminal.complete(doneOrFail)
+                                        progressChannel.close()
                                     } else if (rLocal != null && !rLocal.isDownloadingActive && !rLocal.canBeDownloaded) {
-                                        channel.trySend(DownloadUpdate.Failed("File cannot be downloaded"))
-                                        channel.close()
+                                        terminal.complete(DownloadUpdate.Failed("File cannot be downloaded"))
+                                        progressChannel.close()
                                     }
                                 }
                             }
                         } catch (t: Throwable) {
                             Log.w("TDLib download result error", t)
-                            channel.trySend(DownloadUpdate.Failed(t.message ?: "Download callback error"))
-                            channel.close()
+                            terminal.complete(DownloadUpdate.Failed(t.message ?: "Download callback error"))
+                            progressChannel.close()
                         }
                     },
                     { t ->
                         Log.w("TDLib download request exception", t)
-                        channel.trySend(DownloadUpdate.Failed(t.message ?: "Download failed"))
-                        channel.close()
+                        terminal.complete(DownloadUpdate.Failed(t.message ?: "Download failed"))
+                        progressChannel.close()
                     },
                 )
-                withTimeoutOrNull(5 * 60 * 1000L) {
-                    for (upd in channel) {
-                        if (upd is DownloadUpdate.Done) completed = true
-                        emit(upd)
-                        if (upd is DownloadUpdate.Done || upd is DownloadUpdate.Failed) break
+                val stallTimeoutMs = 120_000L
+                var lastActivityAt = System.currentTimeMillis()
+                while (!terminal.isCompleted) {
+                    val remaining = (stallTimeoutMs - (System.currentTimeMillis() - lastActivityAt)).coerceAtLeast(1_000L)
+                    val step = withTimeoutOrNull(remaining) {
+                        select<DownloadUpdate?> {
+                            terminal.onAwait { it }
+                            progressChannel.onReceiveCatching { res -> res.getOrNull() }
+                        }
                     }
-                } ?: emit(DownloadUpdate.Failed("Download timed out"))
+                    if (step == null) {
+                        if (terminal.isCompleted) break
+                        emit(DownloadUpdate.Failed("Download stalled"))
+                        break
+                    }
+                    lastActivityAt = System.currentTimeMillis()
+                    if (step is DownloadUpdate.Done) {
+                        completed = true
+                        emit(step)
+                        break
+                    }
+                    if (step is DownloadUpdate.Failed) {
+                        emit(step)
+                        break
+                    }
+                    emit(step)
+                }
+                if (!completed && terminal.isCompleted) {
+                    val finalUpd = terminal.await()
+                    if (finalUpd is DownloadUpdate.Done) completed = true
+                    emit(finalUpd)
+                }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 emit(DownloadUpdate.Failed(t.message ?: "Download failed"))
             } finally {
                 unregisterFileHandler(downloadHandlers, file.id, dlHandler)
-                channel.close()
-                if (!completed) {
+                progressChannel.close()
+                if (!completed && downloadHandlers[file.id].isNullOrEmpty()) {
                     try { activeClient.send(TdApi.CancelDownloadFile(file.id, false)) { } } catch (_: Throwable) {}
                 }
             }

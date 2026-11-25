@@ -33,4 +33,5 @@ dependencies {
     testImplementation(libs.coroutines.test)
     testImplementation(libs.truth)
     testImplementation(libs.turbine)
+    testImplementation(libs.org.json)
 }

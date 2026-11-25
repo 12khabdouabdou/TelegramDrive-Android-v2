@@ -37,6 +37,7 @@ data class ReclaimableFile(
     val displayName: String,
     val size: Long,
     val syncedAt: Long,
+    val lastModified: Long = 0L,
     val mimeType: String? = null,
     val sha256: String? = null,
     val verifiedInCloud: Boolean = false,
@@ -83,6 +84,21 @@ internal object FreeUpSpacePolicy {
     ): Boolean {
         if (!verifyEnabled || expectedSha.isNullOrBlank()) return true
         return actualSha != null && actualSha.equals(expectedSha, ignoreCase = true)
+    }
+
+    fun matchesUnchangedMetadata(
+        expectedSize: Long,
+        expectedLastModified: Long,
+        actualSize: Long,
+        actualLastModified: Long,
+    ): Boolean {
+        if (actualSize < 0L || actualSize != expectedSize) return false
+        if (expectedLastModified > 0L && actualLastModified > 0L &&
+            kotlin.math.abs(actualLastModified - expectedLastModified) > 2_000L
+        ) {
+            return false
+        }
+        return true
     }
 }
 
@@ -231,6 +247,7 @@ class FreeUpSpaceViewModel @Inject constructor(
                         displayName = name,
                         size = length,
                         syncedAt = entry.syncedAt,
+                        lastModified = doc.lastModified().coerceAtLeast(0L),
                         mimeType = mime,
                         sha256 = entry.sha256,
                         verifiedInCloud = cached != null,
@@ -250,6 +267,7 @@ class FreeUpSpaceViewModel @Inject constructor(
                         displayName = file.name,
                         size = if (entry.size > 0L) entry.size else file.length(),
                         syncedAt = entry.syncedAt,
+                        lastModified = file.lastModified().coerceAtLeast(0L),
                         mimeType = mime,
                         sha256 = entry.sha256,
                         verifiedInCloud = cached != null,
@@ -292,12 +310,32 @@ class FreeUpSpaceViewModel @Inject constructor(
                         skippedModified++
                         continue
                     }
-                    if (current.verifyShaBeforeDelete && !item.sha256.isNullOrBlank()) {
-                        val actualSha = sha256Calculator.compute(item.localPath)
-                        if (!FreeUpSpacePolicy.shouldDeleteAfterShaCheck(true, item.sha256, actualSha)) {
-                            Log.w("FreeUpSpace: skipping ${item.displayName} (SHA mismatch or unreadable local file)")
-                            skippedModified++
-                            continue
+                    if (current.verifyShaBeforeDelete) {
+                        if (!item.sha256.isNullOrBlank()) {
+                            val actualSha = sha256Calculator.compute(item.localPath)
+                            if (!FreeUpSpacePolicy.shouldDeleteAfterShaCheck(true, item.sha256, actualSha)) {
+                                Log.w("FreeUpSpace: skipping ${item.displayName} (SHA mismatch or unreadable local file)")
+                                skippedModified++
+                                continue
+                            }
+                        } else {
+                            val (actualSize, actualMod) = if (item.localPath.startsWith("content://")) {
+                                val uri = runCatching { Uri.parse(item.localPath) }.getOrNull()
+                                val doc = uri?.let { runCatching { DocumentFile.fromSingleUri(ctx, it) }.getOrNull() }
+                                if (doc != null && doc.exists()) {
+                                    doc.length().coerceAtLeast(0L) to doc.lastModified().coerceAtLeast(0L)
+                                } else {
+                                    -1L to 0L
+                                }
+                            } else {
+                                val f = File(item.localPath)
+                                if (f.isFile) f.length() to f.lastModified().coerceAtLeast(0L) else -1L to 0L
+                            }
+                            if (!FreeUpSpacePolicy.matchesUnchangedMetadata(item.size, item.lastModified, actualSize, actualMod)) {
+                                Log.w("FreeUpSpace: skipping ${item.displayName} (local size/mtime changed since sync)")
+                                skippedModified++
+                                continue
+                            }
                         }
                     }
 

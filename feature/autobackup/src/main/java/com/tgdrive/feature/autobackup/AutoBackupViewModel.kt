@@ -447,8 +447,8 @@ class AutoBackupViewModel @Inject constructor(
         return scheduler.runNow(manual = true) != null
     }
 
-    fun retryFailed(paths: List<String>): Boolean {
-        return scheduler.retryFailed(paths) != null
+    fun retryFailed(paths: List<String>, sourceJobId: String? = null): Boolean {
+        return scheduler.retryFailed(paths, sourceJobId = sourceJobId) != null
     }
 
     fun cancelActive() {

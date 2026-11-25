@@ -41,7 +41,9 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
 data class SettingsUiState(
@@ -61,9 +63,9 @@ data class SettingsUiState(
     val vaultKeyFingerprint: String = "",
     val decryptedTempTtlMinutes: Int = 30,
     val manualUploadWifiOnly: Boolean = false,
-    val biometricTimeoutSeconds: Int = 0,
+    val biometricTimeoutSeconds: Int = 60,
     val blockScreenshotsEverywhere: Boolean = false,
-    val showEncryptedPreviewsWhenUnlocked: Boolean = true,
+    val showEncryptedPreviewsWhenUnlocked: Boolean = false,
     val downloadConcurrency: Int = 2,
     val downloadWifiOnly: Boolean = false,
     val autoSaveDownloadsToPublic: Boolean = false,
@@ -320,126 +322,112 @@ class SettingsViewModel @Inject constructor(
      * so navigation away from `"main"` never cancels mid-cleanup, and logs out
      * TDLib cleanly before removing session files.
      */
+    private val loggingOut = AtomicBoolean(false)
+
     fun logout() {
+        if (!loggingOut.compareAndSet(false, true)) return
         CoroutineScope(SupervisorJob() + dispatchers.io).launch {
-            withContext(NonCancellable) {
-                Log.i("SettingsViewModel: starting full logout")
+            try {
+                withContext(NonCancellable) {
+                    Log.i("SettingsViewModel: starting full logout")
 
-                // 1. Stop background workers, clear pins BEFORE clearing download queue, and stop audio playback.
-                try { WorkManager.getInstance(appContext).cancelAllWork() } catch (t: Throwable) {
-                    Log.w("logout: cancelAllWork failed", t)
-                }
-                try { offlinePinStore.clearAll() } catch (t: Throwable) {
-                    Log.w("logout: offlinePinStore.clearAll failed", t)
-                }
-                try { uploadManager.cancelAll() } catch (t: Throwable) {
-                    Log.w("logout: uploadManager.cancelAll failed", t)
-                }
-                try { downloadManager.clearCache() } catch (t: Throwable) {
-                    Log.w("logout: downloadManager.clearCache failed", t)
-                }
-                try { cloudSyncManager.clearInMemoryState() } catch (t: Throwable) {
-                    Log.w("logout: cloudSyncManager.clearInMemoryState failed", t)
-                }
-                try { audioPlayerController.release() } catch (t: Throwable) {
-                    Log.w("logout: audio release failed", t)
-                }
-
-                // 2. Ask TDLib to clear cache & log out BEFORE deleting session directory.
-                try { telegramClient.clearDownloadCache() } catch (t: Throwable) {
-                    Log.w("logout: clearDownloadCache failed", t)
-                }
-                try { telegramClient.logout() } catch (t: Throwable) {
-                    Log.w("logout: telegramClient.logout failed", t)
-                }
-
-                // 3. Clear Room tables.
-                try { folderDao.clear() } catch (t: Throwable) { Log.w("logout: folderDao.clear failed", t) }
-                try { fileCacheDao.clear() } catch (t: Throwable) { Log.w("logout: fileCacheDao.clear failed", t) }
-                try { syncedFileDao.clear() } catch (t: Throwable) { Log.w("logout: syncedFileDao.clear failed", t) }
-                try { syncLogDao.clear() } catch (t: Throwable) { Log.w("logout: syncLogDao.clear failed", t) }
-                try { zipEntryDao.clear() } catch (t: Throwable) { Log.w("logout: zipEntryDao.clear failed", t) }
-                try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
-                try { albumDao.clear() } catch (t: Throwable) { Log.w("logout: albumDao.clear failed", t) }
-                try { pendingUploadDao.clear() } catch (t: Throwable) { Log.w("logout: pendingUploadDao.clear failed", t) }
-
-                // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
-                try {
-                    val tdlibDir = File(appContext.filesDir, "tgdrive_tdlib")
-                    if (tdlibDir.exists()) {
-                        tdlibDir.deleteRecursively()
+                    // 1. Stop background workers, clear pins BEFORE clearing download queue, and stop audio playback.
+                    try { WorkManager.getInstance(appContext).cancelAllWork() } catch (t: Throwable) {
+                        Log.w("logout: cancelAllWork failed", t)
                     }
-                } catch (t: Throwable) {
-                    Log.w("logout: could not delete TDLib session dir", t)
-                }
-                try { keystore.clear() } catch (t: Throwable) { Log.w("logout: keystore.clear failed", t) }
-                try {
-                    preferences.update {
-                        it.copy(
-                            biometricLockEnabled = false,
-                            biometricLastBgTime = 0L,
-                            backupEnabled = false,
-                            backupFolderUris = emptySet(),
-                            backupTargetFolderId = -1L,
-                            backupPaused = false,
-                            backupStrictMode = false,
-                            backupDeleteAfterUpload = false,
-                            backupZipIncremental = false,
-                            backupEncryptAll = false,
-                            backupUseCustomPassphrase = false,
-                            backupFolderTargetsJson = "{}",
-                            recentSearchQueries = "",
-                            lastCloudSyncMs = 0L,
-                            decryptedTempTtlMinutes = 30,
-                            manualUploadWifiOnly = false,
-                            biometricTimeoutSeconds = 0,
-                            blockScreenshotsEverywhere = false,
-                            showEncryptedPreviewsWhenUnlocked = true,
-                            downloadConcurrency = 2,
-                            downloadWifiOnly = false,
-                            autoSaveDownloadsToPublic = false,
-                        )
+                    try { offlinePinStore.clearAll() } catch (t: Throwable) {
+                        Log.w("logout: offlinePinStore.clearAll failed", t)
                     }
-                } catch (t: Throwable) {
-                    Log.w("logout: preferences clear failed", t)
-                }
+                    try { uploadManager.cancelAll() } catch (t: Throwable) {
+                        Log.w("logout: uploadManager.cancelAll failed", t)
+                    }
+                    try { downloadManager.clearCache() } catch (t: Throwable) {
+                        Log.w("logout: downloadManager.clearCache failed", t)
+                    }
+                    try { cloudSyncManager.clearInMemoryState() } catch (t: Throwable) {
+                        Log.w("logout: cloudSyncManager.clearInMemoryState failed", t)
+                    }
+                    try { audioPlayerController.release() } catch (t: Throwable) {
+                        Log.w("logout: audio release failed", t)
+                    }
 
-                // 5. Purge all local cache / staging directories.
-                try { decryptedTempSweeper.wipeAll() } catch (_: Throwable) {}
-                for (
-                    dirName in listOf(
-                        "backup_staging",
-                        "upload_staging",
-                        "decrypted",
-                        "downloads",
-                        "image_cache",
-                        "zip_extracts",
-                        "share_staging",
-                        "pdf_thumbs",
-                        "zip_thumbs",
-                        "cloud_sync",
-                        "media_thumbs",
-                        "minithumbs",
-                        "upload_thumbs",
-                        "encrypted_thumbs",
-                        "vault_sync",
-                        "text_edits",
-                        "crop_tmp",
-                        "scan_tmp",
-                    )
-                ) {
-                    try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
-                }
-                try {
-                    appContext.cacheDir.listFiles()?.forEach { f ->
-                        if (f.name.startsWith("zip_export_")) {
-                            runCatching { f.deleteRecursively() }
+                    // 2. Ask TDLib to clear cache & log out BEFORE deleting session directory.
+                    try {
+                        withTimeoutOrNull(5_000L) { telegramClient.clearDownloadCache() }
+                    } catch (t: Throwable) {
+                        Log.w("logout: clearDownloadCache failed", t)
+                    }
+                    try {
+                        withTimeoutOrNull(5_000L) { telegramClient.logout() }
+                    } catch (t: Throwable) {
+                        Log.w("logout: telegramClient.logout failed", t)
+                    }
+
+                    // 3. Clear Room tables.
+                    try { folderDao.clear() } catch (t: Throwable) { Log.w("logout: folderDao.clear failed", t) }
+                    try { fileCacheDao.clear() } catch (t: Throwable) { Log.w("logout: fileCacheDao.clear failed", t) }
+                    try { syncedFileDao.clear() } catch (t: Throwable) { Log.w("logout: syncedFileDao.clear failed", t) }
+                    try { syncLogDao.clear() } catch (t: Throwable) { Log.w("logout: syncLogDao.clear failed", t) }
+                    try { zipEntryDao.clear() } catch (t: Throwable) { Log.w("logout: zipEntryDao.clear failed", t) }
+                    try { trashEntryDao.clear() } catch (t: Throwable) { Log.w("logout: trashEntryDao.clear failed", t) }
+                    try { albumDao.clear() } catch (t: Throwable) { Log.w("logout: albumDao.clear failed", t) }
+                    try { pendingUploadDao.clear() } catch (t: Throwable) { Log.w("logout: pendingUploadDao.clear failed", t) }
+
+                    // 4. Delete TDLib directory, Keystore secrets, and reset DataStore preferences.
+                    try {
+                        val tdlibDir = File(appContext.filesDir, "tgdrive_tdlib")
+                        if (tdlibDir.exists()) {
+                            tdlibDir.deleteRecursively()
                         }
+                    } catch (t: Throwable) {
+                        Log.w("logout: could not delete TDLib session dir", t)
                     }
-                } catch (_: Throwable) {}
+                    try { keystore.clear() } catch (t: Throwable) { Log.w("logout: keystore.clear failed", t) }
+                    try {
+                        preferences.resetUserSession()
+                    } catch (t: Throwable) {
+                        Log.w("logout: preferences clear failed", t)
+                    }
 
-                _credsVersion.value += 1
-                Log.i("SettingsViewModel: logout complete")
+                    // 5. Purge all local cache / staging directories.
+                    try { decryptedTempSweeper.wipeAll() } catch (_: Throwable) {}
+                    for (
+                        dirName in listOf(
+                            "backup_staging",
+                            "upload_staging",
+                            "decrypted",
+                            "downloads",
+                            "image_cache",
+                            "zip_extracts",
+                            "share_staging",
+                            "pdf_thumbs",
+                            "zip_thumbs",
+                            "cloud_sync",
+                            "media_thumbs",
+                            "minithumbs",
+                            "upload_thumbs",
+                            "encrypted_thumbs",
+                            "vault_sync",
+                            "text_edits",
+                            "crop_tmp",
+                            "scan_tmp",
+                        )
+                    ) {
+                        try { File(appContext.cacheDir, dirName).deleteRecursively() } catch (_: Throwable) {}
+                    }
+                    try {
+                        appContext.cacheDir.listFiles()?.forEach { f ->
+                            if (f.name.startsWith("zip_export_")) {
+                                runCatching { f.deleteRecursively() }
+                            }
+                        }
+                    } catch (_: Throwable) {}
+
+                    _credsVersion.value += 1
+                    Log.i("SettingsViewModel: logout complete")
+                }
+            } finally {
+                loggingOut.set(false)
             }
         }
     }

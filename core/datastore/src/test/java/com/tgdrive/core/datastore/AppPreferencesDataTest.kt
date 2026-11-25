@@ -94,4 +94,30 @@ class AppPreferencesDataTest {
         assertThat(globalPrefs.isFolderEncrypted("content://folder/a")).isTrue()
         assertThat(globalPrefs.isFolderEncrypted("content://folder/b")).isTrue()
     }
+
+    @Test
+    fun `folder target JSON roundtrips special characters removal and malformed fallback`() {
+        val trickyUri = "content://com.android.externalstorage/tree/primary%3AMy \"Docs\"\\2026"
+        val secondUri = "content://folder/photos"
+
+        val updated = AppPreferencesData(backupTargetFolderId = -1L)
+            .withFolderTarget(trickyUri, -1001234567890L)
+            .withFolderTarget(secondUri, -1009999999999L)
+
+        assertThat(updated.parseFolderTargets()).containsExactly(
+            trickyUri,
+            -1001234567890L,
+            secondUri,
+            -1009999999999L,
+        )
+        assertThat(updated.customTargetFor(trickyUri)).isEqualTo(-1001234567890L)
+        assertThat(updated.targetFolderFor("content://folder/unmapped")).isEqualTo(-1L)
+
+        val removed = updated.withFolderTarget(trickyUri, null)
+        assertThat(removed.customTargetFor(trickyUri)).isNull()
+        assertThat(removed.parseFolderTargets()).containsExactly(secondUri, -1009999999999L)
+
+        val malformed = AppPreferencesData(backupFolderTargetsJson = "{not valid json")
+        assertThat(malformed.parseFolderTargets()).isEmpty()
+    }
 }

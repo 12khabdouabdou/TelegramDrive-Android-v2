@@ -1,10 +1,12 @@
 package com.tgdrive.core.datastore
 
 import android.content.Context
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -29,7 +31,10 @@ import javax.inject.Singleton
  */
 
 // Single DataStore instance for the process.
-private val Context.appStore by preferencesDataStore("tgdrive_prefs")
+private val Context.appStore by preferencesDataStore(
+    name = "tgdrive_prefs",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 enum class BackupSchedule { ON_CHANGE, DAILY, WEEKLY, MANUAL }
@@ -148,50 +153,33 @@ data class AppPreferencesData(
     companion object {
         private fun encodeLongMap(map: Map<String, Long>): String {
             if (map.isEmpty()) return "{}"
-            return buildString {
-                append('{')
-                map.entries.forEachIndexed { idx, (k, v) ->
-                    if (idx > 0) append(',')
-                    append('"')
-                    append(k.replace("\\", "\\\\").replace("\"", "\\\""))
-                    append("\":")
-                    append(v)
-                }
-                append('}')
-            }
+            val obj = org.json.JSONObject()
+            map.forEach { (k, v) -> obj.put(k, v) }
+            return obj.toString()
         }
 
         private fun decodeLongMap(json: String): Map<String, Long> {
             val trimmed = json.trim()
-            if (trimmed.length < 2 || !trimmed.startsWith('{') || !trimmed.endsWith('}')) return emptyMap()
-            val body = trimmed.substring(1, trimmed.length - 1).trim()
-            if (body.isEmpty()) return emptyMap()
-            val result = LinkedHashMap<String, Long>()
-            var i = 0
-            while (i < body.length) {
-                while (i < body.length && (body[i] == ',' || body[i].isWhitespace())) i++
-                if (i >= body.length || body[i] != '"') break
-                i++
-                val keySb = StringBuilder()
-                while (i < body.length) {
-                    val c = body[i++]
-                    if (c == '\\' && i < body.length) {
-                        keySb.append(body[i++])
-                    } else if (c == '"') {
-                        break
-                    } else {
-                        keySb.append(c)
+            if (trimmed.isEmpty() || trimmed == "{}") return emptyMap()
+            return try {
+                val obj = org.json.JSONObject(trimmed)
+                val result = LinkedHashMap<String, Long>(obj.length())
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val parsedVal = when (val raw = obj.opt(k)) {
+                        is Number -> raw.toLong()
+                        is String -> raw.toLongOrNull()
+                        else -> null
+                    }
+                    if (parsedVal != null) {
+                        result[k] = parsedVal
                     }
                 }
-                while (i < body.length && (body[i] == ':' || body[i].isWhitespace())) i++
-                val numStart = i
-                while (i < body.length && (body[i] == '-' || body[i].isDigit())) i++
-                val parsedVal = body.substring(numStart, i).toLongOrNull()
-                if (parsedVal != null) {
-                    result[keySb.toString()] = parsedVal
-                }
+                result
+            } catch (_: Throwable) {
+                emptyMap()
             }
-            return result
         }
     }
 }
@@ -282,6 +270,15 @@ class AppPreferences @Inject constructor(
             val current = prefs.toDomain()
             val next = transform(current)
             prefs.fromDomain(next)
+        }
+    }
+
+    suspend fun resetUserSession() {
+        update { current ->
+            AppPreferencesData(
+                themeMode = current.themeMode,
+                onboardingCompleted = current.onboardingCompleted,
+            )
         }
     }
 

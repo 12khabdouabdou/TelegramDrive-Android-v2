@@ -130,8 +130,14 @@ class BackupOrchestrator @Inject constructor(
                         }
                     }
                     val pauseWatcher = launch {
+                        var sawUnpaused = false
                         preferences.data.collect { p ->
-                            val shouldCancel = if (isManual) p.backupPaused else (!p.backupEnabled || p.backupPaused)
+                            val shouldCancel = if (isManual) {
+                                if (!p.backupPaused) sawUnpaused = true
+                                sawUnpaused && p.backupPaused
+                            } else {
+                                !p.backupEnabled || p.backupPaused
+                            }
                             if (shouldCancel) {
                                 Log.i("BackupOrchestrator: watcher detected pause/disable — cancelling parent job")
                                 pj.cancel()
@@ -538,12 +544,18 @@ class BackupOrchestrator @Inject constructor(
                         null
                     }
 
+                var sawUnpausedInFileLoop = false
                 try {
                     for ((i, file) in eligibleToUpload.withIndex()) {
                         ensureNotCancelled(jobId)
 
                         val livePrefs = preferences.data.first()
-                        val shouldAbort = livePrefs.backupPaused || (!isManual && !livePrefs.backupEnabled)
+                        if (!livePrefs.backupPaused) sawUnpausedInFileLoop = true
+                        val shouldAbort = if (isManual) {
+                            sawUnpausedInFileLoop && livePrefs.backupPaused
+                        } else {
+                            livePrefs.backupPaused || !livePrefs.backupEnabled
+                        }
                         if (shouldAbort) {
                             abortedMidLoop = true
                             finalize(
@@ -999,11 +1011,17 @@ class BackupOrchestrator @Inject constructor(
         val maxPartBytes = runCatching { telegramClient.safeZipChunkLimitBytes() }
             .getOrDefault(TelegramClient.SAFE_CHUNK_LIMIT_STANDARD)
 
+        var sawUnpausedInZipLoop = false
         for ((i, folderUri) in folderUris.withIndex()) {
             ensureNotCancelled(jobId)
 
             val currentPrefs = preferences.data.first()
-            val shouldAbort = currentPrefs.backupPaused || (!isManual && !currentPrefs.backupEnabled)
+            if (!currentPrefs.backupPaused) sawUnpausedInZipLoop = true
+            val shouldAbort = if (isManual) {
+                sawUnpausedInZipLoop && currentPrefs.backupPaused
+            } else {
+                currentPrefs.backupPaused || !currentPrefs.backupEnabled
+            }
             if (shouldAbort) {
                 finalize(
                     jobId, startedAt, filesScanned, filesPackedAndUploaded, filesSkipped,
@@ -1027,7 +1045,7 @@ class BackupOrchestrator @Inject constructor(
             val folderName = folderNameByUri[folderUri] ?: fallbackFolderName(folderUri)
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(java.util.Date())
             val zipBaseName = if (prefs.backupZipIncremental) "${folderName}_inc_$timestamp" else "${folderName}_$timestamp"
-            val folderPrefTarget = prefs.targetFolderFor(folderUri)
+            val folderPrefTarget = overrideTargetFolderId ?: prefs.targetFolderFor(folderUri)
             val destChatId = resolveTargetCached(folderPrefTarget)
             val encryptZip = prefs.isFolderEncrypted(folderUri)
             val zipPassword = if (encryptZip) backupCrypto.activeBackupZipPassword(prefs.backupUseCustomPassphrase) else null
@@ -1172,7 +1190,7 @@ class BackupOrchestrator @Inject constructor(
                     )
                     manifestFile = mFile
                     val mSize = mFile.length()
-                    val mResult = telegramClient.uploadFile(
+                    val mResult = uploadWithFloodWaitRetry(
                         chatId = destChatId,
                         localPath = mFile.absolutePath,
                         fileName = mFile.name,

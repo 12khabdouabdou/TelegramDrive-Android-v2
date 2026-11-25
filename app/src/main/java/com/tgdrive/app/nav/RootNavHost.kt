@@ -405,9 +405,8 @@ fun RootNavHost(
         }
     }
 
-    if (state.isAuthorized) {
-        AudioPlayerScaffold(content = navContent)
-    } else {
-        navContent()
-    }
+    AudioPlayerScaffold(
+        showMiniPlayer = state.isAuthorized,
+        content = navContent,
+    )
 }

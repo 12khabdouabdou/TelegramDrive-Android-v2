@@ -1,8 +1,10 @@
 package com.tgdrive.core.audio
 
 import android.content.Context
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -140,6 +142,8 @@ class AudioPlayerController @Inject constructor(
         return AudioMediaNotification(
             appContext = appContext,
             onPlayPause = ::togglePlayPause,
+            onPlay = ::play,
+            onPause = ::pause,
             onNext = ::playNext,
             onPrevious = ::playPrevious,
             onStop = ::release,
@@ -152,8 +156,12 @@ class AudioPlayerController @Inject constructor(
         if (_state.value.isPlaying && _state.value.path != null) {
             runCatching {
                 appContext.startForegroundService(
-                    android.content.Intent(appContext, AudioPlaybackService::class.java),
+                    Intent(appContext, AudioPlaybackService::class.java),
                 )
+            }
+        } else {
+            runCatching {
+                appContext.stopService(Intent(appContext, AudioPlaybackService::class.java))
             }
         }
     }
@@ -164,12 +172,16 @@ class AudioPlayerController @Inject constructor(
     @Volatile
     private var lastNotification: android.app.Notification? = null
 
+    @Volatile
+    private var sleepTimerDeadlineElapsedMs: Long = 0L
+
     private val sleepTickRunnable = object : Runnable {
         override fun run() {
-            val cur = _state.value
-            if (cur.sleepTimerRemainingMs <= 0L) return
-            val next = AudioQueueLogic.tickSleepTimerRemaining(cur.sleepTimerRemainingMs, 1_000L)
+            val deadline = sleepTimerDeadlineElapsedMs
+            if (deadline <= 0L) return
+            val next = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
             if (next <= 0L) {
+                sleepTimerDeadlineElapsedMs = 0L
                 _state.update { it.copy(sleepTimerRemainingMs = 0L, isPlaying = false) }
                 runOnMain {
                     runCatching { exoPlayer?.pause() }
@@ -233,8 +245,8 @@ class AudioPlayerController @Inject constructor(
                 Log.w("AudioPlayerController: ExoPlayer error", error)
                 cachedPositionMs = 0L
                 cachedDurationMs = 1L
-                _state.update { AudioState(playbackSpeed = it.playbackSpeed, repeatAll = it.repeatAll) }
-                mediaNotification?.dismiss()
+                _state.update { it.copy(isPlaying = false) }
+                runOnMain { syncNotification() }
             }
         })
         exoPlayer = created
@@ -250,19 +262,16 @@ class AudioPlayerController @Inject constructor(
     fun playQueue(tracks: List<AudioTrack>, startIndex: Int = 0) {
         val (deduped, mappedIndex) = AudioQueueLogic.deduplicateQueue(tracks, startIndex)
         if (deduped.isEmpty()) return
-        val speed = _state.value.playbackSpeed
-        val repeat = _state.value.repeatAll
+        val cur = _state.value
         val current = deduped[mappedIndex]
-        _state.value = AudioState(
+        _state.value = cur.copy(
             title = current.title,
             isPlaying = false,
             path = current.path,
             queue = deduped,
             currentIndex = mappedIndex,
-            playbackSpeed = speed,
-            repeatAll = repeat,
         )
-        loadAndStartTrack(current, speed)
+        loadAndStartTrack(current, cur.playbackSpeed)
     }
 
     /** Skip to the next track in the queue (or wrap around if repeat-all is enabled). */
@@ -363,29 +372,66 @@ class AudioPlayerController @Inject constructor(
             playTrackAtIndex(nextIdx)
         } else {
             _state.update { it.copy(queue = newQueue, currentIndex = nextIdx) }
-            syncNotification()
+            runOnMain { syncNotification() }
         }
     }
 
     fun setSleepTimerMinutes(minutes: Int) {
         mainHandler.removeCallbacks(sleepTickRunnable)
         if (minutes <= 0) {
+            sleepTimerDeadlineElapsedMs = 0L
             _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = false) }
             return
         }
         val totalMs = minutes.toLong() * 60_000L
+        sleepTimerDeadlineElapsedMs = SystemClock.elapsedRealtime() + totalMs
         _state.update { it.copy(sleepTimerRemainingMs = totalMs, sleepTimerEndOfTrack = false) }
         mainHandler.postDelayed(sleepTickRunnable, 1_000L)
     }
 
     fun setSleepTimerEndOfTrack() {
         mainHandler.removeCallbacks(sleepTickRunnable)
+        sleepTimerDeadlineElapsedMs = 0L
         _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = true) }
     }
 
     fun cancelSleepTimer() {
         mainHandler.removeCallbacks(sleepTickRunnable)
+        sleepTimerDeadlineElapsedMs = 0L
         _state.update { it.copy(sleepTimerRemainingMs = 0L, sleepTimerEndOfTrack = false) }
+    }
+
+    /** Explicitly start or resume playback without toggling off if already playing. */
+    fun play() {
+        if (_state.value.path == null) return
+        runOnMain {
+            val player = exoPlayer ?: return@runOnMain
+            try {
+                if (player.playbackState == Player.STATE_ENDED) {
+                    player.seekTo(0L)
+                    player.play()
+                } else if (!player.isPlaying) {
+                    player.play()
+                }
+            } catch (t: Throwable) {
+                Log.w("AudioPlayerController: play failed", t)
+            }
+        }
+    }
+
+    /** Explicitly pause playback without toggling on if already paused. */
+    fun pause() {
+        if (_state.value.path == null) return
+        runOnMain {
+            val player = exoPlayer ?: return@runOnMain
+            try {
+                if (player.isPlaying) {
+                    player.pause()
+                }
+            } catch (t: Throwable) {
+                Log.w("AudioPlayerController: pause failed", t)
+            }
+        }
     }
 
     /** Toggle play/pause. No-op if nothing is loaded. */

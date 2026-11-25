@@ -394,8 +394,9 @@ fun PdfViewerScreen(
                         )
                     }
                 }
-                if (!localPath.isNullOrBlank()) {
-                    IconButton(onClick = { openExternally(File(localPath!!)) }) {
+                val currentLocalPath = localPath
+                if (!currentLocalPath.isNullOrBlank()) {
+                    IconButton(onClick = { openExternally(File(currentLocalPath)) }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.OpenInNew,
                             contentDescription = stringResource(R.string.player_pdf_open_external),
@@ -403,7 +404,7 @@ fun PdfViewerScreen(
                         )
                     }
                     IconButton(onClick = {
-                        val src = File(localPath!!)
+                        val src = File(currentLocalPath)
                         scope.launch {
                             val saved = vm.saveFileToPublicDownloads(
                                 source = src,
@@ -420,7 +421,7 @@ fun PdfViewerScreen(
                         )
                     }
                     IconButton(onClick = {
-                        val file = File(localPath!!)
+                        val file = File(currentLocalPath)
                         if (file.exists()) {
                             runCatching {
                                 val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
@@ -717,6 +718,7 @@ fun PdfViewerScreen(
                     if (activeSession != null && path != null) {
                         LazyColumn(
                             state = listState,
+                            userScrollEnabled = scale <= 1.02f,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .pointerInput(messageId) {
@@ -752,7 +754,9 @@ fun PdfViewerScreen(
                                                         y = (offset.y + pan.y).coerceIn(-maxY, maxY),
                                                     )
                                                 }
-                                                if (pointerCount >= 2) {
+                                                if (pointerCount >= 2 ||
+                                                    (scale > 1.02f && (pan.getDistanceSquared() > 0.5f || kotlin.math.abs(zoom - 1f) > 0.001f))
+                                                ) {
                                                     event.changes.forEach { it.consume() }
                                                 }
                                             }

@@ -21,8 +21,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
@@ -677,8 +679,8 @@ fun SettingsScreen(
                 Button(
                     enabled = !state.cloudVaultBusy,
                     onClick = {
-                        if (passInput.trim().length < 4) {
-                            dialogErr = shortErr
+                        if (passInput.isBlank()) {
+                            dialogErr = "Recovery passphrase is required"
                         } else {
                             scope.launch {
                                 vm.restoreVaultKeyFromCloud(passInput.trim())
@@ -711,6 +713,8 @@ fun SettingsScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+            .navigationBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp),

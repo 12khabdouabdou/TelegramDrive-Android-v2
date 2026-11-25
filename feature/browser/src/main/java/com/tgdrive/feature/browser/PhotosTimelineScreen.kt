@@ -11,7 +11,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -628,7 +628,7 @@ fun PhotosTimelineScreen(
                                     }
                                     .pointerInput(selectionMode, state.columns) {
                                         if (selectionMode) {
-                                            detectDragGestures { change, _ ->
+                                            detectDragGesturesAfterLongPress { change, _ ->
                                                 val pos = change.position
                                                 val hit = gridState.layoutInfo.visibleItemsInfo.firstOrNull { info ->
                                                     val k = info.key as? String

@@ -213,7 +213,7 @@ private fun AuthField(
     placeholder: String = "",
     keyboardType: KeyboardType = KeyboardType.Text,
     imeAction: ImeAction = ImeAction.Done,
-    onImeAction: () -> Unit = {},
+    onImeAction: (() -> Unit)? = null,
     isPassword: Boolean = false,
     revealPassword: Boolean = false,
     onToggleReveal: (() -> Unit)? = null,
@@ -254,8 +254,8 @@ private fun AuthField(
             imeAction = imeAction,
         ),
         keyboardActions = KeyboardActions(
-            onDone = { onImeAction() },
-            onNext = { onImeAction() },
+            onDone = onImeAction?.let { fn -> { fn() } },
+            onNext = onImeAction?.let { fn -> { fn() } },
         ),
         shape = RoundedCornerShape(14.dp),
         colors = OutlinedTextFieldDefaults.colors(

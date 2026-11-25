@@ -325,10 +325,19 @@ class ZipBrowserViewModel
                                     dl == null ||
                                         dl.status == DownloadStatus.DONE ||
                                         dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.PAUSED ||
                                         dl.status == DownloadStatus.CANCELLED
                                 }
                             if (terminal?.status == DownloadStatus.DONE) {
                                 localPart = terminal.localPath?.let(::File)?.takeIf { it.isFile }
+                            } else if (terminal?.status == DownloadStatus.PAUSED && localPart == null) {
+                                _state.update {
+                                    it.copy(
+                                        reassemblingSplit = false,
+                                        error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
+                                    )
+                                }
+                                return@launch
                             }
                         }
                         if (localPart == null) {
@@ -429,6 +438,7 @@ class ZipBrowserViewModel
             entryName: String? = null,
             useSavedBackupPassphrase: Boolean = false,
             onFailurePromptNeeded: (() -> Unit)? = null,
+            onUnlocked: (() -> Unit)? = null,
         ) {
             val zipPath = currentZipPath ?: return
             val targetName = entryName
@@ -463,6 +473,7 @@ class ZipBrowserViewModel
                                 statusMessage = if (entryName == null) "Archive unlocked with Vault Key" else null,
                             )
                         }
+                        withContext(dispatchers.main) { onUnlocked?.invoke() }
                         return@launch
                     }
                 }
@@ -583,6 +594,8 @@ class ZipBrowserViewModel
                                 cachedPassword = pwd
                             }
                             break
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (t: Throwable) {
                             lastErr = t
                         }
@@ -608,13 +621,22 @@ class ZipBrowserViewModel
                             savedCount++
                         }
                     }
-                    val finalCount = if (savedCount > 0) savedCount else extractedFiles.size
-                    _state.update {
-                        it.copy(
-                            extractingAll = false,
-                            unlockedPassword = cachedPassword,
-                            statusMessage = "Extracted $finalCount file(s) to Downloads/$archiveName",
-                        )
+                    if (savedCount == 0 && extractedFiles.isNotEmpty()) {
+                        _state.update {
+                            it.copy(
+                                extractingAll = false,
+                                unlockedPassword = cachedPassword,
+                                error = "Failed to save extracted files to Downloads",
+                            )
+                        }
+                    } else {
+                        _state.update {
+                            it.copy(
+                                extractingAll = false,
+                                unlockedPassword = cachedPassword,
+                                statusMessage = "Extracted $savedCount file(s) to Downloads/$archiveName",
+                            )
+                        }
                     }
                 } catch (e: CancellationException) {
                     _state.update { it.copy(extractingAll = false) }
@@ -881,7 +903,6 @@ class ZipBrowserViewModel
         override fun onCleared() {
             super.onCleared()
             try {
-                File(appContext.cacheDir, "zip_extracts").deleteRecursively()
                 File(appContext.cacheDir, "split_stage").deleteRecursively()
                 File(appContext.cacheDir, "split_merged").deleteRecursively()
             } catch (_: Throwable) {}

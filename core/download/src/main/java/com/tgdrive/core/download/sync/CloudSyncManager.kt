@@ -462,13 +462,12 @@ class CloudSyncManager @Inject constructor(
     }
 
     private suspend fun buildLocalMetaSnapshot(): CloudSyncCodec.CloudMetaSnapshot {
-        val now = System.currentTimeMillis()
         val files = fileCacheDao.getAll()
         val filesByKey = files.associateBy { it.chatId to it.messageId }
         val stars = files.filter { it.isStarred }.map { f ->
             localStarTimestamps[f.chatId to f.messageId]
-                ?: CloudSyncCodec.CloudStarRecord(f.chatId, f.messageId, true, now)
-        } + localStarTimestamps.values.filter { !it.isStarred }
+                ?: CloudSyncCodec.CloudStarRecord(f.chatId, f.messageId, true, 0L)
+        } + localStarTimestamps.values.filter { !it.isStarred || (it.chatId to it.messageId) !in filesByKey }
 
         val renames = ArrayList<CloudSyncCodec.CloudRenameRecord>()
         renames.addAll(localRenameTimestamps.values)
@@ -838,15 +837,27 @@ class CloudSyncManager @Inject constructor(
         val cutoff = System.currentTimeMillis() - TRASH_RETENTION_MS
         val expired = runCatching { trashEntryDao.getOlderThan(cutoff) }.getOrDefault(emptyList())
         for (item in expired) {
+            var deletedRemotely = false
             try {
                 telegramClient.deleteMessage(item.chatId, item.messageId)
+                deletedRemotely = true
             } catch (e: CancellationException) {
                 throw e
             } catch (t: Throwable) {
-                Log.w("CloudSyncManager: failed deleting expired trash msg ${item.messageId}", t)
+                val msg = t.message.orEmpty()
+                if (msg.contains("not found", ignoreCase = true) ||
+                    msg.contains("MESSAGE_ID_INVALID", ignoreCase = true) ||
+                    msg.contains("400")
+                ) {
+                    deletedRemotely = true
+                } else {
+                    Log.w("CloudSyncManager: failed deleting expired trash msg ${item.messageId}", t)
+                }
             }
-            runCatching { trashEntryDao.deleteById(item.chatId, item.messageId) }
-            localTrashTombstones[item.chatId to item.messageId] = System.currentTimeMillis()
+            if (deletedRemotely) {
+                runCatching { trashEntryDao.deleteById(item.chatId, item.messageId) }
+                localTrashTombstones[item.chatId to item.messageId] = System.currentTimeMillis()
+            }
         }
     }
 

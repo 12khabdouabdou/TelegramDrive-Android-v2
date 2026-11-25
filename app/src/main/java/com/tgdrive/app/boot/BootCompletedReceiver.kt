@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import javax.inject.Inject
 
 /**
@@ -46,9 +47,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
 
         scope.launch {
             try {
-                backupScheduler.rescheduleIfEnabled()
-                scheduledUploadScheduler.rescheduleIfEnabled()
-                com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(context)
+                withTimeout(8_000L) {
+                    backupScheduler.rescheduleIfEnabled()
+                    scheduledUploadScheduler.rescheduleIfEnabled()
+                    com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(context)
+                }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {

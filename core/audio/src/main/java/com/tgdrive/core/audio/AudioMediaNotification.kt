@@ -23,6 +23,8 @@ import com.tgdrive.core.common.Log
 internal class AudioMediaNotification(
     private val appContext: Context,
     private val onPlayPause: () -> Unit,
+    private val onPlay: () -> Unit = onPlayPause,
+    private val onPause: () -> Unit = onPlayPause,
     private val onNext: () -> Unit,
     private val onPrevious: () -> Unit,
     private val onStop: () -> Unit,
@@ -49,8 +51,8 @@ internal class AudioMediaNotification(
             ensureChannel()
             val session = MediaSession(appContext, SESSION_TAG).apply {
                 setCallback(object : MediaSession.Callback() {
-                    override fun onPlay() = onPlayPause()
-                    override fun onPause() = onPlayPause()
+                    override fun onPlay() = this@AudioMediaNotification.onPlay()
+                    override fun onPause() = this@AudioMediaNotification.onPause()
                     override fun onSkipToNext() = onNext()
                     override fun onSkipToPrevious() = onPrevious()
                     override fun onStop() = this@AudioMediaNotification.onStop()

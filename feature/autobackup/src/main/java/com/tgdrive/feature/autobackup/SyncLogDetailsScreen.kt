@@ -124,7 +124,7 @@ fun SyncLogDetailsScreen(
                 SyncLogDetails(
                     entry = entry,
                     onRetryPaths = { paths ->
-                        vm.retryFailed(paths)
+                        vm.retryFailed(paths, sourceJobId = entry.jobId)
                         onBack()
                     },
                 )
@@ -185,7 +185,7 @@ private fun SyncLogDetails(
         else -> 0
     }
     val retryablePaths = remember(failedDetails) {
-        failedDetails.map { it.localPath }.filter { it.startsWith("content://") }
+        BackupFailureRecord.retryablePaths(failedDetails)
     }
 
     Column(

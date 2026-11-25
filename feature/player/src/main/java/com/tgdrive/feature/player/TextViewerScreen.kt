@@ -1,6 +1,7 @@
 package com.tgdrive.feature.player
 
 import android.content.Intent
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -46,11 +48,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -171,12 +175,13 @@ fun TextViewerScreen(
                 RandomAccessFile(file, "r").use { raf ->
                     raf.readFully(bytes)
                 }
-                val text = bytes.toString(Charsets.UTF_8)
+                val isTruncated = totalLen > MAX_INLINE_TEXT_BYTES
+                val text = decodeUtf8Safe(bytes, truncated = isTruncated)
                 LoadedTextContent(
                     lines = text.split('\n'),
                     fullText = text,
                     totalFileBytes = totalLen,
-                    truncated = totalLen > MAX_INLINE_TEXT_BYTES,
+                    truncated = isTruncated,
                 )
             }
         }
@@ -204,6 +209,11 @@ fun TextViewerScreen(
     var jsonPrettyMode by remember(resolvedTitle) { mutableStateOf(isJson) }
     var editMode by remember { mutableStateOf(false) }
     var editDraft by remember(content) { mutableStateOf(content?.fullText.orEmpty()) }
+    var showDiscardEditDialog by remember { mutableStateOf(false) }
+    val hasUnsavedEdits = editMode && editDraft != content?.fullText.orEmpty()
+    BackHandler(enabled = hasUnsavedEdits) {
+        showDiscardEditDialog = true
+    }
     val navPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val filteredLines = remember(content, query) {
         val all = content?.lines ?: emptyList()
@@ -234,7 +244,13 @@ fun TextViewerScreen(
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onBack) {
+                IconButton(onClick = {
+                    if (hasUnsavedEdits) {
+                        showDiscardEditDialog = true
+                    } else {
+                        onBack()
+                    }
+                }) {
                     Icon(
                         Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = stringResource(R.string.player_back),
@@ -280,8 +296,12 @@ fun TextViewerScreen(
                         IconButton(onClick = {
                             if (!editMode) {
                                 editDraft = content!!.fullText
+                                editMode = true
+                            } else if (hasUnsavedEdits) {
+                                showDiscardEditDialog = true
+                            } else {
+                                editMode = false
                             }
-                            editMode = !editMode
                         }) {
                             Icon(
                                 imageVector = Icons.Filled.Edit,
@@ -407,6 +427,13 @@ fun TextViewerScreen(
                                     mimeType = cachedEntry?.mimeType,
                                     encryptWithVaultKey = isEncryptedSource,
                                 )
+                                val updatedText = editDraft
+                                content = content?.let { cur ->
+                                    cur.copy(
+                                        lines = updatedText.split('\n'),
+                                        fullText = updatedText,
+                                    )
+                                }
                                 editMode = false
                                 scope.launch { snackbarHostState.showSnackbar(uploadQueuedMsg) }
                             }) {
@@ -450,22 +477,36 @@ fun TextViewerScreen(
                         )
                     }
                     loaded != null && isMarkdown && markdownMode -> {
-                        val renderedMd = remember(loaded.fullText) { renderSimpleMarkdown(loaded.fullText) }
-                        SelectionContainer {
-                            LazyColumn(
-                                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                                    top = 8.dp,
-                                    bottom = navPad + 24.dp,
-                                ),
-                            ) {
-                                item {
-                                    Text(
-                                        text = renderedMd,
-                                        fontSize = fontSizeSp.sp,
-                                        lineHeight = (fontSizeSp + 7f).sp,
-                                        color = MaterialTheme.colorScheme.onBackground,
-                                    )
+                        val renderedMd by produceState<AnnotatedString?>(
+                            initialValue = null,
+                            key1 = loaded.fullText,
+                        ) {
+                            value = withContext(Dispatchers.Default) {
+                                renderSimpleMarkdown(loaded.fullText)
+                            }
+                        }
+                        if (renderedMd == null) {
+                            CircularProgressIndicator(
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.align(Alignment.Center),
+                            )
+                        } else {
+                            SelectionContainer {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                        top = 8.dp,
+                                        bottom = navPad + 24.dp,
+                                    ),
+                                ) {
+                                    item {
+                                        Text(
+                                            text = renderedMd!!,
+                                            fontSize = fontSizeSp.sp,
+                                            lineHeight = (fontSizeSp + 7f).sp,
+                                            color = MaterialTheme.colorScheme.onBackground,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -474,26 +515,40 @@ fun TextViewerScreen(
                         val keyColor = MaterialTheme.colorScheme.primary
                         val strColor = MaterialTheme.colorScheme.tertiary
                         val numColor = MaterialTheme.colorScheme.secondary
-                        val highlighted = remember(loaded.fullText, keyColor, strColor, numColor) {
-                            highlightJsonText(prettyPrintJson(loaded.fullText), keyColor, strColor, numColor)
+                        val highlighted by produceState<AnnotatedString?>(
+                            initialValue = null,
+                            key1 = loaded.fullText,
+                            key2 = keyColor,
+                            key3 = strColor,
+                        ) {
+                            value = withContext(Dispatchers.Default) {
+                                highlightJsonText(prettyPrintJson(loaded.fullText), keyColor, strColor, numColor)
+                            }
                         }
-                        SelectionContainer {
-                            LazyColumn(
-                                modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                                    top = 8.dp,
-                                    bottom = navPad + 24.dp,
-                                ),
-                            ) {
-                                item {
-                                    Text(
-                                        text = highlighted,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = fontSizeSp.sp,
-                                        lineHeight = (fontSizeSp + 6f).sp,
-                                        softWrap = wrapLines,
-                                        color = MaterialTheme.colorScheme.onBackground,
-                                    )
+                        if (highlighted == null) {
+                            CircularProgressIndicator(
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.align(Alignment.Center),
+                            )
+                        } else {
+                            SelectionContainer {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                        top = 8.dp,
+                                        bottom = navPad + 24.dp,
+                                    ),
+                                ) {
+                                    item {
+                                        Text(
+                                            text = highlighted!!,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = fontSizeSp.sp,
+                                            lineHeight = (fontSizeSp + 6f).sp,
+                                            softWrap = wrapLines,
+                                            color = MaterialTheme.colorScheme.onBackground,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -614,10 +669,56 @@ fun TextViewerScreen(
             }
         }
     }
+
+    if (showDiscardEditDialog) {
+        AlertDialog(
+            onDismissRequest = { showDiscardEditDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.player_text_discard_title)) },
+            text = { Text(stringResource(R.string.player_text_discard_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDiscardEditDialog = false
+                    editDraft = content?.fullText.orEmpty()
+                    editMode = false
+                }) {
+                    Text(stringResource(R.string.player_text_discard_confirm), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiscardEditDialog = false }) {
+                    Text(stringResource(R.string.player_text_keep_editing))
+                }
+            },
+        )
+    }
 }
 
-private fun prettyPrintJson(raw: String): String = runCatching {
-    val t = raw.trim()
+internal fun decodeUtf8Safe(bytes: ByteArray, truncated: Boolean): String {
+    if (!truncated || bytes.isEmpty()) return bytes.decodeToString()
+    var end = bytes.size
+    var i = end - 1
+    while (i >= 0 && (end - i) <= 4 && (bytes[i].toInt() and 0xC0) == 0x80) {
+        i--
+    }
+    if (i >= 0 && (end - i) <= 4 && (bytes[i].toInt() and 0x80) != 0) {
+        val lead = bytes[i].toInt() and 0xFF
+        val expectedLen = when {
+            (lead and 0xE0) == 0xC0 -> 2
+            (lead and 0xF0) == 0xE0 -> 3
+            (lead and 0xF8) == 0xF0 -> 4
+            else -> 1
+        }
+        val actualLen = end - i
+        if (expectedLen > 1 && actualLen < expectedLen) {
+            end = i
+        }
+    }
+    return bytes.decodeToString(0, end)
+}
+
+internal fun prettyPrintJson(raw: String): String = runCatching {
+    val t = raw.trimStart('\uFEFF').trim()
     when {
         t.startsWith("{") -> org.json.JSONObject(t).toString(2)
         t.startsWith("[") -> org.json.JSONArray(t).toString(2)

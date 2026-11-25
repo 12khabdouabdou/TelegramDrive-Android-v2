@@ -134,4 +134,15 @@ class FreeUpSpacePolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `matchesUnchangedMetadata enforces size and mtime tolerance when sha unavailable`() {
+        assertTrue(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 10_000L, 1024L, 10_000L))
+        assertTrue(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 10_000L, 1024L, 11_500L))
+        assertTrue(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 0L, 1024L, 50_000L))
+
+        assertFalse(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 10_000L, -1L, 0L))
+        assertFalse(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 10_000L, 2048L, 10_000L))
+        assertFalse(FreeUpSpacePolicy.matchesUnchangedMetadata(1024L, 10_000L, 1024L, 25_000L))
+    }
 }

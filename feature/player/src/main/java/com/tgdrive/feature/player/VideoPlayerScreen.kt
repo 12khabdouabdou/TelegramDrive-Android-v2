@@ -13,6 +13,8 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.WindowManager
@@ -97,6 +99,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -112,7 +115,9 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.tgdrive.core.common.BitmapUtils
 import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.pip.PipController
 import com.tgdrive.core.db.dao.FileCacheDao
@@ -369,18 +374,34 @@ class VideoPlayerViewModel @Inject constructor(
         rotationDeg: Float,
         targetAspect: Float?,
     ): String? = withContext(dispatchers.io) {
-        val decoded = runCatching { BitmapFactory.decodeFile(sourcePath) }.getOrNull() ?: return@withContext null
+        var decoded: Bitmap? = null
+        var normalized: Bitmap? = null
         var rotated: Bitmap? = null
         var cropped: Bitmap? = null
+        var tempFile: File? = null
         try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(sourcePath, bounds)
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = BitmapUtils.computeInSampleSize(bounds.outWidth, bounds.outHeight, 4096)
+            }
+            decoded = runCatching { BitmapFactory.decodeFile(sourcePath, opts) }.getOrNull()
+                ?: return@withContext null
+            val normalizedBmp = BitmapUtils.applyExifOrientationFromFile(sourcePath, decoded)
+            normalized = normalizedBmp
+            if (normalizedBmp !== decoded && !decoded.isRecycled) {
+                decoded.recycle()
+            }
+            decoded = null
+
             val normRot = ((rotationDeg % 360f) + 360f) % 360f
             val base = if (normRot > 0.5f) {
                 val matrix = Matrix().apply { postRotate(normRot) }
-                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
-                    rotated = it
-                }
+                Bitmap.createBitmap(
+                    normalizedBmp, 0, 0, normalizedBmp.width, normalizedBmp.height, matrix, true,
+                ).also { rotated = it }
             } else {
-                decoded
+                normalizedBmp
             }
             val resultBmp = if (targetAspect != null && targetAspect > 0f) {
                 val w = base.width
@@ -401,36 +422,26 @@ class VideoPlayerViewModel @Inject constructor(
             val stem = originalName.substringBeforeLast('.', originalName).ifBlank { "photo" }
             val safeStem = stem.replace(Regex("[^A-Za-z0-9._-]"), "_")
             val outName = "${safeStem}_edited.jpg"
-
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, outName)
-                    put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                }
-                val uri = appContext.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: return@withContext null
-                val ok = appContext.contentResolver.openOutputStream(uri)?.use { out ->
-                    resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                } ?: false
-                if (ok) outName else null
-            } else {
-                @Suppress("DEPRECATION")
-                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                dir.mkdirs()
-                val dest = File(dir, outName)
-                val ok = dest.outputStream().use { out ->
-                    resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-                if (ok) outName else null
+            tempFile = File.createTempFile("crop_", ".jpg", appContext.cacheDir)
+            val compressed = tempFile.outputStream().use { out ->
+                resultBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
             }
+            if (!compressed) return@withContext null
+            val saved = PublicDownloadsExporter.saveToPublicDownloads(
+                ctx = appContext,
+                source = tempFile,
+                displayName = outName,
+                mimeType = "image/jpeg",
+            )
+            if (saved != null) outName else null
         } catch (t: Throwable) {
             Log.w("VideoPlayerViewModel: saveCroppedCopy failed", t)
             null
         } finally {
-            if (cropped != null && cropped !== rotated && cropped !== decoded) cropped?.recycle()
-            if (rotated != null && rotated !== decoded) rotated?.recycle()
-            decoded.recycle()
+            runCatching { tempFile?.delete() }
+            listOfNotNull(cropped, rotated, normalized, decoded).distinct().forEach { bmp ->
+                if (!bmp.isRecycled) bmp.recycle()
+            }
         }
     }
 
@@ -804,9 +815,19 @@ private fun VideoPlayerBody(
     val isFailed = downloadItem?.status == DownloadStatus.FAILED
     val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
 
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val exo = remember(chatId, messageId) {
         try {
-            ExoPlayer.Builder(ctx.applicationContext).build()
+            ExoPlayer.Builder(ctx.applicationContext)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(C.USAGE_MEDIA)
+                        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                        .build(),
+                    true,
+                )
+                .setHandleAudioBecomingNoisy(true)
+                .build()
         } catch (t: Throwable) {
             Log.w("VideoPlayer: failed to create ExoPlayer", t)
             playerInitError = t.localizedMessage ?: "Video player initialization failed"
@@ -954,7 +975,7 @@ private fun VideoPlayerBody(
                         fallbackTotalBytes = entry.fileSize,
                         chatId = entry.chatId,
                         messageId = entry.messageId,
-                        onOpenedFileId = { fid -> streamFileId = fid },
+                        onOpenedFileId = { fid -> mainHandler.post { streamFileId = fid } },
                     )
                 }
                 val videoSource = ProgressiveMediaSource.Factory(factory)
@@ -1001,6 +1022,21 @@ private fun VideoPlayerBody(
         vm.pipController.setActive(
             hasActiveVideo && playbackError == null && playerInitError == null,
         )
+    }
+
+    val initialScreenBrightness = remember(activity) {
+        activity?.window?.attributes?.screenBrightness
+    }
+    DisposableEffect(activity) {
+        onDispose {
+            if (activity != null && initialScreenBrightness != null) {
+                runCatching {
+                    val lp = activity.window.attributes
+                    lp.screenBrightness = initialScreenBrightness
+                    activity.window.attributes = lp
+                }
+            }
+        }
     }
 
     DisposableEffect(lifecycleOwner, exo, activity) {

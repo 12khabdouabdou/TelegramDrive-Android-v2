@@ -485,7 +485,14 @@ fun ZipBrowserScreen(
                         LoadErrorState(
                             error = loadError,
                             onRetry = if (localPath != null) {
-                                { vm.load(localPath) }
+                                {
+                                    vm.load(
+                                        zipPath = localPath,
+                                        chatId = chatId,
+                                        messageId = messageId,
+                                        zipFileName = downloadItem?.fileName.orEmpty(),
+                                    )
+                                }
                             } else {
                                 null
                             },
@@ -569,7 +576,10 @@ fun ZipBrowserScreen(
                             vm.unlockPreviewsWithVault(useSavedBackupPassphrase = false)
                         } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
-                            vm.unlockWithVaultKey(entryName = null)
+                            vm.unlockWithVaultKey(
+                                entryName = null,
+                                onUnlocked = { vm.extractAllToDownloads() },
+                            )
                         } else {
                             vm.unlockWithVaultKey(entryName = entryName)
                         }
@@ -582,7 +592,11 @@ fun ZipBrowserScreen(
                             vm.unlockPreviewsWithVault(useSavedBackupPassphrase = true)
                         } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
-                            vm.unlockWithVaultKey(entryName = null, useSavedBackupPassphrase = true)
+                            vm.unlockWithVaultKey(
+                                entryName = null,
+                                useSavedBackupPassphrase = true,
+                                onUnlocked = { vm.extractAllToDownloads() },
+                            )
                         } else {
                             vm.unlockWithVaultKey(entryName = entryName, useSavedBackupPassphrase = true)
                         }
@@ -628,7 +642,7 @@ private fun buildDirectoryItems(
     val files = mutableListOf<ZipBrowserItem.FileNode>()
 
     for (entry in entries) {
-        val norm = entry.name.trimStart('/')
+        val norm = entry.name.replace('\\', '/').trimStart('/')
         if (norm.isEmpty()) continue
         if (currentPrefix.isNotEmpty() && !norm.startsWith(currentPrefix)) continue
         val rel = norm.removePrefix(currentPrefix).trimEnd('/')

@@ -257,20 +257,22 @@ class BackupScheduler @Inject constructor(
         Log.i("BackupScheduler: cancelled periodic")
     }
 
-    fun retryFailed(failedPaths: List<String>): String? {
-        if (registry.isAnyActive() || failedPaths.isEmpty()) return null
+    fun retryFailed(failedPaths: List<String>, sourceJobId: String? = null): String? {
+        if (registry.isAnyActive() || (failedPaths.isEmpty() && sourceJobId.isNullOrBlank())) return null
         val jobId = "retry_${System.currentTimeMillis()}"
+        val inputBuilder = Data.Builder()
+            .putString(BackupWorker.KEY_JOB_ID, jobId)
+            .putBoolean(BackupWorker.KEY_IS_MANUAL, true)
+        if (!sourceJobId.isNullOrBlank() && failedPaths.size > 20) {
+            inputBuilder.putString(BackupWorker.KEY_RETRY_SOURCE_JOB_ID, sourceJobId)
+        } else {
+            inputBuilder.putStringArray(BackupWorker.KEY_RETRY_PATHS, failedPaths.toTypedArray())
+        }
         val req = OneTimeWorkRequestBuilder<BackupWorker>()
             .addTag(TAG)
             .addTag("manual")
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-            .setInputData(
-                Data.Builder()
-                    .putString(BackupWorker.KEY_JOB_ID, jobId)
-                    .putBoolean(BackupWorker.KEY_IS_MANUAL, true)
-                    .putStringArray(BackupWorker.KEY_RETRY_PATHS, failedPaths.toTypedArray())
-                    .build(),
-            )
+            .setInputData(inputBuilder.build())
             .build()
         WorkManager.getInstance(ctx).enqueueUniqueWork(
             ONE_TIME_WORK_NAME,

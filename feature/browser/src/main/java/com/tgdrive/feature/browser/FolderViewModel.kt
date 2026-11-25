@@ -1077,6 +1077,7 @@ class FolderViewModel
                         dl == null ||
                             dl.status == DownloadStatus.DONE ||
                             dl.status == DownloadStatus.FAILED ||
+                            dl.status == DownloadStatus.PAUSED ||
                             dl.status == DownloadStatus.CANCELLED
                     }
                 when (terminal?.status) {
@@ -1096,6 +1097,14 @@ class FolderViewModel
                     DownloadStatus.FAILED -> {
                         _decryptDialog.update { cur ->
                             cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
+                        }
+                    }
+                    DownloadStatus.PAUSED -> {
+                        _decryptDialog.update { cur ->
+                            cur?.copy(
+                                downloading = false,
+                                error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
+                            )
                         }
                     }
                     else -> {
@@ -1171,6 +1180,7 @@ class FolderViewModel
                                     dl == null ||
                                         dl.status == DownloadStatus.DONE ||
                                         dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.PAUSED ||
                                         dl.status == DownloadStatus.CANCELLED
                                 }
                             if (terminal?.status == DownloadStatus.DONE) {
@@ -1321,6 +1331,7 @@ class FolderViewModel
                                     dl == null ||
                                         dl.status == DownloadStatus.DONE ||
                                         dl.status == DownloadStatus.FAILED ||
+                                        dl.status == DownloadStatus.PAUSED ||
                                         dl.status == DownloadStatus.CANCELLED
                                 }
                             if (terminal?.status == DownloadStatus.DONE) {
@@ -1496,6 +1507,7 @@ class FolderViewModel
                                 dlItem == null ||
                                     dlItem.status == DownloadStatus.DONE ||
                                     dlItem.status == DownloadStatus.FAILED ||
+                                    dlItem.status == DownloadStatus.PAUSED ||
                                     dlItem.status == DownloadStatus.CANCELLED
                             }
                     when (terminal?.status) {
@@ -1509,6 +1521,9 @@ class FolderViewModel
                         }
                         DownloadStatus.FAILED -> {
                             _error.value = "Audio download failed: ${terminal.errorMessage}"
+                        }
+                        DownloadStatus.PAUSED -> {
+                            _error.value = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)"
                         }
                         else -> Unit
                     }
@@ -1553,10 +1568,15 @@ class FolderViewModel
                                 dl == null ||
                                     dl.status == DownloadStatus.DONE ||
                                     dl.status == DownloadStatus.FAILED ||
+                                    dl.status == DownloadStatus.PAUSED ||
                                     dl.status == DownloadStatus.CANCELLED
                             }
                         if (terminal?.status != DownloadStatus.DONE) {
-                            _error.value = terminal?.errorMessage ?: "Download failed"
+                            _error.value = terminal?.errorMessage ?: if (terminal?.status == DownloadStatus.PAUSED) {
+                                "Download paused (waiting for Wi-Fi)"
+                            } else {
+                                "Download failed"
+                            }
                             return@launch
                         }
                         localPath = terminal.localPath ?: getLocalPath(messageId)

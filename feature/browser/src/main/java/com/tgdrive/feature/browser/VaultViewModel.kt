@@ -390,6 +390,7 @@ class VaultViewModel @Inject constructor(
                     dl == null ||
                         dl.status == DownloadStatus.DONE ||
                         dl.status == DownloadStatus.FAILED ||
+                        dl.status == DownloadStatus.PAUSED ||
                         dl.status == DownloadStatus.CANCELLED
                 }
             when (terminal?.status) {
@@ -409,6 +410,14 @@ class VaultViewModel @Inject constructor(
                 DownloadStatus.FAILED -> {
                     _decryptDialog.update { cur ->
                         cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
+                    }
+                }
+                DownloadStatus.PAUSED -> {
+                    _decryptDialog.update { cur ->
+                        cur?.copy(
+                            downloading = false,
+                            error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
+                        )
                     }
                 }
                 else -> _decryptDialog.value = null
@@ -514,12 +523,20 @@ class VaultViewModel @Inject constructor(
                 dl == null ||
                     dl.status == DownloadStatus.DONE ||
                     dl.status == DownloadStatus.FAILED ||
+                    dl.status == DownloadStatus.PAUSED ||
                     dl.status == DownloadStatus.CANCELLED
             }
-        return if (terminal?.status == DownloadStatus.DONE) {
-            terminal.localPath?.let(::File)?.takeIf { it.isFile }
-        } else {
-            null
+        return when (terminal?.status) {
+            DownloadStatus.DONE -> terminal.localPath?.let(::File)?.takeIf { it.isFile }
+            DownloadStatus.PAUSED -> {
+                _error.value = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)"
+                null
+            }
+            DownloadStatus.FAILED -> {
+                _error.value = terminal.errorMessage ?: "Download failed"
+                null
+            }
+            else -> null
         }
     }
 
