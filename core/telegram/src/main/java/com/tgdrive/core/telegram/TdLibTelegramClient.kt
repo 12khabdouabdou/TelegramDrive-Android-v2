@@ -875,12 +875,14 @@ class TdLibTelegramClient(
                         delay(2_000L)
                         if (sendConfirmation.isCompleted) break
 
-                        orphanedSendSucceeded.remove(localMsgId)?.let { orphaned ->
+                        val orphaned = orphanedSendSucceeded.remove(localMsgId)
+                        if (orphaned != null) {
                             sendConfirmation.complete(orphaned)
                             break
                         }
-                        orphanedSendFailed.remove(localMsgId)?.let { err ->
-                            sendConfirmation.completeExceptionally(TelegramException.fromError(err))
+                        val orphanedErr = orphanedSendFailed.remove(localMsgId)
+                        if (orphanedErr != null) {
+                            sendConfirmation.completeExceptionally(TelegramException.fromError(orphanedErr))
                             break
                         }
 

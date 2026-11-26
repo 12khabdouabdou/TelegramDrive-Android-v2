@@ -241,12 +241,12 @@ class UploadManager @Inject constructor(
                         }
                     }
                 }
-                    if (results.any { it }) {
-                        if (options.virtualPath.isNotBlank()) {
-                            cloudSyncManager.schedulePushMetadata()
-                        }
-                        _completedChatEvents.tryEmit(resolvedChatId)
+                if (results.any { it }) {
+                    if (options.virtualPath.isNotBlank()) {
+                        cloudSyncManager.schedulePushMetadata()
                     }
+                    _completedChatEvents.tryEmit(resolvedChatId)
+                }
             } finally {
                 batchJobs.remove(batchId)
             }
@@ -336,12 +336,12 @@ class UploadManager @Inject constructor(
                         }
                     }
                 }
-                    if (results.any { it }) {
-                        if (options.virtualPath.isNotBlank()) {
-                            cloudSyncManager.schedulePushMetadata()
-                        }
-                        _completedChatEvents.tryEmit(resolvedChatId)
+                if (results.any { it }) {
+                    if (prepared.any { it.second.virtualPath.isNotBlank() }) {
+                        cloudSyncManager.schedulePushMetadata()
                     }
+                    _completedChatEvents.tryEmit(resolvedChatId)
+                }
             } finally {
                 batchJobs.remove(batchId)
             }
