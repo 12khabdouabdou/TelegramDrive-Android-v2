@@ -53,25 +53,11 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             if (activeCount > 0 && (activeCount != lastActiveCount || now - lastUpdateMs >= 400L)) {
                 lastUpdateMs = now
                 lastActiveCount = activeCount
-                val label = activeUl.firstOrNull()?.let { ul ->
-                    val verb = when (ul.status) {
-                        UploadStatus.PACKING -> "Packing"
-                        UploadStatus.ENCRYPTING -> "Encrypting"
-                        UploadStatus.PREPARING -> "Preparing"
-                        UploadStatus.QUEUED -> "Queued"
-                        else -> "Uploading"
-                    }
-                    "$verb ${ul.fileName} (${(ul.progress * 100f).toInt().coerceIn(0, 100)}%)"
-                } ?: activeDl.firstOrNull()?.let {
-                    "Downloading ${it.fileName} (${(it.progress * 100f).toInt().coerceIn(0, 100)}%)"
-                } ?: "$activeCount transfer(s) active"
-                val progressPct = activeUl.firstOrNull()?.let { (it.progress * 100f).toInt().coerceIn(0, 100) }
-                    ?: activeDl.firstOrNull()?.let { (it.progress * 100f).toInt().coerceIn(0, 100) }
-                    ?: 0
+                val (label, progressPct) = formatTransferSummary(activeUl, activeDl)
                 runCatching {
                     setForeground(
                         buildForegroundInfo(
-                            text = if (activeCount > 1) "$label • $activeCount active" else label,
+                            text = label,
                             progress = progressPct,
                             max = 100,
                             indeterminate = progressPct == 0,
@@ -109,6 +95,17 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val launchPi = applicationContext.packageManager
+            .getLaunchIntentForPackage(applicationContext.packageName)
+            ?.apply { addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
+            ?.let { launchIntent ->
+                PendingIntent.getActivity(
+                    applicationContext,
+                    REQ_OPEN_APP,
+                    launchIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+            }
         val notif = NotificationCompat.Builder(applicationContext, "download.progress")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("TelegramDrive Transfers")
@@ -116,6 +113,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .apply {
+                if (launchPi != null) setContentIntent(launchPi)
                 if (max > 0) setProgress(max, progress, indeterminate)
                 if (hasActiveTransfers) {
                     addAction(0, "Pause", pausePi)
@@ -133,8 +131,77 @@ class TransferKeepAliveWorker @AssistedInject constructor(
     companion object {
         private const val UNIQUE_NAME = "tgdrive_transfer_keepalive"
         private const val NOTIF_ID = 50002
+        private const val REQ_OPEN_APP = 50010
         private const val REQ_PAUSE = 50011
         private const val REQ_STOP = 50012
+
+        internal fun formatTransferSummary(
+            activeUploads: List<UploadItem>,
+            activeDownloads: List<DownloadItem>,
+        ): Pair<String, Int> {
+            val activeCount = activeUploads.size + activeDownloads.size
+            if (activeCount == 0) return "Preparing transfers…" to 0
+
+            var weightedKnownBytes = 0L
+            var weightedDoneBytes = 0.0
+            var fallbackSum = 0f
+            var fallbackCount = 0
+            for (ul in activeUploads) {
+                val p = ul.progress.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+                if (ul.totalBytes > 0L) {
+                    weightedKnownBytes += ul.totalBytes
+                    weightedDoneBytes += p * ul.totalBytes.toDouble()
+                } else {
+                    fallbackSum += p
+                    fallbackCount++
+                }
+            }
+            for (dl in activeDownloads) {
+                val p = dl.progress.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+                if (dl.totalBytes > 0L) {
+                    weightedKnownBytes += dl.totalBytes
+                    weightedDoneBytes += p * dl.totalBytes.toDouble()
+                } else {
+                    fallbackSum += p
+                    fallbackCount++
+                }
+            }
+            val pct = when {
+                weightedKnownBytes > 0L ->
+                    ((weightedDoneBytes / weightedKnownBytes.toDouble()) * 100.0).toInt().coerceIn(0, 100)
+                fallbackCount > 0 ->
+                    ((fallbackSum / fallbackCount) * 100f).toInt().coerceIn(0, 100)
+                else -> 0
+            }
+
+            val label = when {
+                activeCount == 1 && activeUploads.size == 1 -> {
+                    val ul = activeUploads.first()
+                    val verb = when (ul.status) {
+                        UploadStatus.PACKING -> "Packing"
+                        UploadStatus.ENCRYPTING -> "Encrypting"
+                        UploadStatus.PREPARING -> "Preparing"
+                        UploadStatus.QUEUED -> "Queued"
+                        else -> "Uploading"
+                    }
+                    "$verb ${ul.fileName} ($pct%)"
+                }
+                activeCount == 1 && activeDownloads.size == 1 -> {
+                    val dl = activeDownloads.first()
+                    "Downloading ${dl.fileName} ($pct%)"
+                }
+                activeUploads.isNotEmpty() && activeDownloads.isNotEmpty() -> {
+                    "${activeUploads.size} upload(s), ${activeDownloads.size} download(s) ($pct%)"
+                }
+                activeUploads.isNotEmpty() -> {
+                    "Uploading ${activeUploads.size} file(s) ($pct%)"
+                }
+                else -> {
+                    "Downloading ${activeDownloads.size} file(s) ($pct%)"
+                }
+            }
+            return label to pct
+        }
 
         fun ensureRunning(ctx: Context) {
             runCatching {

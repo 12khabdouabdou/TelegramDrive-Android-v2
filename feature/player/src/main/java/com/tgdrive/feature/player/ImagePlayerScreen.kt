@@ -182,15 +182,15 @@ fun ImagePlayerScreen(
                 vm.ensureDownloaded(entry)
             }
         }
-        val next = pages.getOrNull(pagerState.currentPage + 1)
-        next?.entity?.let { nextEntry ->
-            val nextIsVid = classifyFile(nextEntry.mimeType, nextEntry.fileName) == FileBucket.VIDEOS
-            if (!nextIsVid &&
-                vm.getLocalPath(nextEntry.messageId, nextEntry.chatId) == null &&
-                vm.downloadManager.findItem(nextEntry.chatId, nextEntry.messageId) == null &&
-                nextEntry.fileSize <= 15L * 1024 * 1024
+        for (neighborIdx in listOf(pagerState.currentPage + 1, pagerState.currentPage - 1)) {
+            val neighbor = pages.getOrNull(neighborIdx)?.entity ?: continue
+            val neighborIsVid = classifyFile(neighbor.mimeType, neighbor.fileName) == FileBucket.VIDEOS
+            if (!neighborIsVid &&
+                vm.getLocalPath(neighbor.messageId, neighbor.chatId) == null &&
+                vm.downloadManager.findItem(neighbor.chatId, neighbor.messageId) == null &&
+                neighbor.fileSize <= 15L * 1024 * 1024
             ) {
-                vm.ensureDownloaded(nextEntry)
+                vm.ensureDownloaded(neighbor)
             }
         }
     }

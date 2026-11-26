@@ -173,6 +173,7 @@ dependencies {
     // Coil
     implementation(libs.coil.compose)
     implementation(libs.coil.video)
+    implementation(libs.coil.gif)
 
     // Testing
     testImplementation(libs.junit5.jupiter.api)

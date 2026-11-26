@@ -38,6 +38,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -64,9 +65,9 @@ fun AboutScreen(
     var crashLogCopied by remember { mutableStateOf(false) }
     val versionName = remember(context) {
         try {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0.3"
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0.4"
         } catch (_: Throwable) {
-            "1.0.3"
+            "1.0.4"
         }
     }
 
@@ -157,7 +158,7 @@ fun AboutScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .clickable {
+                            .clickable(role = Role.Button) {
                                 try {
                                     uriHandler.openUri("https://github.com/TelegramDrive")
                                 } catch (_: Throwable) {}

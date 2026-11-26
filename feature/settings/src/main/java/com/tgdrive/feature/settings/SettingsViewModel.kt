@@ -173,6 +173,7 @@ class SettingsViewModel @Inject constructor(
     fun setCacheLimit(bytes: Long) {
         viewModelScope.launch(dispatchers.io) {
             preferences.update { it.copy(cacheLimitBytes = bytes) }
+            runCatching { telegramClient.optimizeStorage(bytes) }
         }
     }
 

@@ -113,6 +113,13 @@ class TelegramDriveApp :
                 if (ok == null) {
                     Log.w("TelegramDriveApp: TDLib init timed out after ${TDLIB_INIT_TIMEOUT_MS}ms — " +
                           "user will see auth screen; TDLib may finish initializing in the background")
+                } else {
+                    launch {
+                        runCatching {
+                            val limit = preferences.get().data.first().cacheLimitBytes
+                            telegramClient.get().optimizeStorage(limit)
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -180,6 +187,12 @@ class TelegramDriveApp :
         ImageLoader.Builder(this)
             .components {
                 add(VideoFrameDecoder.Factory())
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    add(coil.decode.ImageDecoderDecoder.Factory())
+                } else {
+                    @Suppress("DEPRECATION")
+                    add(coil.decode.GifDecoder.Factory())
+                }
             }
             .memoryCache {
                 MemoryCache.Builder(this)

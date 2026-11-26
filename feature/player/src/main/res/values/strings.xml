@@ -8,6 +8,9 @@
     <string name="player_pdf_error">Could not open PDF document</string>
     <string name="player_pdf_empty">This PDF has no pages</string>
     <string name="player_pdf_page_desc">PDF page %d</string>
+    <string name="player_pdf_bookmark_add">Bookmark page</string>
+    <string name="player_pdf_bookmark_remove">Remove bookmark</string>
+    <string name="player_pdf_bookmarks_title">Bookmarks</string>
     <string name="player_image_desc">Image viewer</string>
     <string name="player_image_error">Could not load image</string>
     <string name="player_video_pip">Picture-in-picture</string>
@@ -43,6 +46,8 @@
     <string name="player_audio_pause">Pause</string>
     <string name="player_audio_stop">Close player</string>
     <string name="player_audio_seek">Seek audio position</string>
+    <string name="player_audio_seek_back_10">Rewind 10 seconds</string>
+    <string name="player_audio_seek_forward_10">Forward 10 seconds</string>
     <string name="player_action_share">Share</string>
     <string name="player_action_pin_offline">Offline</string>
     <string name="player_action_pinned">Pinned</string>

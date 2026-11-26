@@ -75,6 +75,7 @@ interface TelegramClient : TelegramAuthObserver {
     suspend fun renameFile(chatId: Long, messageId: Long, newFileName: String)
     fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate>
     suspend fun clearDownloadCache()
+    suspend fun optimizeStorage(maxBytes: Long) {}
     suspend fun myUserId(): Long
     suspend fun isPremiumUser(): Boolean = false
     suspend fun maxUploadSizeBytes(): Long =

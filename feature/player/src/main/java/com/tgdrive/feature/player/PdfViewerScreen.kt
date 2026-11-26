@@ -1,5 +1,6 @@
 package com.tgdrive.feature.player
 
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -31,6 +32,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +41,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -238,6 +243,15 @@ fun PdfViewerScreen(
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val bookmarkKey = remember(chatId, messageId, localPath) {
+        if (messageId != 0L) "${chatId}_$messageId" else localPath.orEmpty().hashCode().toString()
+    }
+    val bookmarkPrefs = remember(ctx) {
+        ctx.getSharedPreferences("tgdrive_pdf_bookmarks", Context.MODE_PRIVATE)
+    }
+    var bookmarkedPages by remember(bookmarkKey) {
+        mutableStateOf(PdfBookmarkCodec.decode(bookmarkPrefs.getString(bookmarkKey, null)))
+    }
     val bottomNavPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val displayTitle = initialTitle?.takeIf { it.isNotBlank() }
         ?: cachedEntry?.fileName
@@ -379,6 +393,20 @@ fun PdfViewerScreen(
                     }
                 }
                 if (pageCount > 0 && session != null) {
+                    val isBookmarked = currentPage in bookmarkedPages
+                    IconButton(onClick = {
+                        val updated = if (isBookmarked) bookmarkedPages - currentPage else bookmarkedPages + currentPage
+                        bookmarkedPages = updated
+                        bookmarkPrefs.edit().putString(bookmarkKey, PdfBookmarkCodec.encode(updated)).apply()
+                    }) {
+                        Icon(
+                            imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                            contentDescription = stringResource(
+                                if (isBookmarked) R.string.player_pdf_bookmark_remove else R.string.player_pdf_bookmark_add,
+                            ),
+                            tint = if (isBookmarked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                     IconButton(onClick = { showOcrSearch = !showOcrSearch }) {
                         Icon(
                             imageVector = if (showOcrSearch) Icons.Filled.Close else Icons.Filled.Search,
@@ -800,14 +828,38 @@ fun PdfViewerScreen(
                 onDismissRequest = { showJumpDialog = false },
                 title = { Text(stringResource(R.string.player_pdf_jump_title)) },
                 text = {
-                    OutlinedTextField(
-                        value = jumpDraft,
-                        onValueChange = { jumpDraft = it.filter { ch -> ch.isDigit() } },
-                        label = { Text(stringResource(R.string.player_pdf_jump_hint, pageCount)) },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    val validBookmarks = bookmarkedPages.filter { it in 1..pageCount }.sorted()
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedTextField(
+                            value = jumpDraft,
+                            onValueChange = { jumpDraft = it.filter { ch -> ch.isDigit() } },
+                            label = { Text(stringResource(R.string.player_pdf_jump_hint, pageCount)) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        if (validBookmarks.isNotEmpty()) {
+                            Text(
+                                text = stringResource(R.string.player_pdf_bookmarks_title),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                items(validBookmarks) { bmPage ->
+                                    FilterChip(
+                                        selected = bmPage == currentPage,
+                                        onClick = {
+                                            val targetIdx = (bmPage - 1).coerceIn(0, pageCount - 1)
+                                            showJumpDialog = false
+                                            scope.launch { listState.scrollToItem(targetIdx) }
+                                        },
+                                        label = { Text("p.$bmPage") },
+                                    )
+                                }
+                            }
+                        }
+                    }
                 },
                 confirmButton = {
                     TextButton(
@@ -919,5 +971,23 @@ private fun PdfPage(
                 modifier = Modifier.size(28.dp),
             )
         }
+    }
+}
+
+internal object PdfBookmarkCodec {
+    fun encode(pages: Set<Int>): String =
+        pages.asSequence()
+            .filter { it > 0 }
+            .distinct()
+            .sorted()
+            .joinToString(",")
+
+    fun decode(raw: String?): Set<Int> {
+        if (raw.isNullOrBlank()) return emptySet()
+        return raw.split(',')
+            .asSequence()
+            .mapNotNull { it.trim().toIntOrNull() }
+            .filter { it > 0 }
+            .toSortedSet()
     }
 }

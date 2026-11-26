@@ -56,6 +56,7 @@ data class ZipBrowserUiState(
     val extractingEntry: String? = null,
     val unlockedPassword: String? = null,
     val resolvedLocalPath: String? = null,
+    val archiveFileName: String = "",
     val extractingAll: Boolean = false,
     val statusMessage: String? = null,
     val hasSavedBackupPassphrase: Boolean = false,
@@ -213,6 +214,7 @@ class ZipBrowserViewModel
                             loading = false,
                             error = null,
                             zipReady = true,
+                            archiveFileName = currentZipName,
                             passwordRequired = hasEncrypted,
                             unlockedPassword = cachedPassword,
                             hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
@@ -539,6 +541,106 @@ class ZipBrowserViewModel
                             error = t.message ?: "Extraction failed",
                         )
                     }
+                }
+            }
+        }
+
+        fun extractSingleEntryToDownloads(
+            entryName: String,
+            password: String? = null,
+            onNeedPassword: () -> Unit = {},
+        ) {
+            val zipPath = currentZipPath ?: return
+            if (_state.value.extractingEntry != null) return
+            val targetEntry = _state.value.entries.find { it.name == entryName }
+            val supplied = password ?: cachedPassword
+            if (targetEntry?.isEncrypted == true && supplied.isNullOrBlank() && !isVaultHinted) {
+                onNeedPassword()
+                return
+            }
+
+            _state.update { it.copy(extractingEntry = entryName, error = null, statusMessage = null) }
+            viewModelScope.launch(dispatchers.io) {
+                val stageDir = File(appContext.cacheDir, "zip_single_save/${System.nanoTime()}").apply { mkdirs() }
+                var mergedTemp: File? = null
+                try {
+                    val targetZipPath = resolveArchiveWithSplitCheck(File(zipPath), supplied) { merged ->
+                        mergedTemp = merged
+                    }
+                    val candidates = when {
+                        !supplied.isNullOrBlank() -> listOf(supplied)
+                        targetEntry?.isEncrypted == true -> buildList {
+                            add(backupCrypto.zipVaultPassword())
+                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
+                        }.distinct()
+                        else -> listOf<String?>(null)
+                    }
+
+                    var extractedFile: File? = null
+                    var lastErr: Throwable? = null
+                    for (pwd in candidates) {
+                        val res = runCatching {
+                            zipExtractor.extractEntry(targetZipPath, entryName, stageDir, pwd)
+                        }
+                        val found = res.getOrNull()?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+                        if (found != null) {
+                            extractedFile = found
+                            if (!pwd.isNullOrBlank()) {
+                                cachedPassword = pwd
+                            }
+                            break
+                        }
+                        lastErr = res.exceptionOrNull()
+                    }
+
+                    if (extractedFile == null) {
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                error = lastErr?.message ?: "Wrong password or failed to save entry",
+                            )
+                        }
+                        if (targetEntry?.isEncrypted == true && supplied.isNullOrBlank()) {
+                            withContext(dispatchers.main) { onNeedPassword() }
+                        }
+                        return@launch
+                    }
+
+                    val archiveFolder = currentZipName.ifBlank { File(zipPath).name }
+                        .substringBeforeLast('.')
+                        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                        .ifBlank { "Archive" }
+                    val savedOk = copyExtractedToDownloads(extractedFile, archiveFolder, extractedFile.name)
+                    if (savedOk) {
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                unlockedPassword = cachedPassword,
+                                statusMessage = "Saved ${extractedFile.name} to Downloads/$archiveFolder",
+                            )
+                        }
+                    } else {
+                        _state.update {
+                            it.copy(
+                                extractingEntry = null,
+                                error = "Failed to save ${extractedFile.name} to Downloads",
+                            )
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    _state.update { it.copy(extractingEntry = null) }
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("ZipBrowser: extractSingleEntryToDownloads failed", t)
+                    _state.update {
+                        it.copy(
+                            extractingEntry = null,
+                            error = t.message ?: "Failed to save entry",
+                        )
+                    }
+                } finally {
+                    runCatching { mergedTemp?.delete() }
+                    runCatching { stageDir.deleteRecursively() }
                 }
             }
         }

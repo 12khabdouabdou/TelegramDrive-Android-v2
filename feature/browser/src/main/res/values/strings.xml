@@ -278,6 +278,7 @@
     <string name="zip_browser_toggle_grid">Grid view</string>
     <string name="zip_browser_toggle_list">List view</string>
     <string name="zip_browser_extract_all">Extract all</string>
+    <string name="zip_browser_save_entry">Save to Downloads</string>
     <string name="zip_browser_extracting_all">Extracting archive…</string>
     <string name="zip_browser_extracted_all_done">Extracted %1$d file(s) to Downloads</string>
     <string name="home_quick_upload_zip_desc_direct">Pick a device folder to archive &amp; upload</string>

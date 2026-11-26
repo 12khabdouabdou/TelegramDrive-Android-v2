@@ -26,10 +26,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -56,7 +58,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -204,17 +208,23 @@ fun AudioPlayerScaffold(
                         }
                     }
 
+                    val speedLabel = AudioQueueLogic.formatSpeedLabel(state.playbackSpeed)
+                    val speedDesc = "${stringResource(R.string.player_audio_speed)} $speedLabel"
                     Surface(
                         shape = RoundedCornerShape(8.dp),
                         color = MaterialTheme.colorScheme.surfaceContainerHighest,
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
+                            .semantics {
+                                role = Role.Button
+                                contentDescription = speedDesc
+                            }
                             .clickable(
                                 onClickLabel = stringResource(R.string.player_audio_speed),
                             ) { controller.cyclePlaybackSpeed() },
                     ) {
                         Text(
-                            text = AudioQueueLogic.formatSpeedLabel(state.playbackSpeed),
+                            text = speedLabel,
                             style = TgTypography.Mono,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary,
@@ -401,6 +411,36 @@ fun AudioPlayerScaffold(
                             selected = selectedMins,
                             onClick = { controller.setSleepTimerMinutes(mins) },
                             label = { Text(stringResource(strId)) },
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(
+                        onClick = {
+                            controller.seekTo((controller.currentPosition() - 10_000).coerceAtLeast(0))
+                        },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Replay10,
+                            contentDescription = stringResource(R.string.player_audio_seek_back_10),
+                            tint = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            val maxPos = controller.duration().coerceAtLeast(1)
+                            controller.seekTo((controller.currentPosition() + 10_000).coerceAtMost(maxPos))
+                        },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Forward10,
+                            contentDescription = stringResource(R.string.player_audio_seek_forward_10),
+                            tint = MaterialTheme.colorScheme.onSurface,
                         )
                     }
                 }

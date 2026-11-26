@@ -167,6 +167,7 @@ fun ZipBrowserScreen(
     var passwordInput by remember { mutableStateOf("") }
     var showPasswordDialog by remember { mutableStateOf<String?>(null) }
     var passwordForExtractAll by remember { mutableStateOf(false) }
+    var passwordForSaveEntry by remember { mutableStateOf(false) }
     var passwordForPreviewsOnly by remember { mutableStateOf(false) }
     var imageViewerPaths by remember { mutableStateOf<List<String>>(emptyList()) }
     var imageViewerInitialIndex by remember { mutableStateOf(0) }
@@ -298,7 +299,9 @@ fun ZipBrowserScreen(
                     }
                     Column(modifier = Modifier.weight(1f).padding(start = 8.dp)) {
                         Text(
-                            text = stringResource(R.string.zip_browser_title),
+                            text = state.archiveFileName
+                                .ifBlank { downloadItem?.fileName.orEmpty() }
+                                .ifBlank { stringResource(R.string.zip_browser_title) },
                             style = TgTypography.Display.displayMedium,
                             color = MaterialTheme.colorScheme.onBackground,
                             fontWeight = FontWeight.Bold,
@@ -531,6 +534,7 @@ fun ZipBrowserScreen(
                             onFileClick = { fileNode ->
                                 val entry = fileNode.entry
                                 passwordForExtractAll = false
+                                passwordForSaveEntry = false
                                 passwordForPreviewsOnly = false
                                 val ext = entry.name.substringAfterLast('.', "").lowercase()
                                 if (ext in setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif")) {
@@ -548,6 +552,16 @@ fun ZipBrowserScreen(
                                     vm.openOrPromptEntry(entry) {
                                         showPasswordDialog = entry.name
                                     }
+                                }
+                            },
+                            onSaveFileClick = { fileNode ->
+                                val entry = fileNode.entry
+                                passwordForExtractAll = false
+                                passwordForPreviewsOnly = false
+                                passwordForSaveEntry = false
+                                vm.extractSingleEntryToDownloads(entry.name) {
+                                    passwordForSaveEntry = true
+                                    showPasswordDialog = entry.name
                                 }
                             },
                         )
@@ -580,6 +594,12 @@ fun ZipBrowserScreen(
                                 entryName = null,
                                 onUnlocked = { vm.extractAllToDownloads() },
                             )
+                        } else if (passwordForSaveEntry) {
+                            passwordForSaveEntry = false
+                            vm.unlockWithVaultKey(
+                                entryName = null,
+                                onUnlocked = { vm.extractSingleEntryToDownloads(entryName) },
+                            )
                         } else {
                             vm.unlockWithVaultKey(entryName = entryName)
                         }
@@ -597,6 +617,13 @@ fun ZipBrowserScreen(
                                 useSavedBackupPassphrase = true,
                                 onUnlocked = { vm.extractAllToDownloads() },
                             )
+                        } else if (passwordForSaveEntry) {
+                            passwordForSaveEntry = false
+                            vm.unlockWithVaultKey(
+                                entryName = null,
+                                useSavedBackupPassphrase = true,
+                                onUnlocked = { vm.extractSingleEntryToDownloads(entryName) },
+                            )
                         } else {
                             vm.unlockWithVaultKey(entryName = entryName, useSavedBackupPassphrase = true)
                         }
@@ -611,6 +638,9 @@ fun ZipBrowserScreen(
                         } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
                             vm.extractAllToDownloads(pwd)
+                        } else if (passwordForSaveEntry) {
+                            passwordForSaveEntry = false
+                            vm.extractSingleEntryToDownloads(entryName, pwd)
                         } else {
                             vm.extractEntry(entryName, pwd)
                         }
@@ -618,6 +648,7 @@ fun ZipBrowserScreen(
                     onDismiss = {
                         passwordInput = ""
                         passwordForExtractAll = false
+                        passwordForSaveEntry = false
                         passwordForPreviewsOnly = false
                         showPasswordDialog = null
                     },
@@ -897,6 +928,7 @@ private fun EntriesContent(
     backupCrypto: com.tgdrive.core.security.BackupCrypto,
     onFolderClick: (ZipBrowserItem.FolderNode) -> Unit,
     onFileClick: (ZipBrowserItem.FileNode) -> Unit,
+    onSaveFileClick: (ZipBrowserItem.FileNode) -> Unit,
 ) {
     val context = LocalContext.current
     val thumbnailGenerator = remember(context, backupCrypto) {
@@ -1000,6 +1032,7 @@ private fun EntriesContent(
                             thumbnailGenerator = thumbnailGenerator,
                             thumbSemaphore = thumbSemaphore,
                             onClick = { onFileClick(item) },
+                            onSaveClick = { onSaveFileClick(item) },
                         )
                 }
             }
@@ -1295,6 +1328,7 @@ private fun ZipEntryRow(
     thumbnailGenerator: ZipThumbnailGenerator,
     thumbSemaphore: Semaphore,
     onClick: () -> Unit,
+    onSaveClick: () -> Unit,
 ) {
     GlassPanel(
         modifier = Modifier
@@ -1353,6 +1387,18 @@ private fun ZipEntryRow(
                     color = MaterialTheme.colorScheme.primary,
                     strokeWidth = 2.dp,
                 )
+            } else {
+                IconButton(
+                    onClick = onSaveClick,
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Download,
+                        contentDescription = stringResource(R.string.zip_browser_save_entry),
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
         }
     }

@@ -1316,6 +1316,25 @@ class TdLibTelegramClient(
         }
     }
 
+    override suspend fun optimizeStorage(maxBytes: Long): Unit = withContext(dispatchers.io) {
+        try {
+            val safeLimit = maxBytes.coerceAtLeast(50L * 1024 * 1024)
+            val optimize = TdApi.OptimizeStorage().apply {
+                size = safeLimit
+                ttl = 30 * 24 * 3600
+                count = -1
+                immunityDelay = 3600
+                fileTypes = arrayOf()
+            }
+            send<TdApi.StorageStatistics>(optimize)
+            Log.i("optimizeStorage: trimmed cache toward $safeLimit bytes")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("optimizeStorage: OptimizeStorage failed", t)
+        }
+    }
+
     override suspend fun myUserId(): Long = withContext(dispatchers.io) {
         myUserIdCache?.let { return@withContext it }
         val me = send<TdApi.User>(TdApi.GetMe())
