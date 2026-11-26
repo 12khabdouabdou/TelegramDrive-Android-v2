@@ -653,19 +653,36 @@ class FolderViewModel
                     fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
                         _items.value = entities
                         var queued = 0
+                        val perSubfolderCount = HashMap<String, Int>()
+                        var subfolderQueued = 0
                         for (entity in entities) {
-                            if (queued >= 30) break
                             if (mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath) &&
                                 !entity.isLocked &&
                                 !entity.isEncryptedVault &&
                                 !BackupCrypto.isEncryptedFileName(entity.fileName)
                             ) {
-                                val key = entity.chatId to entity.messageId
-                                if (attemptedThumbKeys.add(key)) {
-                                    thumbRequests.trySend(entity to false)
-                                    queued++
+                                val normVpath = normalizeVirtualPath(entity.virtualPath)
+                                val topFolder = if (normVpath.isNotEmpty()) normVpath.substringBefore('/') else ""
+                                val shouldWarmTop = queued < 30
+                                val shouldWarmSubfolderCover = !shouldWarmTop &&
+                                    topFolder.isNotEmpty() &&
+                                    subfolderQueued < 24 &&
+                                    (perSubfolderCount[topFolder] ?: 0) < 4 &&
+                                    hasThumbnailableKind(entity)
+                                if (shouldWarmTop || shouldWarmSubfolderCover) {
+                                    val key = entity.chatId to entity.messageId
+                                    if (attemptedThumbKeys.add(key)) {
+                                        thumbRequests.trySend(entity to false)
+                                        if (shouldWarmTop) {
+                                            queued++
+                                        } else {
+                                            subfolderQueued++
+                                            perSubfolderCount[topFolder] = (perSubfolderCount[topFolder] ?: 0) + 1
+                                        }
+                                    }
                                 }
                             }
+                            if (queued >= 30 && subfolderQueued >= 24) break
                         }
                         launch { refreshLocalThumbnails(chatId, entities) }
                     }
@@ -1752,5 +1769,6 @@ class FolderViewModel
                 thumbnailPath = thumbnailPath,
                 remoteId = fileRemoteId,
                 date = date,
+                virtualPath = cloudSyncManager.getCloudVirtualPath(chatId, id) ?: virtualPathFromCaption,
             )
     }

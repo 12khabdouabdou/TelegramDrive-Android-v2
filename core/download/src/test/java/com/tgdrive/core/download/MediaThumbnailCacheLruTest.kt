@@ -1,10 +1,27 @@
 package com.tgdrive.core.download
 
+import android.content.Context
 import com.google.common.truth.Truth.assertThat
+import com.tgdrive.core.common.DispatchersProvider
+import com.tgdrive.core.datastore.AppPreferences
+import com.tgdrive.core.datastore.AppPreferencesData
+import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.telegram.TelegramClient
+import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class MediaThumbnailCacheLruTest {
 
     @Test
@@ -52,5 +69,50 @@ class MediaThumbnailCacheLruTest {
         assertThat(olderEnc.exists()).isFalse()
         assertThat(newer.exists()).isTrue()
         assertThat(newest.exists()).isTrue()
+    }
+
+    @Test
+    fun `getCachedThumbnailPath prefers webp over legacy jpg and promotePrebuiltThumbnail moves upload thumb`(@TempDir tmp: File) = runTest {
+        val d = UnconfinedTestDispatcher(testScheduler)
+        val dispatchers = object : DispatchersProvider {
+            override val main: CoroutineDispatcher = d
+            override val io: CoroutineDispatcher = d
+            override val default: CoroutineDispatcher = d
+            override val unconfined: CoroutineDispatcher = d
+        }
+        val cacheRoot = File(tmp, "cache").apply { mkdirs() }
+        val ctx = mockk<Context>(relaxed = true) {
+            every { cacheDir } returns cacheRoot
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true)
+        val thumbCache = MediaThumbnailCache(
+            ctx = ctx,
+            telegramClient = mockk<TelegramClient>(relaxed = true),
+            fileCacheDao = dao,
+            downloadManager = mockk<DownloadManager>(relaxed = true),
+            offlinePinStore = mockk<OfflinePinStore>(relaxed = true),
+            backupCrypto = mockk<BackupCrypto>(relaxed = true),
+            cloudSyncManager = mockk<CloudSyncManager>(relaxed = true),
+            appPreferences = mockk<AppPreferences>(relaxed = true) {
+                every { data } returns flowOf(AppPreferencesData())
+            },
+            dispatchers = dispatchers,
+        )
+
+        val thumbsDir = File(cacheRoot, "media_thumbs").apply { mkdirs() }
+        val legacyJpg = File(thumbsDir, "10_1.jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+        assertThat(thumbCache.getCachedThumbnailPath(10L, 1L)).isEqualTo(legacyJpg.absolutePath)
+
+        val webpFile = File(thumbsDir, "10_1.webp").apply { writeBytes(byteArrayOf(4, 5, 6)) }
+        assertThat(thumbCache.getCachedThumbnailPath(10L, 1L)).isEqualTo(webpFile.absolutePath)
+
+        val uploadThumbs = File(cacheRoot, "upload_thumbs").apply { mkdirs() }
+        val srcPrebuilt = File(uploadThumbs, "thumb_99.jpg").apply { writeBytes(byteArrayOf(7, 8, 9, 10)) }
+        val promoted = thumbCache.promotePrebuiltThumbnail(10L, 2L, srcPrebuilt.absolutePath)
+
+        assertThat(promoted).isNotNull()
+        assertThat(File(promoted!!).exists()).isTrue()
+        assertThat(srcPrebuilt.exists()).isFalse()
+        coVerify { dao.updateThumbnailPath(10L, 2L, promoted) }
     }
 }

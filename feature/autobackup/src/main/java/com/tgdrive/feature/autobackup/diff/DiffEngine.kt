@@ -36,10 +36,16 @@ data class LocalFile(
  *   the scanned set. The caller can delete these rows so the registry doesn't
  *   grow unboundedly with deleted local files.
  */
+data class MovedLocalFile(
+    val localFile: LocalFile,
+    val previousRecord: SyncedFileEntity,
+)
+
 data class DiffResult(
     val toUpload: List<LocalFile>,
     val toSkip: List<LocalFile>,
     val staleRemotePaths: List<String>,
+    val movedFiles: List<MovedLocalFile> = emptyList(),
 )
 
 /**
@@ -159,17 +165,32 @@ class DiffEngine(
         val localPaths = HashSet<String>(local.size)
         for (l in local) localPaths.add(l.absolutePath)
 
+        // Pre-index stale records by (leafName, size, lastModified) for safe non-strict move detection.
+        val staleByMeta = HashMap<Triple<String, Long, Long>, MutableList<SyncedFileEntity>>()
+        for (a in already) {
+            if (a.localPath !in localPaths && a.lastModified > 0L) {
+                val leaf = extractLeafName(a.localPath).lowercase()
+                if (leaf.isNotEmpty()) {
+                    staleByMeta.getOrPut(Triple(leaf, a.size, a.lastModified)) { ArrayList(1) }.add(a)
+                }
+            }
+        }
+        val unmatchedLocalMetaCounts = HashMap<Triple<String, Long, Long>, Int>()
+        for (f in local) {
+            if (byPathAndSize[f.absolutePath to f.size] == null && f.lastModified > 0L) {
+                val key = Triple(f.name.lowercase(), f.size, f.lastModified)
+                unmatchedLocalMetaCounts[key] = (unmatchedLocalMetaCounts[key] ?: 0) + 1
+            }
+        }
+
         val toUpload = mutableListOf<LocalFile>()
         val toSkip = mutableListOf<LocalFile>()
         val staleRemotePaths = mutableListOf<String>()
+        val movedFiles = mutableListOf<MovedLocalFile>()
+        val matchedMovedOldPaths = HashSet<String>()
 
         var processed = 0
         for (f in local) {
-            // Cooperative cancellation: yield every YIELD_INTERVAL files so
-            // the user's Cancel tap is honored within ~50ms (assuming each
-            // iteration takes < 1ms — true for non-strict mode; strict mode
-            // with SHA computation takes longer per file but we still yield
-            // between files).
             if (processed % YIELD_INTERVAL == 0) {
                 coroutineContext.ensureActive()
             }
@@ -189,10 +210,15 @@ class DiffEngine(
                     }
                     continue
                 }
-                // Strict + path+size match → verify via SHA.
-                // This is the slow path: SHA-256 computation does blocking I/O.
-                // We've already yielded above, so cancellation is honored
-                // BEFORE we start hashing.
+                // Strict mode fast path: when recorded mtime & sha256 match unchanged file, skip hashing.
+                val mtimeStable = matched.sha256 != null &&
+                    matched.lastModified > 0L &&
+                    f.lastModified > 0L &&
+                    kotlin.math.abs(f.lastModified - matched.lastModified) <= MTIME_TOLERANCE_MS
+                if (mtimeStable) {
+                    toSkip.add(f.copy(sha256 = matched.sha256))
+                    continue
+                }
                 val fileSha = f.sha256 ?: sha256Provider(f.absolutePath)
                 when {
                     fileSha == null -> toSkip.add(f)  // SHA failed → conservative skip
@@ -203,26 +229,57 @@ class DiffEngine(
             }
 
             // No path+size match. In strict mode, compute SHA-256 and
-            // check the global SHA index — catches moved/renamed duplicates
-            // and persists SHA on first upload so run 2 can verify without re-uploading.
+            // check the global SHA index — catches moved/renamed duplicates.
             val fSha = if (strict) (f.sha256 ?: sha256Provider(f.absolutePath)) else f.sha256
-            if (strict && fSha != null && bySha.containsKey(fSha)) {
-                toSkip.add(f.copy(sha256 = fSha))
+            val shaMatch = if (strict && fSha != null) bySha[fSha] else null
+            if (shaMatch != null) {
+                val updatedLocal = f.copy(sha256 = fSha)
+                toSkip.add(updatedLocal)
+                if (shaMatch.localPath !in localPaths && matchedMovedOldPaths.add(shaMatch.localPath)) {
+                    movedFiles.add(MovedLocalFile(updatedLocal, shaMatch))
+                }
                 continue
+            }
+
+            // Non-strict move detection: unique (leafName, size, lastModified) match among disappeared files.
+            if (!strict && f.lastModified > 0L) {
+                val moveKey = Triple(f.name.lowercase(), f.size, f.lastModified)
+                val staleCandidates = staleByMeta[moveKey]
+                if (unmatchedLocalMetaCounts[moveKey] == 1 &&
+                    staleCandidates != null &&
+                    staleCandidates.size == 1 &&
+                    matchedMovedOldPaths.add(staleCandidates[0].localPath)
+                ) {
+                    movedFiles.add(MovedLocalFile(f, staleCandidates[0]))
+                    toSkip.add(f)
+                    continue
+                }
             }
 
             toUpload.add(if (fSha != null && f.sha256 == null) f.copy(sha256 = fSha) else f)
         }
 
         for (a in already) {
-            if (a.localPath !in localPaths) staleRemotePaths.add(a.localPath)
+            if (a.localPath !in localPaths && a.localPath !in matchedMovedOldPaths) {
+                staleRemotePaths.add(a.localPath)
+            }
         }
 
         return DiffResult(
             toUpload = toUpload,
             toSkip = toSkip,
             staleRemotePaths = staleRemotePaths,
+            movedFiles = movedFiles,
         )
+    }
+
+    private fun extractLeafName(rawPath: String): String {
+        val decoded = try {
+            java.net.URLDecoder.decode(rawPath, "UTF-8")
+        } catch (_: Throwable) {
+            rawPath
+        }
+        return decoded.substringAfterLast('/').substringAfterLast(':').trim()
     }
 
     private companion object {

@@ -9,6 +9,11 @@ import com.tgdrive.feature.autobackup.diff.LocalFile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import javax.inject.Inject
@@ -109,6 +114,8 @@ class FolderScanner @Inject constructor(
         }
 
         val results = ArrayList<LocalFile>(256)
+        val scanLock = Any()
+        val dirSemaphore = Semaphore(4)
         var dirCount = 0
         var fileCount = 0
         var skippedCount = 0
@@ -119,92 +126,132 @@ class FolderScanner @Inject constructor(
 
         suspend fun walkWithCursor(treeUri: Uri, docId: String, relPath: String, depth: Int): Boolean {
             if (depth > MAX_DEPTH) return true
-            if (results.size >= MAX_FILES) {
-                hitLimit = true
-                return true
-            }
-
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
-            val subDirs = ArrayList<Pair<String, String>>()
-            val cursor = try {
-                ctx.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
-            } catch (se: SecurityException) {
-                if (depth == 0) {
-                    permissionLost = true
-                    scanError = "Folder permission lost"
-                } else {
-                    errorCount++
-                }
-                return true
-            } catch (t: Throwable) {
-                Log.w("FolderScanner: cursor query failed at depth $depth", t)
-                if (depth == 0) scanError = t.message ?: "Cursor query failed"
-                return false
-            } ?: return false
-
-            cursor.use { c ->
-                val idxId = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val idxName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                val idxMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                val idxSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-                val idxMtime = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-
-                while (c.moveToNext()) {
-                    if (fileCount % YIELD_INTERVAL == 0) {
-                        yield()
-                        onProgress(results.size)
-                    }
-                    if (results.size >= MAX_FILES) {
-                        hitLimit = true
-                        return true
-                    }
-
-                    val childId = if (idxId >= 0) c.getString(idxId) else null
-                    val name = if (idxName >= 0) c.getString(idxName) else null
-                    val mime = (if (idxMime >= 0) c.getString(idxMime) else null) ?: "application/octet-stream"
-                    if (childId.isNullOrBlank() || name.isNullOrBlank()) continue
-
-                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        if (ExcludePatternMatcher.matchesDirectory(name, excludePatterns)) {
-                            continue
-                        }
-                        dirCount++
-                        val childRel = if (relPath.isEmpty()) name else "$relPath/$name"
-                        subDirs.add(childId to childRel)
-                    } else {
-                        fileCount++
-                        val size = if (idxSize >= 0 && !c.isNull(idxSize)) c.getLong(idxSize) else -1L
-                        if (size <= 0L) {
-                            skippedCount++
-                            continue
-                        }
-                        if (ExcludePatternMatcher.matchesPath(relPath, name, excludePatterns)) {
-                            skippedCount++
-                            continue
-                        }
-                        val lastModified = if (idxMtime >= 0 && !c.isNull(idxMtime)) c.getLong(idxMtime) else 0L
-                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
-                        results.add(
-                            LocalFile(
-                                absolutePath = docUri.toString(),
-                                name = name,
-                                size = size,
-                                lastModified = lastModified,
-                                mimeType = mime,
-                                sha256 = null,
-                                relativePath = relPath,
-                            ),
-                        )
-                    }
-                }
-            }
-
-            for ((subId, subRel) in subDirs) {
+            synchronized(scanLock) {
                 if (results.size >= MAX_FILES) {
                     hitLimit = true
-                    break
+                    return true
                 }
-                walkWithCursor(treeUri, subId, subRel, depth + 1)
+            }
+
+            val subDirs = ArrayList<Pair<String, String>>()
+            val localFiles = ArrayList<LocalFile>()
+            var localDirs = 0
+            var localScannedFiles = 0
+            var localSkipped = 0
+            var limitReachedHere = false
+
+            val queryWorked = dirSemaphore.withPermit {
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                val cursor = try {
+                    ctx.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
+                } catch (se: SecurityException) {
+                    synchronized(scanLock) {
+                        if (depth == 0) {
+                            permissionLost = true
+                            scanError = "Folder permission lost"
+                        } else {
+                            errorCount++
+                        }
+                    }
+                    return@withPermit true
+                } catch (t: Throwable) {
+                    Log.w("FolderScanner: cursor query failed at depth $depth", t)
+                    synchronized(scanLock) {
+                        if (depth == 0) scanError = t.message ?: "Cursor query failed"
+                    }
+                    return@withPermit false
+                } ?: return@withPermit false
+
+                cursor.use { c ->
+                    val idxId = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val idxName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val idxMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val idxSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    val idxMtime = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+
+                    while (c.moveToNext()) {
+                        if (localScannedFiles % YIELD_INTERVAL == 0) {
+                            yield()
+                            val countNow = synchronized(scanLock) { results.size + localFiles.size }
+                            onProgress(countNow)
+                        }
+                        val totalNow = synchronized(scanLock) { results.size + localFiles.size }
+                        if (totalNow >= MAX_FILES) {
+                            limitReachedHere = true
+                            break
+                        }
+
+                        val childId = if (idxId >= 0) c.getString(idxId) else null
+                        val name = if (idxName >= 0) c.getString(idxName) else null
+                        val mime = (if (idxMime >= 0) c.getString(idxMime) else null) ?: "application/octet-stream"
+                        if (childId.isNullOrBlank() || name.isNullOrBlank()) continue
+
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            if (ExcludePatternMatcher.matchesDirectory(name, excludePatterns)) {
+                                continue
+                            }
+                            localDirs++
+                            val childRel = if (relPath.isEmpty()) name else "$relPath/$name"
+                            subDirs.add(childId to childRel)
+                        } else {
+                            localScannedFiles++
+                            val size = if (idxSize >= 0 && !c.isNull(idxSize)) c.getLong(idxSize) else -1L
+                            if (size <= 0L) {
+                                localSkipped++
+                                continue
+                            }
+                            if (ExcludePatternMatcher.matchesPath(relPath, name, excludePatterns)) {
+                                localSkipped++
+                                continue
+                            }
+                            val lastModified = if (idxMtime >= 0 && !c.isNull(idxMtime)) c.getLong(idxMtime) else 0L
+                            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                            localFiles.add(
+                                LocalFile(
+                                    absolutePath = docUri.toString(),
+                                    name = name,
+                                    size = size,
+                                    lastModified = lastModified,
+                                    mimeType = mime,
+                                    sha256 = null,
+                                    relativePath = relPath,
+                                ),
+                            )
+                        }
+                    }
+                }
+                true
+            }
+
+            if (!queryWorked) return false
+
+            synchronized(scanLock) {
+                dirCount += localDirs
+                fileCount += localScannedFiles
+                skippedCount += localSkipped
+                if (limitReachedHere) hitLimit = true
+                val remaining = (MAX_FILES - results.size).coerceAtLeast(0)
+                if (localFiles.size <= remaining) {
+                    results.addAll(localFiles)
+                } else {
+                    results.addAll(localFiles.take(remaining))
+                    hitLimit = true
+                }
+            }
+
+            if (subDirs.isNotEmpty()) {
+                coroutineScope {
+                    subDirs.map { (subId, subRel) ->
+                        async {
+                            val atLimit = synchronized(scanLock) { results.size >= MAX_FILES }
+                            if (atLimit) {
+                                synchronized(scanLock) { hitLimit = true }
+                            } else {
+                                walkWithCursor(treeUri, subId, subRel, depth + 1)
+                            }
+                        }
+                    }.awaitAll()
+                }
             }
             return true
         }

@@ -180,4 +180,55 @@ class DiffEngineTest {
         assertThat(r.toUpload.map { it.name }).containsExactly("edited.txt")
         assertThat(r.toSkip.map { it.name }).containsExactly("legacy.txt", "unchanged.txt")
     }
+
+    @Test
+    fun `strict mode skips sha256Provider when path size mtime and stored sha already match`() = runTest {
+        var shaCalls = 0
+        val local = listOf(
+            LocalFile("/a/unchanged.jpg", "unchanged.jpg", 1_000L, lastModified = 50_000L, "image/jpeg"),
+        )
+        val already = listOf(
+            SyncedFileEntity(
+                localPath = "/a/unchanged.jpg",
+                telegramMessageId = 7L,
+                sha256 = "stored_sha",
+                size = 1_000L,
+                syncedAt = 1L,
+                folderId = 1L,
+                lastModified = 50_500L,
+            ),
+        )
+
+        val r = DiffEngine(sha256Provider = { shaCalls++; "computed" }).compute(local, already, strict = true)
+
+        assertThat(shaCalls).isEqualTo(0)
+        assertThat(r.toUpload).isEmpty()
+        assertThat(r.toSkip.map { it.sha256 }).containsExactly("stored_sha")
+    }
+
+    @Test
+    fun `non-strict mode detects uniquely moved file into subfolder instead of re-uploading`() = runTest {
+        val local = listOf(
+            LocalFile("/root/Trips/2026/photo.jpg", "photo.jpg", 2_048L, lastModified = 90_000L, "image/jpeg", relativePath = "Trips/2026"),
+        )
+        val already = listOf(
+            SyncedFileEntity(
+                localPath = "/root/photo.jpg",
+                telegramMessageId = 42L,
+                sha256 = "abc",
+                size = 2_048L,
+                syncedAt = 1L,
+                folderId = 1L,
+                lastModified = 90_000L,
+            ),
+        )
+
+        val r = DiffEngine().compute(local, already, strict = false)
+
+        assertThat(r.toUpload).isEmpty()
+        assertThat(r.toSkip.map { it.name }).containsExactly("photo.jpg")
+        assertThat(r.staleRemotePaths).isEmpty()
+        assertThat(r.movedFiles).hasSize(1)
+        assertThat(r.movedFiles.single().previousRecord.telegramMessageId).isEqualTo(42L)
+    }
 }

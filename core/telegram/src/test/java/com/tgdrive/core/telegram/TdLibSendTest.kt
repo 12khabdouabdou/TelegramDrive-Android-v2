@@ -172,4 +172,32 @@ class TdLibSendTest {
         assertThat(getChatsCalls).isEqualTo(2)
         assertThat(channels).containsExactly(100L, 300L).inOrder()
     }
+
+    @Test
+    fun `TelegramPathTag round-trips subfolder paths and toDomainFile parses caption`() {
+        val caption = TelegramPathTag.formatCaption(" /Work/2026/../Taxes/ ")
+        assertThat(caption).isEqualTo("tgdrive:path=Work/2026/Taxes")
+
+        val tdMsg = TdApi.Message().apply {
+            id = 55L
+            chatId = 100L
+            date = 1_700_000_000
+            content = TdApi.MessageDocument().apply {
+                this.caption = TdApi.FormattedText("Some note\n$caption", emptyArray())
+                document = TdApi.Document().apply {
+                    fileName = "receipt.pdf"
+                    mimeType = "application/pdf"
+                    document = TdApi.File().apply {
+                        id = 9
+                        size = 4096L
+                        remote = TdApi.RemoteFile().apply { id = "rem_55" }
+                    }
+                }
+            }
+        }
+
+        val domain = tdMsg.toDomainFile()
+        assertThat(domain).isNotNull()
+        assertThat(domain!!.virtualPathFromCaption).isEqualTo("Work/2026/Taxes")
+    }
 }

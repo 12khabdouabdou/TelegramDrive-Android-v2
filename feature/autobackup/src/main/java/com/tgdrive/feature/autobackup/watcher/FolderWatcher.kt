@@ -56,6 +56,11 @@ class FolderWatcher @Inject constructor(
         ctx.contentResolver.registerContentObserver(
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, obs
         )
+        runCatching {
+            ctx.contentResolver.registerContentObserver(
+                MediaStore.Files.getContentUri("external"), true, obs
+            )
+        }
         Log.i("FolderWatcher started")
     }
 

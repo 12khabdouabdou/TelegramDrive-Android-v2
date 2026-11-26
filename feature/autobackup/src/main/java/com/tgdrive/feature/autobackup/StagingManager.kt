@@ -76,7 +76,7 @@ class StagingManager @Inject constructor(
                 return null
             }
             input.use { src ->
-                FileOutputStream(target).use { dst -> src.copyTo(dst) }
+                FileOutputStream(target).use { dst -> src.copyTo(dst, bufferSize = STAGE_COPY_BUFFER_BYTES) }
             }
             target.absolutePath
         } catch (e: CancellationException) {
@@ -327,6 +327,7 @@ class StagingManager @Inject constructor(
     }
 
     private companion object {
+        const val STAGE_COPY_BUFFER_BYTES = 256 * 1024
         const val FREE_SPACE_SAFETY_BUFFER_BYTES = 50L * 1024 * 1024
         const val STORAGE_SAVER_MIN_BYTES = 350_000L
         const val STORAGE_SAVER_MAX_DIM = 3840

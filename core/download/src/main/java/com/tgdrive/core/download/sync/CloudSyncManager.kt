@@ -95,6 +95,13 @@ class CloudSyncManager @Inject constructor(
     private val syncDir: File
         get() = File(ctx.cacheDir, "cloud_sync").apply { mkdirs() }
 
+    private val virtualPathOverlayFile: File
+        get() = File(ctx.filesDir, VIRTUAL_PATH_OVERLAY_FILE)
+
+    init {
+        loadVirtualPathOverlayFromDisk()
+    }
+
     fun noteStarChanged(chatId: Long, messageId: Long, isStarred: Boolean) {
         val now = System.currentTimeMillis()
         localStarTimestamps[chatId to messageId] =
@@ -131,15 +138,27 @@ class CloudSyncManager @Inject constructor(
         schedulePushMetadata()
     }
 
-    fun noteVirtualPathChanged(chatId: Long, messageId: Long, virtualPath: String) {
+    fun noteVirtualPathChanged(
+        chatId: Long,
+        messageId: Long,
+        virtualPath: String,
+        schedulePush: Boolean = true,
+    ) {
+        val clean = virtualPath.trim('/')
         localVirtualPathTimestamps[chatId to messageId] = CloudSyncCodec.CloudVirtualPathRecord(
             chatId = chatId,
             messageId = messageId,
-            virtualPath = virtualPath,
+            virtualPath = clean,
             updatedAtMs = System.currentTimeMillis(),
         )
-        schedulePushMetadata()
+        persistVirtualPathOverlayToDisk()
+        if (schedulePush) {
+            schedulePushMetadata()
+        }
     }
+
+    fun getCloudVirtualPath(chatId: Long, messageId: Long): String? =
+        localVirtualPathTimestamps[chatId to messageId]?.virtualPath?.takeIf { it.isNotBlank() }
 
     fun noteLockChanged(chatId: Long, messageId: Long, isLocked: Boolean) {
         localLockTimestamps[chatId to messageId] = CloudSyncCodec.CloudLockRecord(
@@ -906,6 +925,7 @@ class CloudSyncManager @Inject constructor(
                 runCatching { fileCacheDao.updateVirtualPath(vp.chatId, vp.messageId, vp.virtualPath) }
             }
         }
+        persistVirtualPathOverlayToDisk()
 
         merged.lockedFlags.forEach { lk ->
             localLockTimestamps[lk.chatId to lk.messageId] = lk
@@ -1179,9 +1199,82 @@ class CloudSyncManager @Inject constructor(
         localAiTimestamps.clear()
         localVaultAiTimestamps.clear()
         localEncryptedThumbTimestamps.clear()
+        runCatching { virtualPathOverlayFile.delete() }
+    }
+
+    private fun loadVirtualPathOverlayFromDisk() {
+        runCatching {
+            val file = virtualPathOverlayFile
+            if (!file.isFile || file.length() <= 0L) return
+            file.forEachLine { line ->
+                if (line.isBlank()) return@forEachLine
+                val parts = line.split('\t', limit = 4)
+                if (parts.size < 4) return@forEachLine
+                val chatId = parts[0].toLongOrNull() ?: return@forEachLine
+                val msgId = parts[1].toLongOrNull() ?: return@forEachLine
+                val updatedAt = parts[2].toLongOrNull() ?: 0L
+                val vpath = unescapeOverlayValue(parts[3])
+                localVirtualPathTimestamps[chatId to msgId] = CloudSyncCodec.CloudVirtualPathRecord(
+                    chatId = chatId,
+                    messageId = msgId,
+                    virtualPath = vpath,
+                    updatedAtMs = updatedAt,
+                )
+            }
+        }
+    }
+
+    private fun persistVirtualPathOverlayToDisk() {
+        runCatching {
+            val target = virtualPathOverlayFile
+            target.parentFile?.mkdirs()
+            val snapshot = localVirtualPathTimestamps.values.toList()
+            val tmp = File(target.parentFile, "$VIRTUAL_PATH_OVERLAY_FILE.tmp")
+            tmp.bufferedWriter().use { writer ->
+                for (rec in snapshot) {
+                    writer.write(rec.chatId.toString())
+                    writer.write('\t'.code)
+                    writer.write(rec.messageId.toString())
+                    writer.write('\t'.code)
+                    writer.write(rec.updatedAtMs.toString())
+                    writer.write('\t'.code)
+                    writer.write(escapeOverlayValue(rec.virtualPath))
+                    writer.newLine()
+                }
+            }
+            if (target.exists()) target.delete()
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        }
+    }
+
+    private fun escapeOverlayValue(raw: String): String =
+        raw.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+    private fun unescapeOverlayValue(raw: String): String = buildString(raw.length) {
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (raw[i + 1]) {
+                    '\\' -> append('\\')
+                    'n' -> append('\n')
+                    'r' -> append('\r')
+                    't' -> append('\t')
+                    else -> append(raw[i + 1])
+                }
+                i += 2
+            } else {
+                append(ch)
+                i += 1
+            }
+        }
     }
 
     companion object {
+        private const val VIRTUAL_PATH_OVERLAY_FILE = "cloud_virtual_paths_overlay.tsv"
         private const val PUSH_DEBOUNCE_MS = 8_000L
         const val TRASH_RETENTION_MS = 30L * 24L * 60L * 60L * 1000L
 

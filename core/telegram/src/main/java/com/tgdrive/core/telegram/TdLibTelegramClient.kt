@@ -137,6 +137,10 @@ class TdLibTelegramClient(
     private val orphanedSendSucceeded = ConcurrentHashMap<Long, TdApi.Message>()
     private val orphanedSendFailed = ConcurrentHashMap<Long, TdApi.Error>()
     private val pendingSendConfirmations = ConcurrentHashMap<Long, CompletableDeferred<TdApi.Message>>()
+    private val verifiedChatIds = ConcurrentHashMap.newKeySet<Long>()
+    private data class PendingUploadMeta(val caption: String, val prebuiltThumbnailPath: String?)
+    private val pendingUploadMeta = ConcurrentHashMap<String, PendingUploadMeta>()
+    private val lastUploadThumbPruneMs = AtomicLong(0L)
 
     private val _messageIdUpdates = MutableSharedFlow<MessageIdUpdate>(
         extraBufferCapacity = 1024,
@@ -532,6 +536,8 @@ class TdLibTelegramClient(
                 downloadHandlers.clear()
                 uploadHandlers.clear()
                 pendingThumbnails.clear()
+                verifiedChatIds.clear()
+                pendingUploadMeta.clear()
                 withTimeoutOrNull(5_000) {
                     try { send<TdApi.Ok>(TdApi.Close()) } catch (_: Throwable) {}
                 }
@@ -729,6 +735,19 @@ class TdLibTelegramClient(
         send<TdApi.Ok>(TdApi.DeleteChat(chatId)); Unit
     }
 
+    override fun registerUploadMetadata(
+        localPath: String,
+        caption: String,
+        prebuiltThumbnailPath: String?,
+    ) {
+        if (localPath.isBlank()) return
+        if (caption.isBlank() && prebuiltThumbnailPath.isNullOrBlank()) {
+            pendingUploadMeta.remove(localPath)
+        } else {
+            pendingUploadMeta[localPath] = PendingUploadMeta(caption, prebuiltThumbnailPath)
+        }
+    }
+
     override suspend fun uploadFile(
         chatId: Long,
         localPath: String,
@@ -747,20 +766,39 @@ class TdLibTelegramClient(
         Log.i("uploadFile: '$fileName' ($totalSize bytes) → chatId=$chatId")
         onProgress(0L, totalSize)
 
-        try {
-            send<TdApi.Chat>(TdApi.GetChat(chatId))
-        } catch (t: Throwable) {
-            Log.w("uploadFile: GetChat failed (continuing anyway)", t)
+        if (chatId !in verifiedChatIds) {
+            try {
+                send<TdApi.Chat>(TdApi.GetChat(chatId))
+                verifiedChatIds.add(chatId)
+            } catch (t: Throwable) {
+                Log.w("uploadFile: GetChat failed (continuing anyway)", t)
+            }
         }
 
-        val thumbTriple = buildUploadThumbnail(localPath, fileName, mimeType)
+        pruneStaleUploadThumbs()
+        val meta = pendingUploadMeta.remove(localPath)
+        val prebuiltThumbFile = meta?.prebuiltThumbnailPath
+            ?.let(::File)
+            ?.takeIf { it.isFile && it.length() > 0L }
+        val thumbTriple = if (prebuiltThumbFile != null) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(prebuiltThumbFile.absolutePath, bounds)
+            val w = if (bounds.outWidth > 0) bounds.outWidth.coerceIn(1, 320) else 320
+            val h = if (bounds.outHeight > 0) bounds.outHeight.coerceIn(1, 320) else 320
+            Triple(prebuiltThumbFile, w, h)
+        } else {
+            buildUploadThumbnail(localPath, fileName, mimeType)
+        }
         val uploadThumbFile = thumbTriple?.first
+        val createdByClient = prebuiltThumbFile == null && uploadThumbFile != null
+        var keepGeneratedThumb = false
         val inputThumb = thumbTriple?.let { (f, w, h) ->
             TdApi.InputThumbnail(TdApi.InputFileLocal(f.absolutePath), w, h)
         }
+        val captionText = meta?.caption.orEmpty()
         val inputContent = TdApi.InputMessageDocument(
             TdApi.InputDocument(TdApi.InputFileLocal(localPath), inputThumb, false),
-            TdApi.FormattedText(),
+            TdApi.FormattedText(captionText, emptyArray()),
         )
 
         val sendConfirmation = CompletableDeferred<TdApi.Message>()
@@ -777,10 +815,14 @@ class TdLibTelegramClient(
 
             pendingSendConfirmations[localMsgId] = sendConfirmation
 
+            fun readyThumbPath(): String? =
+                uploadThumbFile?.takeIf { it.isFile && it.length() > 0L }?.absolutePath
+
             orphanedSendSucceeded.remove(localMsgId)?.let { orphaned ->
                 pendingSendConfirmations.remove(localMsgId)
+                keepGeneratedThumb = true
                 onProgress(totalSize, totalSize)
-                return@withContext UploadResult(orphaned.id, orphaned.extractRemoteId())
+                return@withContext UploadResult(orphaned.id, orphaned.extractRemoteId(), readyThumbPath())
             }
             orphanedSendFailed.remove(localMsgId)?.let { err ->
                 pendingSendConfirmations.remove(localMsgId)
@@ -789,8 +831,9 @@ class TdLibTelegramClient(
 
             if (sendConfirmation.isCompleted) {
                 val serverMsg = sendConfirmation.await()
+                keepGeneratedThumb = true
                 onProgress(totalSize, totalSize)
-                return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
+                return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId(), readyThumbPath())
             }
 
             if (fileId != null) {
@@ -799,26 +842,93 @@ class TdLibTelegramClient(
                 registerFileHandler(uploadHandlers, fileId, uploadHandler)
                 val lastActivityMs = AtomicLong(System.currentTimeMillis())
                 val lastUploadedBytes = AtomicLong(-1L)
+                val bytesCompletedAtMs = AtomicLong(0L)
+                var uploadConfirmed = false
 
                 val progressJob = launch {
                     for (f in progressChannel) {
                         if (!isActive) break
-                        if (f.remote.isUploadingActive || f.remote.uploadedSize > 0L) {
-                            val uploaded = f.remote.uploadedSize
+                        val remote = f.remote ?: continue
+                        val uploaded = remote.uploadedSize
+                        val remoteTotal = f.size.coerceAtLeast(totalSize)
+                        if (remote.isUploadingCompleted || (remoteTotal > 0L && uploaded >= remoteTotal)) {
+                            bytesCompletedAtMs.compareAndSet(0L, System.currentTimeMillis())
+                            lastActivityMs.set(System.currentTimeMillis())
+                            if (!sendConfirmation.isCompleted) {
+                                // Reserve the final tick until TDLib confirms UpdateMessageSendSucceeded.
+                                val pendingSent = if (remoteTotal > 1L) remoteTotal - 1L else 0L
+                                onProgress(pendingSent, remoteTotal)
+                            }
+                        } else if (remote.isUploadingActive || uploaded > 0L) {
                             if (uploaded > lastUploadedBytes.get()) {
                                 lastUploadedBytes.set(uploaded)
                                 lastActivityMs.set(System.currentTimeMillis())
                             }
-                            onProgress(uploaded, f.size.coerceAtLeast(totalSize))
+                            val reported = if (remoteTotal > 1L) uploaded.coerceAtMost(remoteTotal - 1L) else uploaded
+                            onProgress(reported, remoteTotal)
                         }
                     }
                 }
                 val watchdogJob = launch {
+                    var lastPollAtMs = 0L
                     while (!sendConfirmation.isCompleted) {
                         delay(2_000L)
-                        if (System.currentTimeMillis() - lastActivityMs.get() >= UPLOAD_STALL_TIMEOUT_MS) {
+                        if (sendConfirmation.isCompleted) break
+
+                        orphanedSendSucceeded.remove(localMsgId)?.let { orphaned ->
+                            sendConfirmation.complete(orphaned)
+                            break
+                        }
+                        orphanedSendFailed.remove(localMsgId)?.let { err ->
+                            sendConfirmation.completeExceptionally(TelegramException.fromError(err))
+                            break
+                        }
+
+                        val now = System.currentTimeMillis()
+                        val completedAt = bytesCompletedAtMs.get()
+                        if (completedAt > 0L) {
+                            if (now - lastPollAtMs >= UPLOAD_FINALIZE_POLL_INTERVAL_MS) {
+                                lastPollAtMs = now
+                                val polled = runCatching {
+                                    withTimeoutOrNull(8_000L) {
+                                        send<TdApi.Message>(TdApi.GetMessage(chatId, localMsgId))
+                                    }
+                                }.getOrNull()
+                                if (polled != null) {
+                                    when (val st = polled.sendingState) {
+                                        null -> {
+                                            if (polled.id != 0L) {
+                                                sendConfirmation.complete(polled)
+                                                break
+                                            }
+                                        }
+                                        is TdApi.MessageSendingStateFailed -> {
+                                            val err = st.error ?: TdApi.Error().apply {
+                                                code = -1
+                                                message = "Upload failed on Telegram"
+                                            }
+                                            sendConfirmation.completeExceptionally(TelegramException.fromError(err))
+                                            break
+                                        }
+                                        else -> Unit
+                                    }
+                                }
+                            }
+                            if (now - completedAt >= UPLOAD_FINALIZE_TIMEOUT_MS) {
+                                sendConfirmation.completeExceptionally(
+                                    TelegramException(
+                                        -1,
+                                        "Upload finalization timed out (${UPLOAD_FINALIZE_TIMEOUT_MS / 1000}s) for $fileName",
+                                    ),
+                                )
+                                break
+                            }
+                        } else if (now - lastActivityMs.get() >= UPLOAD_STALL_TIMEOUT_MS) {
                             sendConfirmation.completeExceptionally(
-                                TelegramException(-1, "Upload stalled (no progress for ${UPLOAD_STALL_TIMEOUT_MS / 1000}s) for $fileName"),
+                                TelegramException(
+                                    -1,
+                                    "Upload stalled (no progress for ${UPLOAD_STALL_TIMEOUT_MS / 1000}s) for $fileName",
+                                ),
                             )
                             break
                         }
@@ -827,19 +937,25 @@ class TdLibTelegramClient(
 
                 try {
                     val serverMsg = sendConfirmation.await()
+                    uploadConfirmed = true
+                    keepGeneratedThumb = true
                     val serverId = serverMsg.id
                     val remoteId = serverMsg.extractRemoteId()
                     onProgress(totalSize, totalSize)
-                    return@withContext UploadResult(serverId, remoteId)
+                    return@withContext UploadResult(serverId, remoteId, readyThumbPath())
                 } catch (e: kotlinx.coroutines.CancellationException) {
-                    try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
-                    } catch (_: Throwable) {}
+                    if (!uploadConfirmed && localMsgId != 0L) {
+                        try {
+                            client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
+                        } catch (_: Throwable) {}
+                    }
                     throw e
                 } catch (t: Throwable) {
-                    try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
-                    } catch (_: Throwable) {}
+                    if (!uploadConfirmed && localMsgId != 0L) {
+                        try {
+                            client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
+                        } catch (_: Throwable) {}
+                    }
                     throw t
                 } finally {
                     watchdogJob.cancel()
@@ -852,24 +968,45 @@ class TdLibTelegramClient(
                 try {
                     val serverMsg = withTimeoutOrNull(UPLOAD_NO_FILE_ID_TIMEOUT_MS) { sendConfirmation.await() }
                     if (serverMsg != null) {
+                        keepGeneratedThumb = true
                         onProgress(totalSize, totalSize)
-                        return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId())
+                        return@withContext UploadResult(serverMsg.id, serverMsg.extractRemoteId(), readyThumbPath())
                     }
-                    try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
-                    } catch (_: Throwable) {}
+                    if (localMsgId != 0L) {
+                        try {
+                            client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
+                        } catch (_: Throwable) {}
+                    }
                     throw TelegramException(-1, "Upload timed out for $fileName")
                 } catch (e: kotlinx.coroutines.CancellationException) {
-                    try {
-                        client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
-                    } catch (_: Throwable) {}
+                    if (localMsgId != 0L) {
+                        try {
+                            client?.send(TdApi.DeleteMessages(chatId, longArrayOf(localMsgId), true)) { }
+                        } catch (_: Throwable) {}
+                    }
                     throw e
                 } finally {
                     pendingSendConfirmations.remove(localMsgId)
                 }
             }
         } finally {
-            runCatching { uploadThumbFile?.delete() }
+            if (createdByClient && !keepGeneratedThumb) {
+                runCatching { uploadThumbFile?.delete() }
+            }
+        }
+    }
+
+    private fun pruneStaleUploadThumbs() {
+        val now = System.currentTimeMillis()
+        val prev = lastUploadThumbPruneMs.get()
+        if (now - prev < 30L * 60 * 1000L || !lastUploadThumbPruneMs.compareAndSet(prev, now)) return
+        val dir = File(appContext.cacheDir, "upload_thumbs")
+        if (!dir.isDirectory) return
+        val cutoff = now - 60L * 60 * 1000L
+        dir.listFiles()?.forEach { f ->
+            if (f.isFile && f.lastModified() < cutoff) {
+                runCatching { f.delete() }
+            }
         }
     }
 
@@ -1523,6 +1660,8 @@ class TdLibTelegramClient(
             downloadHandlers.clear()
             uploadHandlers.clear()
             pendingThumbnails.clear()
+            verifiedChatIds.clear()
+            pendingUploadMeta.clear()
             scope.cancel()
             client = null
             initializedApiId = null
@@ -1540,6 +1679,8 @@ class TdLibTelegramClient(
     companion object {
         private val PDF_RENDER_LOCK = Any()
         private const val UPLOAD_STALL_TIMEOUT_MS = 90_000L
+        private const val UPLOAD_FINALIZE_POLL_INTERVAL_MS = 10_000L
+        private const val UPLOAD_FINALIZE_TIMEOUT_MS = 180_000L
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256
         private const val MAX_ZIP_COVER_BYTES = 10L * 1024 * 1024

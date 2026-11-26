@@ -129,8 +129,14 @@ class UploadTracker @Inject constructor(
             }
         }
         val remaining = (safeTotal - safeSent).coerceAtLeast(0L)
-        val etaSeconds = if (speedBps > 0L && safeTotal > 0L && remaining > 0L) remaining / speedBps else null
-        val progress = if (safeTotal > 0L) (safeSent.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f) else 0f
+        val isFinalizing = safeTotal > 1L && safeSent == safeTotal - 1L
+        val etaSeconds = if (!isFinalizing && speedBps > 0L && safeTotal > 0L && remaining > 0L) remaining / speedBps else null
+        val progress = when {
+            safeTotal <= 0L -> 0f
+            isFinalizing -> 0.98f
+            safeSent >= safeTotal -> 1f
+            else -> (safeSent.toFloat() / safeTotal.toFloat()).coerceIn(0f, 0.97f)
+        }
 
         _state.update { cur ->
             cur.copy(
@@ -146,6 +152,11 @@ class UploadTracker @Inject constructor(
                     } else {
                         item.copy(
                             status = UploadStatus.UPLOADING,
+                            statusDetail = if (isFinalizing) {
+                                "Finalizing on Telegram…"
+                            } else {
+                                item.statusDetail?.takeUnless { it == "Finalizing on Telegram…" }
+                            },
                             uploadedBytes = safeSent,
                             totalBytes = if (safeTotal > 0L) safeTotal else item.totalBytes,
                             progress = progress,
@@ -174,7 +185,7 @@ class UploadTracker @Inject constructor(
                             speedBytesPerSec = 0L,
                             etaSeconds = null,
                             status = UploadStatus.DONE,
-                            statusDetail = detail ?: item.statusDetail,
+                            statusDetail = detail ?: item.statusDetail?.takeUnless { it == "Finalizing on Telegram…" },
                             errorMessage = null,
                             canCancel = false,
                             canRetry = false,

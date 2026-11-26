@@ -6,7 +6,9 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
+import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import com.tgdrive.core.common.BitmapUtils
@@ -25,18 +27,24 @@ import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -74,12 +82,34 @@ class MediaThumbnailCache @Inject constructor(
         override fun sizeOf(key: String, value: ByteArray): Int = value.size.coerceAtLeast(1)
     }
 
+    private data class PendingEncryptedThumbUpload(
+        val chatId: Long,
+        val messageId: Long,
+        val bytes: ByteArray,
+    )
+
+    private val encryptedThumbUploadQueue = Channel<PendingEncryptedThumbUpload>(
+        capacity = 128,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
     init {
         scope.launch {
             runCatching {
                 appPreferences.data.collect { prefs ->
                     maxDiskBytes = prefs.thumbnailCacheLimitBytes.coerceAtLeast(MIN_DISK_LIMIT_BYTES)
                 }
+            }
+        }
+        scope.launch {
+            for (item in encryptedThumbUploadQueue) {
+                runCatching {
+                    cloudSyncManager.uploadEncryptedThumbBytes(item.chatId, item.messageId, item.bytes)
+                }.onFailure { t ->
+                    if (t is CancellationException) throw t
+                    Log.w("MediaThumbnailCache: async encrypted thumb upload failed", t)
+                }
+                delay(150L)
             }
         }
     }
@@ -116,8 +146,45 @@ class MediaThumbnailCache @Inject constructor(
     }
 
     fun getCachedThumbnailPath(chatId: Long, messageId: Long): String? {
-        val file = File(thumbsDir, "${chatId}_$messageId.jpg")
-        return file.takeIf { it.isFile && it.length() > 0L }?.also(::touchIfStale)?.absolutePath
+        val webpFile = File(thumbsDir, "${chatId}_$messageId.webp")
+        if (webpFile.isFile && webpFile.length() > 0L) {
+            touchIfStale(webpFile)
+            return webpFile.absolutePath
+        }
+        val jpgFile = File(thumbsDir, "${chatId}_$messageId.jpg")
+        return jpgFile.takeIf { it.isFile && it.length() > 0L }?.also(::touchIfStale)?.absolutePath
+    }
+
+    suspend fun promotePrebuiltThumbnail(
+        chatId: Long,
+        messageId: Long,
+        sourcePath: String,
+    ): String? = withContext(dispatchers.io) {
+        val src = File(sourcePath)
+        if (!src.isFile || src.length() <= 0L) return@withContext null
+        try {
+            val rawBmp = decodeSampledImageFile(sourcePath)
+            val saved = if (rawBmp != null && !rawBmp.isRecycled) {
+                writeThumbnailJpeg(chatId, messageId, rawBmp)
+            } else {
+                val ext = src.extension.lowercase().ifBlank { "jpg" }
+                val dest = File(thumbsDir, "${chatId}_$messageId.$ext")
+                src.copyTo(dest, overwrite = true)
+                maybeEvictDiskCache()
+                dest.takeIf { it.isFile && it.length() > 0L }?.absolutePath
+            }
+            if (saved != null) {
+                failedAtMs.remove(chatId to messageId)
+                runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, saved) }
+            }
+            saved
+        } finally {
+            if (sourcePath.contains("/upload_thumbs/") ||
+                sourcePath.contains("${File.separator}upload_thumbs${File.separator}")
+            ) {
+                runCatching { src.delete() }
+            }
+        }
     }
 
     fun isValidThumbnailPath(path: String?): Boolean {
@@ -230,7 +297,7 @@ class MediaThumbnailCache @Inject constructor(
     ): String? = withContext(dispatchers.io) {
         val path = saveEncryptedThumbnailBytes(chatId, messageId, encryptedBytes) ?: return@withContext null
         runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, path) }
-        runCatching { cloudSyncManager.uploadEncryptedThumbBytes(chatId, messageId, encryptedBytes) }
+        encryptedThumbUploadQueue.trySend(PendingEncryptedThumbUpload(chatId, messageId, encryptedBytes))
         path
     }
 
@@ -451,6 +518,36 @@ class MediaThumbnailCache @Inject constructor(
             FileBucket.VIDEOS -> {
                 semaphore.withPermit {
                     var activeRemoteId = entity.remoteId
+                    var streamInfo = telegramClient.openStreamFile(activeRemoteId)
+                    if (streamInfo == null && entity.chatId != 0L && entity.messageId != 0L) {
+                        val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
+                        if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
+                            activeRemoteId = refreshed
+                            streamInfo = telegramClient.openStreamFile(activeRemoteId)
+                        }
+                    }
+                    if (streamInfo != null && streamInfo.size > 0L) {
+                        val dsFrame = try {
+                            decodeVideoFrameFromDataSource(
+                                TdLibRangeMediaDataSource(
+                                    telegramClient = telegramClient,
+                                    fileId = streamInfo.fileId,
+                                    fileSize = streamInfo.size,
+                                    ioDispatcher = dispatchers.io,
+                                ),
+                            )
+                        } finally {
+                            runCatching { telegramClient.cancelFileStream(streamInfo.fileId) }
+                        }
+                        if (dsFrame != null) {
+                            val saved = writeThumbnailJpeg(entity.chatId, entity.messageId, dsFrame)
+                            if (saved != null) {
+                                runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, saved) }
+                                return@withPermit saved
+                            }
+                        }
+                    }
+
                     var bytes = telegramClient.downloadFileRangeBytes(
                         remoteId = activeRemoteId,
                         offset = 0L,
@@ -517,18 +614,27 @@ class MediaThumbnailCache @Inject constructor(
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun thumbFormatAndExt(): Pair<Bitmap.CompressFormat, String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Bitmap.CompressFormat.WEBP_LOSSY to "webp"
+        } else {
+            Bitmap.CompressFormat.WEBP to "webp"
+        }
+
     private fun writeThumbnailJpeg(
         chatId: Long,
         messageId: Long,
         rawBmp: Bitmap,
     ): String? {
-        val outFile = File(thumbsDir, "${chatId}_$messageId.jpg")
+        val (compressFormat, ext) = thumbFormatAndExt()
+        val outFile = File(thumbsDir, "${chatId}_$messageId.$ext")
         val tmpFile = File(thumbsDir, "${chatId}_$messageId.tmp")
         var scaled: Bitmap = rawBmp
         return try {
             scaled = BitmapUtils.scaleToMax(rawBmp, TARGET_MAX_PX)
             FileOutputStream(tmpFile).use { fos ->
-                scaled.compress(Bitmap.CompressFormat.JPEG, 82, fos)
+                scaled.compress(compressFormat, 78, fos)
             }
             if (tmpFile.isFile && tmpFile.length() > 0L) {
                 if (outFile.exists()) outFile.delete()
@@ -618,6 +724,99 @@ class MediaThumbnailCache @Inject constructor(
             }.onFailure { t ->
                 Log.w("MediaThumbnailCache: failed rendering PDF thumb for ${srcFile.name}", t)
             }.getOrNull()
+        }
+    }
+
+    private fun decodeVideoFrameFromDataSource(source: MediaDataSource): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(source)
+            retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+            runCatching { source.close() }
+        }
+    }
+
+    private class TdLibRangeMediaDataSource(
+        private val telegramClient: TelegramClient,
+        private val fileId: Int,
+        private val fileSize: Long,
+        private val ioDispatcher: CoroutineDispatcher,
+    ) : MediaDataSource() {
+        private val blocks = object : java.util.LinkedHashMap<Long, ByteArray>(8, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ByteArray>?): Boolean = size > 8
+        }
+        @Volatile private var closed = false
+
+        override fun getSize(): Long = fileSize
+
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (closed || position < 0L || position >= fileSize) return -1
+            if (size == 0) return 0
+            val toRead = minOf(size.toLong(), fileSize - position).toInt()
+            var copied = 0
+            var pos = position
+            while (copied < toRead && !closed) {
+                val blockIdx = pos / BLOCK_SIZE
+                val inBlockOffset = (pos % BLOCK_SIZE).toInt()
+                val block = getBlock(blockIdx) ?: break
+                if (inBlockOffset >= block.size) break
+                val n = minOf(toRead - copied, block.size - inBlockOffset)
+                System.arraycopy(block, inBlockOffset, buffer, offset + copied, n)
+                copied += n
+                pos += n
+            }
+            return if (copied > 0) copied else -1
+        }
+
+        private fun getBlock(blockIdx: Long): ByteArray? {
+            synchronized(blocks) {
+                blocks[blockIdx]?.let { return it }
+            }
+            val blockOffset = blockIdx * BLOCK_SIZE
+            if (blockOffset >= fileSize) return null
+            val wantLen = minOf(BLOCK_SIZE.toLong(), fileSize - blockOffset)
+            val state = runCatching {
+                runBlocking(ioDispatcher) {
+                    telegramClient.ensureFileRangeDownloaded(fileId, blockOffset, wantLen)
+                }
+            }.getOrNull() ?: return null
+            if (state.localPath.isEmpty()) return null
+            val f = File(state.localPath)
+            if (!f.isFile) return null
+            val available = when {
+                state.isCompleted -> wantLen
+                state.downloadOffset > blockOffset -> 0L
+                else -> (state.downloadOffset + state.downloadedPrefixSize - blockOffset).coerceIn(0L, wantLen)
+            }
+            if (available <= 0L) return null
+            val data = runCatching {
+                RandomAccessFile(f, "r").use { raf ->
+                    val len = minOf(available, (f.length() - blockOffset).coerceAtLeast(0L)).toInt()
+                    if (len <= 0) return@use ByteArray(0)
+                    ByteArray(len).also { buf ->
+                        raf.seek(blockOffset)
+                        raf.readFully(buf)
+                    }
+                }
+            }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return null
+            synchronized(blocks) {
+                blocks[blockIdx] = data
+            }
+            return data
+        }
+
+        override fun close() {
+            closed = true
+            synchronized(blocks) { blocks.clear() }
+        }
+
+        private companion object {
+            const val BLOCK_SIZE = 256 * 1024
         }
     }
 

@@ -90,6 +90,11 @@ interface TelegramClient : TelegramAuthObserver {
     suspend fun downloadFileRangeBytes(remoteId: String, offset: Long, length: Long): ByteArray? = null
     suspend fun refreshMessageRemoteId(chatId: Long, messageId: Long): String? = null
     suspend fun requestMessageThumbnail(chatId: Long, messageId: Long): String? = null
+    fun registerUploadMetadata(
+        localPath: String,
+        caption: String = "",
+        prebuiltThumbnailPath: String? = null,
+    ) {}
     val thumbnailUpdates: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate>
         get() = EMPTY_THUMBNAIL_UPDATES
     suspend fun close()
@@ -119,10 +124,11 @@ data class ThumbnailUpdate(
     val localPath: String,
 )
 
-/** Result of uploading a file — contains both the server message ID and remote file ID. */
+/** Result of uploading a file — contains server message ID, remote file ID, and optional cached upload thumbnail path. */
 data class UploadResult(
     val messageId: Long,
     val remoteId: String,
+    val generatedThumbPath: String? = null,
 )
 
 /** Fired when TDLib assigns a server message ID to a previously-sent message. */

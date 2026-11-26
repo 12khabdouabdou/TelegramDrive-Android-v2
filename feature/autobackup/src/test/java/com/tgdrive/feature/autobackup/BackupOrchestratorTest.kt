@@ -331,4 +331,60 @@ class BackupOrchestratorTest {
             stagingManager.stageForUpload(any(), any(), any(), any(), any(), any())
         }
     }
+
+    @Test
+    fun `moved file reconciles virtualPath and cloud sync without re-uploading`() = runTest(testDispatcher) {
+        val folderUri = "content://com.android.externalstorage.documents/tree/primary%3ACamera"
+        prefsFlow.value = prefsFlow.value.copy(
+            backupFolderUris = setOf(folderUri),
+            backupAutoOrganizeByDate = true,
+        )
+        val movedLocal = LocalFile(
+            absolutePath = "content://doc/sub/moved.jpg",
+            name = "moved.jpg",
+            size = 4_096L,
+            lastModified = 1_700_000_000_000L,
+            mimeType = "image/jpeg",
+            relativePath = "Trips",
+        )
+        coEvery { folderScanner.scanDetailed(folderUri, any(), any()) } returns FolderScanResult(
+            files = listOf(movedLocal),
+            folderName = "Camera",
+        )
+        coEvery { syncedFileDao.forFolder(any()) } returns listOf(
+            SyncedFileEntity(
+                localPath = "content://doc/moved.jpg",
+                telegramMessageId = 777L,
+                sha256 = "sha777",
+                size = 4_096L,
+                syncedAt = 1L,
+                folderId = null,
+                lastModified = 1_700_000_000_000L,
+            ),
+        )
+
+        val expectedVpath = BackupOrchestrator.buildVirtualPath("Camera", "Trips", true, 1_700_000_000_000L)
+        val outcome = orchestrator.runBackup(jobId = "job_moved", isManual = true)
+
+        assertThat(outcome).isEqualTo(BackupOrchestrator.RunOutcome.Success(uploaded = 0, skipped = 1, total = 0))
+        coVerify(exactly = 0) { telegramClient.uploadFile(any(), any(), any(), any(), any()) }
+        coVerify { syncedFileDao.deleteByPathAndFolder("content://doc/moved.jpg", -1L) }
+        coVerify { fileCacheDao.updateVirtualPath(999L, 777L, expectedVpath) }
+        coVerify { cloudSyncManager.noteVirtualPathChanged(999L, 777L, expectedVpath, schedulePush = false) }
+        coVerify { cloudSyncManager.schedulePushMetadata() }
+    }
+
+    @Test
+    fun `buildVirtualPath combines relative subfolder with year and month when organizeByDate is enabled`() {
+        val ts = java.time.LocalDate.of(2026, 11, 5)
+            .atStartOfDay(java.time.ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+
+        val combined = BackupOrchestrator.buildVirtualPath("Camera", "Vacations", organizeByDate = true, captureTimestampMs = ts)
+        assertThat(combined).isEqualTo("Camera/Vacations/2026/11")
+
+        val alreadyDated = BackupOrchestrator.buildVirtualPath("Camera", "2025/Trips", organizeByDate = true, captureTimestampMs = ts)
+        assertThat(alreadyDated).isEqualTo("Camera/2025/Trips")
+    }
 }

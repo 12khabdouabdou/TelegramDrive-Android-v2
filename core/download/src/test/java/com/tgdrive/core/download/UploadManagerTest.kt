@@ -12,6 +12,7 @@ import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.PendingUploadEntity
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.EncryptedFileFormat
 import com.tgdrive.core.security.KeystoreHelper
@@ -91,6 +92,7 @@ class UploadManagerTest {
             every { isUnmetered } returns MutableStateFlow(true)
             every { isCurrentlyUnmetered() } returns true
         },
+        cloudSyncManager: CloudSyncManager = mockk(relaxed = true),
     ): Pair<UploadManager, UploadTracker> {
         val ctx = fakeContext(File(tmp, "cache").apply { mkdirs() })
         val tracker = UploadTracker(ctx)
@@ -108,6 +110,7 @@ class UploadManagerTest {
             mediaThumbnailCache = thumbCache,
             uploadTracker = tracker,
             backupCrypto = crypto,
+            cloudSyncManager = cloudSyncManager,
             appPreferences = appPreferences,
             networkMonitor = networkMonitor,
             dispatchers = testDispatchers(dispatcher),
@@ -586,5 +589,40 @@ class UploadManagerTest {
         val items = tracker.state.value.items.associateBy { it.fileName }
         assertThat(items["a.bin"]?.status).isEqualTo(UploadStatus.PAUSED)
         assertThat(items["b.bin"]?.status).isEqualTo(UploadStatus.DONE)
+    }
+
+    @Test
+    fun `file URI uploads without extra staging copy and syncs virtualPath to CloudSyncManager`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val src = File(tmp, "contract.pdf").apply { writeBytes("pdf-payload".toByteArray()) }
+        var uploadedLocalPath: String? = null
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } answers {
+                uploadedLocalPath = secondArg()
+                UploadResult(messageId = 808L, remoteId = "rem808")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(33L) } returns emptyList()
+        }
+        val cloudSync = mockk<CloudSyncManager>(relaxed = true)
+        val (manager, tracker) = createManager(tmp, d, tg, dao, cloudSyncManager = cloudSync)
+        runCurrent()
+
+        manager.enqueueFiles(
+            chatId = 33L,
+            files = listOf(UploadFileItem(fileUri(src), "contract.pdf", "application/pdf", src.length())),
+            options = NormalUploadOptions(virtualPath = "Docs/2026"),
+        )
+        advanceUntilIdle()
+
+        assertThat(tracker.state.value.items.single().status).isEqualTo(UploadStatus.DONE)
+        assertThat(uploadedLocalPath).isEqualTo(src.absolutePath)
+        assertThat(src.exists()).isTrue()
+        coVerify { tg.registerUploadMetadata(src.absolutePath, caption = "tgdrive:path=Docs/2026", prebuiltThumbnailPath = null) }
+        coVerify { cloudSync.noteVirtualPathChanged(33L, 808L, "Docs/2026", schedulePush = false) }
+        coVerify(exactly = 1) { cloudSync.schedulePushMetadata() }
     }
 }

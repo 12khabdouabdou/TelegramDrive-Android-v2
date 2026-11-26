@@ -17,7 +17,39 @@ data class TelegramMessage(
     val isAudio: Boolean,
     val isDocument: Boolean,
     val minithumbnailBytes: ByteArray? = null,
+    val caption: String = "",
+    val virtualPathFromCaption: String = "",
 )
+
+/** Encodes/decodes normalized subfolder paths inside Telegram message captions as self-describing fallback metadata. */
+object TelegramPathTag {
+    const val PREFIX = "tgdrive:path="
+
+    fun normalize(raw: String?): String =
+        raw.orEmpty()
+            .trim()
+            .trim('/')
+            .split('/')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+            .joinToString("/")
+
+    fun formatCaption(virtualPath: String): String {
+        val clean = normalize(virtualPath)
+        return if (clean.isEmpty()) "" else "$PREFIX$clean"
+    }
+
+    fun parseVirtualPath(caption: String?): String {
+        if (caption.isNullOrBlank()) return ""
+        for (line in caption.lineSequence()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith(PREFIX, ignoreCase = true)) {
+                return normalize(trimmed.substring(PREFIX.length))
+            }
+        }
+        return ""
+    }
+}
 
 private fun completedLocalPath(file: TdApi.File?): String? {
     val local = file?.local ?: return null
@@ -38,6 +70,7 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
             val doc = c.document
             val file = doc.document
             val imageFallback = if (doc.mimeType.startsWith("image/")) completedLocalPath(file) else null
+            val cap = c.caption?.text.orEmpty()
             TelegramMessage(
                 id = id,
                 chatId = chatId,
@@ -52,12 +85,15 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
                 isAudio = doc.mimeType.startsWith("audio/"),
                 isDocument = true,
                 minithumbnailBytes = doc.minithumbnail?.data,
+                caption = cap,
+                virtualPathFromCaption = TelegramPathTag.parseVirtualPath(cap),
             )
         }
         is TdApi.MessagePhoto -> {
             val largest = c.photo.sizes.maxByOrNull { it.width } ?: return null
             val thumbSize = c.photo.pickThumbnailPhotoSize()
             val file = largest.photo
+            val cap = c.caption?.text.orEmpty()
             TelegramMessage(
                 id = id,
                 chatId = chatId,
@@ -72,11 +108,14 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
                 isAudio = false,
                 isDocument = false,
                 minithumbnailBytes = c.photo.minithumbnail?.data,
+                caption = cap,
+                virtualPathFromCaption = TelegramPathTag.parseVirtualPath(cap),
             )
         }
         is TdApi.MessageVideo -> {
             val v = c.video
             val file = v.video
+            val cap = c.caption?.text.orEmpty()
             TelegramMessage(
                 id = id,
                 chatId = chatId,
@@ -91,11 +130,14 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
                 isAudio = false,
                 isDocument = false,
                 minithumbnailBytes = v.minithumbnail?.data,
+                caption = cap,
+                virtualPathFromCaption = TelegramPathTag.parseVirtualPath(cap),
             )
         }
         is TdApi.MessageAudio -> {
             val a = c.audio
             val file = a.audio
+            val cap = c.caption?.text.orEmpty()
             TelegramMessage(
                 id = id,
                 chatId = chatId,
@@ -109,11 +151,14 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
                 isImage = false,
                 isAudio = true,
                 isDocument = false,
+                caption = cap,
+                virtualPathFromCaption = TelegramPathTag.parseVirtualPath(cap),
             )
         }
         is TdApi.MessageAnimation -> {
             val anim = c.animation
             val file = anim.animation
+            val cap = c.caption?.text.orEmpty()
             TelegramMessage(
                 id = id,
                 chatId = chatId,
@@ -128,6 +173,8 @@ internal fun TdApi.Message.toDomainFile(): TelegramMessage? {
                 isAudio = false,
                 isDocument = false,
                 minithumbnailBytes = anim.minithumbnail?.data,
+                caption = cap,
+                virtualPathFromCaption = TelegramPathTag.parseVirtualPath(cap),
             )
         }
         else -> null
