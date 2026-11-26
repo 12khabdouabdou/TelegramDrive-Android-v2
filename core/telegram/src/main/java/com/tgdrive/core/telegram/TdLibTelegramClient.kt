@@ -382,12 +382,13 @@ class TdLibTelegramClient(
     }
 
     internal suspend fun <T : TdApi.Object> send(function: TdApi.Function<*>): T =
-        withContext(dispatchers.io) {
+        withContext<T>(dispatchers.io) {
             val bypassGate = function is TdApi.Close || function is TdApi.LogOut
             val retrySafe = isFloodRetrySafe(function)
             for (attempt in 0..MAX_FLOOD_WAIT_RETRIES) {
                 try {
-                    return@withContext sendGated(bypassGate, function)
+                    @Suppress("UNCHECKED_CAST")
+                    return@withContext sendGated(bypassGate, function) as T
                 } catch (e: TelegramException) {
                     val waitSec = parseFloodWaitSeconds(e.code, e.errorMessage)
                     if (waitSec != null &&
@@ -414,10 +415,10 @@ class TdLibTelegramClient(
             throw TelegramException(-1, "Unexpected retry termination for ${function.javaClass.simpleName}")
         }
 
-    private suspend fun <T : TdApi.Object> sendGated(
+    private suspend fun sendGated(
         bypassGate: Boolean,
         function: TdApi.Function<*>,
-    ): T {
+    ): TdApi.Object {
         if (bypassGate) return sendOnce(function)
         requestSemaphore.acquire()
         try {
@@ -427,7 +428,7 @@ class TdLibTelegramClient(
         }
     }
 
-    private suspend fun <T : TdApi.Object> sendOnce(function: TdApi.Function<*>): T {
+    private suspend fun sendOnce(function: TdApi.Function<*>): TdApi.Object {
         val override = rawSendOverride
         val c = if (override == null) {
             client ?: initLock.withLock { client }
@@ -435,7 +436,7 @@ class TdLibTelegramClient(
         } else {
             null
         }
-        return suspendCancellableCoroutine { cont ->
+        return suspendCancellableCoroutine<TdApi.Object> { cont ->
             val onResult: (TdApi.Object?) -> Unit = { result ->
                 if (cont.isActive) {
                     when (result) {
@@ -443,7 +444,7 @@ class TdLibTelegramClient(
                             IllegalStateException("TDLib returned null response for ${function.javaClass.simpleName}"),
                         )
                         is TdApi.Error -> cont.resumeWithException(TelegramException.fromError(result))
-                        else -> @Suppress("UNCHECKED_CAST") cont.resume(result as T)
+                        else -> cont.resume(result)
                     }
                 }
             }
