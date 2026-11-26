@@ -16,6 +16,7 @@ import androidx.work.WorkerParameters
 import com.tgdrive.core.common.Log
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -168,9 +169,9 @@ class TransferKeepAliveWorker @AssistedInject constructor(
             }
             val pct = when {
                 weightedKnownBytes > 0L ->
-                    ((weightedDoneBytes / weightedKnownBytes.toDouble()) * 100.0).toInt().coerceIn(0, 100)
+                    ((weightedDoneBytes / weightedKnownBytes.toDouble()) * 100.0).roundToInt().coerceIn(0, 100)
                 fallbackCount > 0 ->
-                    ((fallbackSum / fallbackCount) * 100f).toInt().coerceIn(0, 100)
+                    ((fallbackSum / fallbackCount) * 100f).roundToInt().coerceIn(0, 100)
                 else -> 0
             }
 

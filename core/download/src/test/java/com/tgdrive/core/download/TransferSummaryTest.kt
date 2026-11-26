@@ -39,10 +39,10 @@ class TransferSummaryTest {
             progress = 1.0f, // 1000 done
             status = DownloadStatus.DOWNLOADING,
         )
-        // Weighted total = 2500 / 4000 = 62.5% -> 62%
+        // Weighted total = 2500 / 4000 = 62.5% -> 63% (rounded)
         val (text, pct) = TransferKeepAliveWorker.formatTransferSummary(listOf(upload), listOf(download))
-        assertThat(pct).isEqualTo(62)
-        assertThat(text).isEqualTo("1 upload(s), 1 download(s) (62%)")
+        assertThat(pct).isEqualTo(63)
+        assertThat(text).isEqualTo("1 upload(s), 1 download(s) (63%)")
     }
 
     @Test
