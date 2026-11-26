@@ -518,7 +518,7 @@ class TgDriveDatabaseTest {
 
             // Verify vault-only list, batched thumbnail update tx, and PendingUploadDao.observeCount()
             val vaultOnlyIds = migrated.fileCacheDao().getEncryptedVaultFiles().map { it.messageId }
-            assertThat(vaultOnlyIds).containsExactly(802L, 803L)
+            assertThat(vaultOnlyIds).containsExactly(803L, 802L, 701L).inOrder()
 
             migrated.fileCacheDao().updateThumbnailPaths(
                 listOf(
