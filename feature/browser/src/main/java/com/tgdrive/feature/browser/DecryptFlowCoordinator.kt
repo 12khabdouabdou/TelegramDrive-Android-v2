@@ -26,6 +26,7 @@ internal class DecryptFlowCoordinator(
     private val ioDispatcher: CoroutineDispatcher,
     private val downloadState: StateFlow<DownloadQueueState>,
     private val detectFormat: (File) -> EncryptedFileFormat?,
+    private val hasSavedPassphrase: () -> Boolean = { false },
     private val decryptFile: suspend (
         encryptedFile: File,
         originalDisplayName: String,
@@ -54,11 +55,16 @@ internal class DecryptFlowCoordinator(
         val localFile = resolveLocalFile()?.takeIf { it.isFile }
         if (localFile != null) {
             val fmt = detectFormat(localFile)
+            val autoDecrypt = fmt == EncryptedFileFormat.PASSPHRASE_TGE2 && hasSavedPassphrase()
             _dialog.value = DecryptDialogState(
                 item = item,
                 localFile = localFile,
                 format = fmt,
+                decrypting = autoDecrypt,
             )
+            if (autoDecrypt) {
+                decrypt(passphrase = null, saveToDownloads = false)
+            }
             return
         }
         if (item.remoteId.isBlank()) {
@@ -87,8 +93,18 @@ internal class DecryptFlowCoordinator(
                     val f = terminal.localPath?.let(::File)?.takeIf { it.isFile }
                     if (f != null) {
                         val fmt = detectFormat(f)
+                        val autoDecrypt = fmt == EncryptedFileFormat.PASSPHRASE_TGE2 && hasSavedPassphrase()
                         _dialog.update { cur ->
-                            cur?.copy(localFile = f, format = fmt, downloading = false, error = null)
+                            cur?.copy(
+                                localFile = f,
+                                format = fmt,
+                                downloading = false,
+                                decrypting = autoDecrypt,
+                                error = null,
+                            )
+                        }
+                        if (autoDecrypt) {
+                            decrypt(passphrase = null, saveToDownloads = false)
                         }
                     } else {
                         _dialog.update { cur ->

@@ -106,7 +106,14 @@ class DownloadListViewModel @Inject constructor(
 ) : ViewModel() {
 
     val hasSavedBackupPassphrase: Boolean
-        get() = backupCrypto.hasCustomBackupPassphrase()
+        get() = backupCrypto.hasVaultPassphrase()
+
+    fun saveVaultPassphrase(passphrase: String) {
+        val clean = passphrase.trim()
+        if (clean.length >= 8) {
+            backupCrypto.setVaultPassphrase(clean)
+        }
+    }
 
     fun detectEncryptedFormat(file: File): EncryptedFileFormat =
         uploadManager.detectEncryptedFormat(file)
@@ -550,6 +557,7 @@ fun DownloadListScreen(
             hasSavedBackupPassphrase = vm.hasSavedBackupPassphrase,
             inProgress = decryptInProgress,
             errorMessage = decryptError,
+            onSaveAsVaultPassphrase = vm::saveVaultPassphrase,
             onDecryptAndOpen = { passphrase ->
                 if (localFile == null || !localFile.isFile) {
                     decryptError = openFailedMsg

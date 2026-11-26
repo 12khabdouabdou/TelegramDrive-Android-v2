@@ -20,9 +20,10 @@ import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.download.DecryptedTempSweeper
 import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.PassVaultCloudVerifier
 import com.tgdrive.core.download.UploadManager
-import com.tgdrive.core.download.VaultKeyCloudBackup
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
@@ -46,6 +47,11 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
+enum class PassVaultSaveStatus {
+    SAVED,
+    CLOUD_MISMATCH,
+}
+
 data class SettingsUiState(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val cacheLimitBytes: Long = 500L * 1024 * 1024,
@@ -58,9 +64,10 @@ data class SettingsUiState(
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
     val backupEncryptAll: Boolean = false,
-    val backupUseCustomPassphrase: Boolean = false,
-    val hasCustomPassphrase: Boolean = false,
-    val vaultKeyFingerprint: String = "",
+    val hasVaultPassphrase: Boolean = false,
+    val passphraseFingerprint: String? = null,
+    val hasCloudVerifier: Boolean = false,
+    val passVaultBusy: Boolean = false,
     val decryptedTempTtlMinutes: Int = 30,
     val manualUploadWifiOnly: Boolean = false,
     val biometricTimeoutSeconds: Int = 60,
@@ -71,7 +78,6 @@ data class SettingsUiState(
     val autoSaveDownloadsToPublic: Boolean = false,
     val tempDecryptedCount: Int = 0,
     val tempDecryptedBytes: Long = 0L,
-    val cloudVaultBusy: Boolean = false,
 )
 
 @HiltViewModel
@@ -83,8 +89,9 @@ class SettingsViewModel @Inject constructor(
     private val telegramClient: TelegramClient,
     private val downloadManager: DownloadManager,
     private val uploadManager: UploadManager,
+    private val mediaThumbnailCache: MediaThumbnailCache,
     private val decryptedTempSweeper: DecryptedTempSweeper,
-    private val vaultKeyCloudBackup: VaultKeyCloudBackup,
+    private val passVaultCloudVerifier: PassVaultCloudVerifier,
     private val audioPlayerController: AudioPlayerController,
     private val folderDao: FolderDao,
     private val fileCacheDao: FileCacheDao,
@@ -104,18 +111,24 @@ class SettingsViewModel @Inject constructor(
     private val _vaultVersion = MutableStateFlow(0)
     private val _clearingCache = MutableStateFlow(false)
     private val _tempStatsVersion = MutableStateFlow(0)
-    private val _cloudVaultBusy = MutableStateFlow(false)
+    private val _hasCloudVerifier = MutableStateFlow(false)
+    private val _passVaultBusy = MutableStateFlow(false)
 
     val state: StateFlow<SettingsUiState> = combine(
         combine(preferences.data, _credsVersion, _vaultVersion) { p, c, v ->
             Triple(p, c, v)
         },
-        combine(_clearingCache, cloudSyncManager.syncing, _tempStatsVersion, _cloudVaultBusy) { clearing, syncing, _, busy ->
-            Triple(clearing, syncing, busy)
+        combine(_clearingCache, cloudSyncManager.syncing, _tempStatsVersion, _hasCloudVerifier, _passVaultBusy) {
+                clearing, syncing, _, hasVerifier, busy ->
+            listOf(clearing, syncing, hasVerifier, busy)
         },
-    ) { (p, _, _), (clearing, syncing, busy) ->
+    ) { (p, _, _), aux ->
+        val clearing = aux[0] as Boolean
+        val syncing = aux[1] as Boolean
+        val hasVerifier = aux[2] as Boolean
+        val busy = aux[3] as Boolean
         val creds = keystore.getApiCreds()
-        val fingerprint = runCatching { backupCrypto.vaultKeyFingerprint() }.getOrDefault("")
+        val fingerprint = runCatching { backupCrypto.passphraseFingerprint() }.getOrNull()
         val (tempCount, tempBytes) = runCatching { decryptedTempSweeper.tempCacheStats() }.getOrDefault(0 to 0L)
         SettingsUiState(
             themeMode = p.themeMode,
@@ -129,9 +142,10 @@ class SettingsViewModel @Inject constructor(
             cloudSyncing = syncing,
             lastCloudSyncMs = p.lastCloudSyncMs,
             backupEncryptAll = p.backupEncryptAll,
-            backupUseCustomPassphrase = p.backupUseCustomPassphrase,
-            hasCustomPassphrase = backupCrypto.hasCustomBackupPassphrase(),
-            vaultKeyFingerprint = fingerprint,
+            hasVaultPassphrase = backupCrypto.hasVaultPassphrase(),
+            passphraseFingerprint = fingerprint,
+            hasCloudVerifier = hasVerifier,
+            passVaultBusy = busy,
             decryptedTempTtlMinutes = p.decryptedTempTtlMinutes,
             manualUploadWifiOnly = p.manualUploadWifiOnly,
             biometricTimeoutSeconds = p.biometricTimeoutSeconds,
@@ -142,7 +156,6 @@ class SettingsViewModel @Inject constructor(
             autoSaveDownloadsToPublic = p.autoSaveDownloadsToPublic,
             tempDecryptedCount = tempCount,
             tempDecryptedBytes = tempBytes,
-            cloudVaultBusy = busy,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -194,30 +207,54 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    fun saveBackupPassphrase(passphrase: String) {
+    fun refreshCloudVerifierStatus() {
+        viewModelScope.launch(dispatchers.io) {
+            _hasCloudVerifier.value = runCatching { passVaultCloudVerifier.hasCloudVerifier() }.getOrDefault(false)
+        }
+    }
+
+    suspend fun saveVaultPassphrase(
+        passphrase: String,
+        forceReplace: Boolean = false,
+    ): Result<PassVaultSaveStatus> = withContext(dispatchers.io) {
         val clean = passphrase.trim()
-        if (clean.length < 4) return
-        viewModelScope.launch(dispatchers.io) {
-            backupCrypto.setCustomBackupPassphrase(clean)
-            preferences.update { it.copy(backupUseCustomPassphrase = true) }
+        require(clean.length >= 8) { "Passphrase must be at least 8 characters" }
+        _passVaultBusy.value = true
+        try {
+            val verify = if (forceReplace) {
+                PassVaultCloudVerifier.CloudVerifyResult.NO_CLOUD_VERIFIER
+            } else {
+                passVaultCloudVerifier.verifyAgainstCloud(clean)
+            }
+            if (verify == PassVaultCloudVerifier.CloudVerifyResult.MISMATCH) {
+                _hasCloudVerifier.value = true
+                return@withContext Result.success(PassVaultSaveStatus.CLOUD_MISMATCH)
+            }
+            backupCrypto.setVaultPassphrase(clean)
+            mediaThumbnailCache.clearDecryptedMemoryCache()
+            if (verify == PassVaultCloudVerifier.CloudVerifyResult.NO_CLOUD_VERIFIER || forceReplace) {
+                runCatching { passVaultCloudVerifier.publishVerifier(clean) }
+                    .onSuccess { _hasCloudVerifier.value = true }
+            } else if (verify == PassVaultCloudVerifier.CloudVerifyResult.MATCHED) {
+                _hasCloudVerifier.value = true
+            }
             _vaultVersion.value += 1
+            Result.success(PassVaultSaveStatus.SAVED)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Result.failure(t)
+        } finally {
+            _passVaultBusy.value = false
         }
     }
 
-    fun clearBackupPassphrase() {
+    fun clearVaultPassphrase() {
         viewModelScope.launch(dispatchers.io) {
-            backupCrypto.setCustomBackupPassphrase(null)
-            preferences.update { it.copy(backupUseCustomPassphrase = false) }
+            backupCrypto.setVaultPassphrase(null)
+            mediaThumbnailCache.clearDecryptedMemoryCache()
             _vaultVersion.value += 1
         }
-    }
-
-    fun exportVaultKey(): String = backupCrypto.exportVaultKeyBase64()
-
-    fun importVaultKey(encoded: String): Boolean {
-        val ok = backupCrypto.importVaultKeyBase64(encoded)
-        if (ok) _vaultVersion.value += 1
-        return ok
     }
 
     suspend fun clearDecryptedTempFiles(): Int = withContext(dispatchers.io) {
@@ -282,28 +319,6 @@ class SettingsViewModel @Inject constructor(
 
     fun refreshTempStats() {
         _tempStatsVersion.value += 1
-    }
-
-    suspend fun backupVaultKeyToCloud(recoveryPassphrase: String): Result<Long> {
-        _cloudVaultBusy.value = true
-        return try {
-            vaultKeyCloudBackup.backupToTelegram(recoveryPassphrase)
-        } finally {
-            _cloudVaultBusy.value = false
-        }
-    }
-
-    suspend fun restoreVaultKeyFromCloud(recoveryPassphrase: String): Result<String> {
-        _cloudVaultBusy.value = true
-        return try {
-            val res = vaultKeyCloudBackup.restoreFromTelegram(recoveryPassphrase)
-            if (res.isSuccess) {
-                _vaultVersion.value += 1
-            }
-            res
-        } finally {
-            _cloudVaultBusy.value = false
-        }
     }
 
     fun syncNow() {

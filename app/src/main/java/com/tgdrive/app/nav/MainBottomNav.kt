@@ -383,6 +383,8 @@ fun MainBottomNav(
                 inProgress = rootState.shareUploadInProgress,
                 message = rootState.shareUploadMessage,
                 defaultWifiOnly = rootState.manualUploadWifiOnly,
+                hasSavedPassphrase = rootState.hasSavedPassphrase,
+                onSavePassphrase = rootVm::saveVaultPassphrase,
                 onConfirm = rootVm::confirmShareUpload,
                 onDismiss = rootVm::cancelShareUpload,
             )
@@ -397,13 +399,15 @@ private fun ShareUploadDialog(
     inProgress: Boolean,
     message: String?,
     defaultWifiOnly: Boolean = false,
+    hasSavedPassphrase: Boolean = false,
+    onSavePassphrase: ((String) -> Unit)? = null,
     onConfirm: (
         targetChatId: Long?,
         packAsZip: Boolean,
         zipName: String?,
         zipPassword: String?,
         encryptFiles: Boolean,
-        useVaultKey: Boolean,
+        useSavedPassphrase: Boolean,
         compressionMode: ZipCompressionMode,
         wifiOnly: Boolean,
     ) -> Unit,
@@ -416,7 +420,8 @@ private fun ShareUploadDialog(
     var zipName by remember { mutableStateOf("") }
     var compressionMode by remember { mutableStateOf(ZipCompressionMode.SMART) }
     var encryptFiles by remember { mutableStateOf(false) }
-    var useVaultKey by remember { mutableStateOf(true) }
+    var useSavedPassphrase by remember(hasSavedPassphrase) { mutableStateOf(hasSavedPassphrase) }
+    var saveAsPassVault by remember { mutableStateOf(false) }
     var zipPassword by remember { mutableStateOf("") }
     var wifiOnly by remember(defaultWifiOnly) { mutableStateOf(defaultWifiOnly) }
 
@@ -563,17 +568,18 @@ private fun ShareUploadDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         FilterChip(
-                            selected = useVaultKey,
-                            onClick = { useVaultKey = true },
+                            selected = useSavedPassphrase,
+                            enabled = hasSavedPassphrase,
+                            onClick = { if (hasSavedPassphrase) useSavedPassphrase = true },
                             label = { Text(stringResource(R.string.share_encrypt_vault_key)) },
                         )
                         FilterChip(
-                            selected = !useVaultKey,
-                            onClick = { useVaultKey = false },
+                            selected = !useSavedPassphrase,
+                            onClick = { useSavedPassphrase = false },
                             label = { Text(stringResource(R.string.share_encrypt_custom_password)) },
                         )
                     }
-                    if (!useVaultKey) {
+                    if (!useSavedPassphrase) {
                         OutlinedTextField(
                             value = zipPassword,
                             onValueChange = { zipPassword = it },
@@ -583,6 +589,30 @@ private fun ShareUploadDialog(
                             visualTransformation = PasswordVisualTransformation(),
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        if (!hasSavedPassphrase && onSavePassphrase != null) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable(enabled = !inProgress && zipPassword.trim().length >= 8) {
+                                        saveAsPassVault = !saveAsPassVault
+                                    }
+                                    .padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = saveAsPassVault,
+                                    enabled = !inProgress && zipPassword.trim().length >= 8,
+                                    onCheckedChange = null,
+                                )
+                                Text(
+                                    text = stringResource(R.string.share_save_as_passvault),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 6.dp),
+                                )
+                            }
+                        }
                     }
                 }
                 Row(
@@ -619,18 +649,26 @@ private fun ShareUploadDialog(
         confirmButton = {
             TextButton(
                 onClick = {
+                    val trimmedPass = zipPassword.takeIf { it.isNotBlank() }?.trim()
+                    if (encryptFiles && !useSavedPassphrase && saveAsPassVault && trimmedPass != null && trimmedPass.length >= 8) {
+                        onSavePassphrase?.invoke(trimmedPass)
+                    }
                     onConfirm(
                         selectedChatId.takeIf { it != 0L },
                         packAsZip,
                         zipName.takeIf { it.isNotBlank() },
                         zipPassword.takeIf { it.isNotBlank() },
                         encryptFiles,
-                        useVaultKey,
+                        useSavedPassphrase,
                         compressionMode,
                         wifiOnly,
                     )
                 },
-                enabled = !inProgress && (!encryptFiles || useVaultKey || zipPassword.length >= 4),
+                enabled = !inProgress && (
+                    !encryptFiles ||
+                        useSavedPassphrase ||
+                        zipPassword.length >= 4 && (!saveAsPassVault || zipPassword.trim().length >= 8)
+                    ),
             ) {
                 Text(stringResource(R.string.share_upload_action))
             }

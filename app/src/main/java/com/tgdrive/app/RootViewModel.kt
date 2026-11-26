@@ -17,6 +17,7 @@ import com.tgdrive.core.download.UploadEncryptionSpec
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.AuthorizationState
 import com.tgdrive.core.telegram.TelegramClient
@@ -79,6 +80,7 @@ data class RootState(
     /** Last share-upload result message (shown briefly in the dialog). */
     val shareUploadMessage: String? = null,
     val manualUploadWifiOnly: Boolean = false,
+    val hasSavedPassphrase: Boolean = false,
     val decryptedTempTtlMinutes: Int = 30,
     val blockScreenshotsEverywhere: Boolean = false,
     val pendingShortcutRoute: String? = null,
@@ -90,6 +92,7 @@ class RootViewModel @Inject constructor(
     private val preferences: AppPreferences,
     private val networkMonitor: NetworkMonitor,
     private val keystoreHelper: KeystoreHelper,
+    private val backupCrypto: BackupCrypto,
     private val cloudSyncManager: CloudSyncManager,
     private val fileCacheDao: FileCacheDao,
     private val folderDao: FolderDao,
@@ -218,6 +221,7 @@ class RootViewModel @Inject constructor(
                         biometricUnlocked = if (coldStartLock) false else current.biometricUnlocked,
                         isInitializing = current.isInitializing && (!authSettled || !initialPrefSynced),
                         manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                        hasSavedPassphrase = backupCrypto.hasVaultPassphrase(),
                         decryptedTempTtlMinutes = prefs.decryptedTempTtlMinutes,
                         blockScreenshotsEverywhere = prefs.blockScreenshotsEverywhere,
                     )
@@ -396,13 +400,21 @@ class RootViewModel @Inject constructor(
      * Upload the pending share URIs to [targetChatId] (or Saved Messages when null/0).
      * Optionally packs all shared URIs into an AES-256 or plain ZIP archive when [packAsZip] is true.
      */
+    fun saveVaultPassphrase(passphrase: String) {
+        val clean = passphrase.trim()
+        if (clean.length >= 8) {
+            backupCrypto.setVaultPassphrase(clean)
+            _state.update { it.copy(hasSavedPassphrase = true) }
+        }
+    }
+
     fun confirmShareUpload(
         targetChatId: Long? = null,
         packAsZip: Boolean = false,
         zipName: String? = null,
         zipPassword: String? = null,
         encryptFiles: Boolean = false,
-        useVaultKey: Boolean = true,
+        useSavedPassphrase: Boolean = true,
         compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
         wifiOnly: Boolean = false,
     ) {
@@ -420,8 +432,8 @@ class RootViewModel @Inject constructor(
                 val fileItems = uploadManager.resolveFileItems(parsedUris)
                 val encSpec = UploadEncryptionSpec(
                     enabled = encryptFiles,
-                    useVaultKey = useVaultKey,
-                    customPassphrase = if (encryptFiles && !useVaultKey) zipPassword else null,
+                    useSavedPassphrase = useSavedPassphrase,
+                    customPassphrase = if (encryptFiles && !useSavedPassphrase) zipPassword else null,
                 )
                 if (packAsZip) {
                     val base = ZipUploader.sanitizeZipBaseName(

@@ -64,7 +64,7 @@ class DecryptFlowCoordinatorTest {
                     scope = scope,
                     ioDispatcher = dispatcher,
                     downloadState = dlState,
-                    detectFormat = { EncryptedFileFormat.VAULT_TGE1 },
+                    detectFormat = { EncryptedFileFormat.PASSPHRASE_TGE2 },
                     decryptFile = { _, _, _, _, _, _ -> DecryptOutcome.Failed("unused") },
                     onSavedMessage = {},
                     onMissingRemoteId = {},
@@ -80,7 +80,7 @@ class DecryptFlowCoordinatorTest {
                 val dlg = coordinator.dialog.value
                 assertThat(dlg).isNotNull()
                 assertThat(dlg!!.localFile).isEqualTo(encFile)
-                assertThat(dlg.format).isEqualTo(EncryptedFileFormat.VAULT_TGE1)
+                assertThat(dlg.format).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
                 assertThat(dlg.downloading).isFalse()
             }
         }
@@ -329,6 +329,47 @@ class DecryptFlowCoordinatorTest {
                 )
                 advanceUntilIdle()
                 assertThat(coordinator.dialog.value).isNull()
+            }
+        }
+    }
+
+    @Test
+    fun `start auto-decrypts TGE2 file when saved PassVault passphrase exists and falls back on WrongPassphrase`(
+        @TempDir tempDir: Path,
+    ) {
+        val dispatcher = StandardTestDispatcher()
+        runTest(dispatcher) {
+            withCoordinatorScope(dispatcher) { scope ->
+                val dlState = MutableStateFlow(DownloadQueueState())
+                val encFile = File(tempDir.toFile(), "secret.pdf.tgenc").apply { writeBytes(byteArrayOf(7, 8)) }
+                val decFile = File(tempDir.toFile(), "secret.pdf").apply { writeBytes(byteArrayOf(9)) }
+                var nextOutcome: DecryptOutcome = DecryptOutcome.Success(decFile, "secret.pdf", "application/pdf")
+
+                val coordinator = DecryptFlowCoordinator(
+                    scope = scope,
+                    ioDispatcher = dispatcher,
+                    downloadState = dlState,
+                    detectFormat = { EncryptedFileFormat.PASSPHRASE_TGE2 },
+                    hasSavedPassphrase = { true },
+                    decryptFile = { _, _, pass, _, _, _ ->
+                        assertThat(pass).isNull()
+                        nextOutcome
+                    },
+                    onSavedMessage = {},
+                    onMissingRemoteId = {},
+                )
+
+                coordinator.start(item = sampleItem(), resolveLocalFile = { encFile }, enqueueDownload = {})
+                advanceUntilIdle()
+                assertThat(coordinator.dialog.value).isNull()
+                assertThat(coordinator.openEvent.value?.outcome?.displayName).isEqualTo("secret.pdf")
+
+                coordinator.clearOpenEvent()
+                nextOutcome = DecryptOutcome.WrongPassphrase("Different custom password")
+                coordinator.start(item = sampleItem(), resolveLocalFile = { encFile }, enqueueDownload = {})
+                advanceUntilIdle()
+                assertThat(coordinator.dialog.value?.decrypting).isFalse()
+                assertThat(coordinator.dialog.value?.error).isEqualTo("Different custom password")
             }
         }
     }

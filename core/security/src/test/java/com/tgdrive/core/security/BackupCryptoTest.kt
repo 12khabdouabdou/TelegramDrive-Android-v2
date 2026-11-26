@@ -168,18 +168,19 @@ class BackupCryptoTest {
     }
 
     @Test
-    fun `exportVaultKeyBase64 and importVaultKeyBase64 restore TGE1 decryption across instances`(@TempDir tmp: File) {
+    fun `portable TGE2 encryption decrypts across fresh instances without device key`(@TempDir tmp: File) {
         val crypto1 = BackupCrypto(inMemoryKeystore())
         val crypto2 = BackupCrypto(inMemoryKeystore())
+        crypto1.setVaultPassphrase("cross-device-secret-99")
         val plain = File(tmp, "video.mp4").apply { writeBytes("fake-mp4-header-and-frames".repeat(64).toByteArray()) }
         val enc = File(tmp, "video.mp4.tgenc")
         crypto1.encryptFile(plain, enc)
 
-        val exported = crypto1.exportVaultKeyBase64()
-        assertThat(crypto2.importVaultKeyBase64("not-base64!")).isFalse()
-        assertThat(crypto2.importVaultKeyBase64(java.util.Base64.getEncoder().encodeToString(ByteArray(8)))).isFalse()
-        assertThat(crypto2.importVaultKeyBase64(exported)).isTrue()
-        assertThat(crypto2.vaultKeyFingerprint()).isEqualTo(crypto1.vaultKeyFingerprint())
+        assertThat(crypto1.detectFormat(enc)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        assertThat(crypto2.passphraseFingerprint()).isNull()
+
+        crypto2.setVaultPassphrase("cross-device-secret-99")
+        assertThat(crypto2.passphraseFingerprint()).isEqualTo(crypto1.passphraseFingerprint())
 
         val dec = File(tmp, "restored.mp4")
         crypto2.decryptFile(enc, dec)
@@ -189,6 +190,7 @@ class BackupCryptoTest {
     @Test
     fun `cancelCheck aborts encryptFile mid-stream and deletes partial output`(@TempDir tmp: File) {
         val crypto = BackupCrypto(inMemoryKeystore())
+        crypto.setVaultPassphrase("cancel-check-pass")
         val plain = File(tmp, "big.bin").apply { writeBytes(ByteArray(256 * 1024) { it.toByte() }) }
         val out = File(tmp, "big.bin.tgenc")
 
@@ -200,25 +202,36 @@ class BackupCryptoTest {
     }
 
     @Test
-    fun `wrapVaultKeyWithPassphrase and unwrapAndImportVaultKey recover vault across devices`(@TempDir tmp: File) {
+    fun `legacy TGE1 file is rejected cleanly and thumbnails + verifiers work cross-device`(@TempDir tmp: File) {
         val src = BackupCrypto(inMemoryKeystore())
         val dst = BackupCrypto(inMemoryKeystore())
-        val secretFile = File(tmp, "doc.txt").apply { writeBytes("top-secret-vault-data".repeat(20).toByteArray()) }
-        val encFile = File(tmp, "doc.txt.tgenc")
-        src.encryptFile(secretFile, encFile)
+        src.setVaultPassphrase("portable-thumb-pass")
+        dst.setVaultPassphrase("portable-thumb-pass")
 
-        val wrapped = src.wrapVaultKeyWithPassphrase("recovery-pass-2026")
-        assertThat(BackupCrypto.detectMagicFormat(wrapped)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        // Portable thumbnail key works across installs
+        val thumbPlain = "jpeg-thumbnail-payload".toByteArray()
+        val encThumb = src.encryptThumbnailBytes(thumbPlain)
+        assertThat(encThumb).isNotNull()
+        assertThat(dst.decryptThumbnailBytes(encThumb!!)).isEqualTo(thumbPlain)
 
-        assertThrows<WrongPassphraseException> {
-            dst.unwrapAndImportVaultKey(wrapped, "wrong-recovery-pass")
+        // Changing passphrase invalidates cached thumbnail subkey
+        dst.setVaultPassphrase("wrong-passphrase")
+        assertThat(dst.decryptThumbnailBytes(encThumb)).isNull()
+
+        // Cloud passphrase verifier verifies without exposing plaintext
+        val verifier = src.createPassphraseVerifier("portable-thumb-pass")
+        assertThat(BackupCrypto.detectMagicFormat(verifier)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        assertThat(dst.verifyPassphraseAgainstVerifier(verifier, "portable-thumb-pass")).isTrue()
+        assertThat(dst.verifyPassphraseAgainstVerifier(verifier, "wrong-passphrase")).isFalse()
+
+        // Legacy TGE1 files fail cleanly with WrongPassphraseException
+        val legacyFile = File(tmp, "legacy.jpg.tgenc")
+        legacyFile.outputStream().use { out ->
+            BackupCrypto.encryptStream(ByteArray(32) { 7 }, ByteArrayInputStream("old-data".toByteArray()), out)
         }
-        assertThat(dst.unwrapAndImportVaultKey(wrapped, "recovery-pass-2026")).isTrue()
-        assertThat(dst.vaultKeyFingerprint()).isEqualTo(src.vaultKeyFingerprint())
-
-        val outFile = File(tmp, "doc.txt")
-        dst.decryptFile(encFile, outFile)
-        assertThat(outFile.readBytes()).isEqualTo(secretFile.readBytes())
+        assertThrows<WrongPassphraseException> {
+            dst.decryptFile(legacyFile, File(tmp, "legacy.jpg"), passphrase = "portable-thumb-pass")
+        }
     }
 
     @Test
@@ -259,23 +272,23 @@ class BackupCryptoTest {
     }
 
     @Test
-    fun `wrapVaultKeyWithPassphrase requires at least 8 characters`() {
+    fun `createPassphraseVerifier requires at least 8 characters`() {
         val crypto = BackupCrypto(inMemoryKeystore())
         assertThrows<IllegalArgumentException> {
-            crypto.wrapVaultKeyWithPassphrase("1234567")
+            crypto.createPassphraseVerifier("1234567")
         }
-        val wrapped = crypto.wrapVaultKeyWithPassphrase("12345678")
+        val wrapped = crypto.createPassphraseVerifier("12345678")
         assertThat(BackupCrypto.detectMagicFormat(wrapped)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
     }
 
     @Test
-    fun `encryptFileWithBackupSettings throws instead of downgrading when custom passphrase is missing`(@TempDir tmp: File) {
+    fun `encryptFileWithBackupSettings throws instead of downgrading when passphrase is missing`(@TempDir tmp: File) {
         val crypto = BackupCrypto(inMemoryKeystore())
         val src = File(tmp, "secret.txt").apply { writeText("sensitive") }
         val dst = File(tmp, "secret.txt.tgenc")
 
         assertThrows<IllegalStateException> {
-            crypto.encryptFileWithBackupSettings(src, dst, useCustomPassphrase = true)
+            crypto.encryptFileWithBackupSettings(src, dst)
         }
     }
 
@@ -295,24 +308,24 @@ class BackupCryptoTest {
     @Test
     fun `encryptInputStream and encryptInputStreamWithBackupSettings round trip and clean up on cancel`(@TempDir tmp: File) {
         val crypto = BackupCrypto(inMemoryKeystore())
-        crypto.setCustomBackupPassphrase("direct-stream-pass")
+        crypto.setVaultPassphrase("direct-stream-pass")
         val payload = "Direct encrypted stream avoids 2x disk copy ".repeat(200).toByteArray()
 
-        val vaultOut = File(tmp, "vault_stream.tgenc")
+        val directOut = File(tmp, "direct_stream.tgenc")
         crypto.encryptInputStream(
             input = ByteArrayInputStream(payload),
-            outputFile = vaultOut,
+            outputFile = directOut,
             totalBytes = payload.size.toLong(),
         )
-        val vaultDec = File(tmp, "vault_dec.bin")
-        crypto.decryptFile(vaultOut, vaultDec)
-        assertThat(vaultDec.readBytes()).isEqualTo(payload)
+        assertThat(BackupCrypto.detectMagicFormat(directOut.readBytes())).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        val directDec = File(tmp, "direct_dec.bin")
+        crypto.decryptFile(directOut, directDec)
+        assertThat(directDec.readBytes()).isEqualTo(payload)
 
         val customOut = File(tmp, "custom_stream.tgenc")
         crypto.encryptInputStreamWithBackupSettings(
             input = ByteArrayInputStream(payload),
             outputFile = customOut,
-            useCustomPassphrase = true,
             totalBytes = payload.size.toLong(),
         )
         assertThat(BackupCrypto.detectMagicFormat(customOut.readBytes())).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)

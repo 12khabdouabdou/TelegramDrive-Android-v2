@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
@@ -53,10 +54,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -67,6 +70,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -100,6 +104,7 @@ import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgTypography
 import com.tgdrive.feature.upload.DecryptFileDialog
+import kotlinx.coroutines.launch
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -125,9 +130,11 @@ fun VaultScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptics = LocalHapticFeedback.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
     val selectionMode = state.selectedIds.isNotEmpty()
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
     var showBatchDecryptDialog by remember { mutableStateOf(false) }
+    var showPassphraseDialog by remember { mutableStateOf(false) }
     var promptFired by remember { mutableStateOf(false) }
 
     val bioTitle = stringResource(R.string.vault_biometric_title)
@@ -369,6 +376,11 @@ fun VaultScreen(
                     )
                 }
                 state.items.isEmpty() -> {
+                    if (!state.hasVaultPassphrase) {
+                        VaultNoPassphraseBanner(
+                            onConfigureClick = { showPassphraseDialog = true },
+                        )
+                    }
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         EditorialEmptyState(
                             icon = Icons.Filled.Lock,
@@ -378,6 +390,11 @@ fun VaultScreen(
                     }
                 }
                 else -> {
+                    if (!state.hasVaultPassphrase) {
+                        VaultNoPassphraseBanner(
+                            onConfigureClick = { showPassphraseDialog = true },
+                        )
+                    }
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(2),
                         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 32.dp),
@@ -421,7 +438,7 @@ fun VaultScreen(
         DecryptFileDialog(
             fileName = dlg.item.fileName,
             detectedFormat = dlg.format,
-            hasSavedBackupPassphrase = state.hasSavedBackupPassphrase,
+            hasSavedBackupPassphrase = state.hasVaultPassphrase,
             inProgress = dlg.downloading || dlg.decrypting,
             progressMessage = if (dlg.downloading) {
                 stringResource(R.string.browser_downloading_file, dlg.item.fileName)
@@ -432,6 +449,136 @@ fun VaultScreen(
             onDecryptAndOpen = { pwd -> vm.decryptTarget(pwd, saveToDownloads = false) },
             onDecryptAndSave = { pwd -> vm.decryptTarget(pwd, saveToDownloads = true) },
             onDismiss = vm::dismissDecryptDialog,
+            onSaveAsVaultPassphrase = vm::saveVaultPassphraseQuietly,
+        )
+    }
+
+    if (showPassphraseDialog) {
+        var passInput by remember { mutableStateOf("") }
+        var confirmInput by remember { mutableStateOf("") }
+        var showPass by remember { mutableStateOf(false) }
+        var errMsg by remember { mutableStateOf<String?>(null) }
+        var mismatchDetected by remember { mutableStateOf(false) }
+        val mismatchText = stringResource(R.string.vault_passphrase_cloud_mismatch)
+
+        AlertDialog(
+            onDismissRequest = { if (!state.passphraseBusy) showPassphraseDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.vault_passphrase_dialog_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.vault_passphrase_dialog_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = passInput,
+                        onValueChange = {
+                            passInput = it
+                            errMsg = null
+                            mismatchDetected = false
+                        },
+                        label = { Text(stringResource(R.string.vault_passphrase_dialog_title)) },
+                        singleLine = true,
+                        enabled = !state.passphraseBusy,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPass = !showPass }) {
+                                Icon(
+                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = null,
+                                )
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = confirmInput,
+                        onValueChange = {
+                            confirmInput = it
+                            errMsg = null
+                        },
+                        label = { Text("Confirm passphrase") },
+                        singleLine = true,
+                        enabled = !state.passphraseBusy,
+                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (state.passphraseBusy) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    errMsg?.let { msg ->
+                        Text(msg, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !state.passphraseBusy,
+                    onClick = {
+                        val trimmed = passInput.trim()
+                        when {
+                            trimmed.length < 8 -> errMsg = "Use at least 8 characters"
+                            trimmed != confirmInput.trim() -> errMsg = "Passphrases do not match"
+                            else -> {
+                                scope.launch {
+                                    vm.setAndVerifyVaultPassphrase(trimmed, forceReplace = false)
+                                        .onSuccess { status ->
+                                            if (status == VaultPassphraseSaveStatus.CLOUD_MISMATCH) {
+                                                mismatchDetected = true
+                                                errMsg = mismatchText
+                                            } else {
+                                                showPassphraseDialog = false
+                                            }
+                                        }
+                                        .onFailure { t ->
+                                            errMsg = t.message ?: "Failed to save passphrase"
+                                        }
+                                }
+                            }
+                        }
+                    },
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (mismatchDetected) {
+                        TextButton(
+                            enabled = !state.passphraseBusy,
+                            onClick = {
+                                val trimmed = passInput.trim()
+                                scope.launch {
+                                    vm.setAndVerifyVaultPassphrase(trimmed, forceReplace = true)
+                                        .onSuccess { showPassphraseDialog = false }
+                                        .onFailure { t -> errMsg = t.message ?: "Failed to save passphrase" }
+                                }
+                            },
+                        ) {
+                            Text(
+                                stringResource(R.string.vault_passphrase_replace_action),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                    TextButton(
+                        enabled = !state.passphraseBusy,
+                        onClick = { showPassphraseDialog = false },
+                    ) {
+                        Text(stringResource(R.string.browser_cancel))
+                    }
+                }
+            },
         )
     }
 
@@ -629,6 +776,41 @@ private fun VaultGridCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
             )
+        }
+    }
+}
+
+@Composable
+private fun VaultNoPassphraseBanner(
+    onConfigureClick: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.vault_no_passphrase_title),
+                style = TgTypography.Display.titleSmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = stringResource(R.string.vault_no_passphrase_desc),
+                style = TgTypography.Display.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            OutlinedButton(onClick = onConfigureClick) {
+                Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(R.string.vault_enter_passphrase_action))
+            }
         }
     }
 }

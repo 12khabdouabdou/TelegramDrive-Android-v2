@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -85,6 +86,8 @@ fun FileUploadReviewDialog(
     onDismiss: () -> Unit,
     onConfirm: (FileReviewAction) -> Unit,
     defaultWifiOnly: Boolean = false,
+    hasSavedPassphrase: Boolean = false,
+    onSavePassphrase: ((String) -> Unit)? = null,
 ) {
     val files = remember(initialFiles) {
         mutableStateListOf<UploadFileItem>().apply { addAll(initialFiles) }
@@ -102,7 +105,8 @@ fun FileUploadReviewDialog(
     var autoSplitOversized by remember { mutableStateOf(true) }
 
     var encrypt by remember { mutableStateOf(false) }
-    var useVaultKey by remember { mutableStateOf(true) }
+    var useSavedPassphrase by remember(hasSavedPassphrase) { mutableStateOf(hasSavedPassphrase) }
+    var saveAsPassVault by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
@@ -113,6 +117,7 @@ fun FileUploadReviewDialog(
     val errEmptyPwd = stringResource(R.string.upload_zip_error_empty_password)
     val errMismatch = stringResource(R.string.upload_zip_error_mismatch)
     val errShort = stringResource(R.string.upload_zip_error_short)
+    val errSaveShort = stringResource(R.string.upload_encrypt_error_passvault_short)
 
     val totalBytes = files.sumOf { it.sizeBytes.coerceAtLeast(0L) }
 
@@ -434,23 +439,26 @@ fun FileUploadReviewDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         FilterChip(
-                            selected = useVaultKey,
+                            selected = useSavedPassphrase,
+                            enabled = hasSavedPassphrase,
                             onClick = {
-                                useVaultKey = true
-                                error = null
+                                if (hasSavedPassphrase) {
+                                    useSavedPassphrase = true
+                                    error = null
+                                }
                             },
                             label = { Text(stringResource(R.string.upload_encrypt_vault_key)) },
                         )
                         FilterChip(
-                            selected = !useVaultKey,
+                            selected = !useSavedPassphrase,
                             onClick = {
-                                useVaultKey = false
+                                useSavedPassphrase = false
                                 error = null
                             },
                             label = { Text(stringResource(R.string.upload_encrypt_custom_password)) },
                         )
                     }
-                    if (useVaultKey) {
+                    if (useSavedPassphrase) {
                         Text(
                             stringResource(R.string.upload_encrypt_vault_hint),
                             style = TgTypography.Caption,
@@ -508,6 +516,29 @@ fun FileUploadReviewDialog(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp),
                         )
+                        if (!hasSavedPassphrase && onSavePassphrase != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .toggleable(
+                                        value = saveAsPassVault,
+                                        role = Role.Checkbox,
+                                        onValueChange = {
+                                            saveAsPassVault = it
+                                            error = null
+                                        },
+                                    ),
+                            ) {
+                                Checkbox(checked = saveAsPassVault, onCheckedChange = null)
+                                Text(
+                                    stringResource(R.string.upload_encrypt_save_as_passvault),
+                                    style = TgTypography.Caption,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -560,17 +591,21 @@ fun FileUploadReviewDialog(
                     val cleanZip = zipName.trim().removeSuffix(".zip")
                     when {
                         packAsZip && cleanZip.isBlank() -> error = errEmptyName
-                        encrypt && !useVaultKey && password.isBlank() -> error = errEmptyPwd
-                        encrypt && !useVaultKey && password != confirm -> error = errMismatch
-                        encrypt && !useVaultKey && password.length < 4 -> error = errShort
+                        encrypt && !useSavedPassphrase && password.isBlank() -> error = errEmptyPwd
+                        encrypt && !useSavedPassphrase && password != confirm -> error = errMismatch
+                        encrypt && !useSavedPassphrase && saveAsPassVault && password.trim().length < 8 -> error = errSaveShort
+                        encrypt && !useSavedPassphrase && password.length < 4 -> error = errShort
                         packAsZip -> {
+                            if (encrypt && !useSavedPassphrase && saveAsPassVault) {
+                                onSavePassphrase?.invoke(password.trim())
+                            }
                             onConfirm(
                                 FileReviewAction.PackAsZip(
                                     files = files.toList(),
                                     options = ZipUploadOptions(
                                         name = cleanZip,
-                                        password = if (encrypt && !useVaultKey) password else null,
-                                        useVaultKey = encrypt && useVaultKey,
+                                        password = if (encrypt && !useSavedPassphrase) password else null,
+                                        useSavedPassphrase = encrypt && useSavedPassphrase,
                                         compressionMode = compressionMode,
                                         wifiOnly = wifiOnly,
                                     ),
@@ -578,6 +613,9 @@ fun FileUploadReviewDialog(
                             )
                         }
                         else -> {
+                            if (encrypt && !useSavedPassphrase && saveAsPassVault) {
+                                onSavePassphrase?.invoke(password.trim())
+                            }
                             onConfirm(
                                 FileReviewAction.NormalUpload(
                                     files = files.toList(),
@@ -585,8 +623,8 @@ fun FileUploadReviewDialog(
                                         conflictStrategy = conflictStrategy,
                                         encryption = UploadEncryptionSpec(
                                             enabled = encrypt,
-                                            useVaultKey = useVaultKey,
-                                            customPassphrase = if (encrypt && !useVaultKey) password else null,
+                                            useSavedPassphrase = useSavedPassphrase,
+                                            customPassphrase = if (encrypt && !useSavedPassphrase) password else null,
                                         ),
                                         autoSplitOversized = autoSplitOversized,
                                         wifiOnly = wifiOnly,

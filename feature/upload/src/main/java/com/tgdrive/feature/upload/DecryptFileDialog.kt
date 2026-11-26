@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -53,11 +54,13 @@ fun DecryptFileDialog(
     onDecryptAndOpen: (passphrase: String?) -> Unit,
     onDecryptAndSave: (passphrase: String?) -> Unit,
     onDismiss: () -> Unit,
+    onSaveAsVaultPassphrase: ((String) -> Unit)? = null,
 ) {
     var passphrase by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var saveAsPassVault by remember { mutableStateOf(false) }
     val decryptedName = remember(fileName) { BackupCrypto.stripEncryptedExtension(fileName) }
-    val isVaultFormat = detectedFormat == EncryptedFileFormat.VAULT_TGE1
+    val isLegacyVaultFormat = detectedFormat == EncryptedFileFormat.VAULT_TGE1
 
     AlertDialog(
         onDismissRequest = { if (!inProgress) onDismiss() },
@@ -87,11 +90,11 @@ fun DecryptFileDialog(
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
-                if (isVaultFormat) {
+                if (isLegacyVaultFormat) {
                     Text(
-                        text = stringResource(R.string.decrypt_vault_ready_hint),
+                        text = stringResource(R.string.decrypt_legacy_vault_unsupported),
                         style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = MaterialTheme.colorScheme.error,
                     )
                 } else {
                     Text(
@@ -128,12 +131,35 @@ fun DecryptFileDialog(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (!inProgress) onDecryptAndOpen(passphrase.takeIf { it.isNotBlank() })
+                                if (!inProgress) {
+                                    val trimmed = passphrase.takeIf { it.isNotBlank() }?.trim()
+                                    if (saveAsPassVault && trimmed != null && trimmed.length >= 8) {
+                                        onSaveAsVaultPassphrase?.invoke(trimmed)
+                                    }
+                                    onDecryptAndOpen(passphrase.takeIf { it.isNotBlank() })
+                                }
                             },
                         ),
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
                     )
+                    if (!hasSavedBackupPassphrase && onSaveAsVaultPassphrase != null) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Checkbox(
+                                checked = saveAsPassVault,
+                                enabled = !inProgress && passphrase.trim().length >= 8,
+                                onCheckedChange = { saveAsPassVault = it },
+                            )
+                            Text(
+                                text = stringResource(R.string.decrypt_save_as_passvault),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
 
                 if (inProgress) {
@@ -165,14 +191,26 @@ fun DecryptFileDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                 ) {
                     OutlinedButton(
-                        enabled = !inProgress,
-                        onClick = { onDecryptAndSave(passphrase.takeIf { it.isNotBlank() }) },
+                        enabled = !inProgress && !isLegacyVaultFormat,
+                        onClick = {
+                            val trimmed = passphrase.takeIf { it.isNotBlank() }?.trim()
+                            if (saveAsPassVault && trimmed != null && trimmed.length >= 8) {
+                                onSaveAsVaultPassphrase?.invoke(trimmed)
+                            }
+                            onDecryptAndSave(passphrase.takeIf { it.isNotBlank() })
+                        },
                     ) {
                         Text(stringResource(R.string.decrypt_action_save))
                     }
                     Button(
-                        enabled = !inProgress,
-                        onClick = { onDecryptAndOpen(passphrase.takeIf { it.isNotBlank() }) },
+                        enabled = !inProgress && !isLegacyVaultFormat,
+                        onClick = {
+                            val trimmed = passphrase.takeIf { it.isNotBlank() }?.trim()
+                            if (saveAsPassVault && trimmed != null && trimmed.length >= 8) {
+                                onSaveAsVaultPassphrase?.invoke(trimmed)
+                            }
+                            onDecryptAndOpen(passphrase.takeIf { it.isNotBlank() })
+                        },
                     ) {
                         Text(stringResource(R.string.decrypt_action_open))
                     }

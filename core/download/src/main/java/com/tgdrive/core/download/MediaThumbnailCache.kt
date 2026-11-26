@@ -34,7 +34,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -198,14 +197,7 @@ class MediaThumbnailCache @Inject constructor(
             scaled.compress(Bitmap.CompressFormat.JPEG, 80, jpegOut)
             val plainBytes = jpegOut.toByteArray()
             if (plainBytes.isEmpty()) return@withContext null
-            val encOut = ByteArrayOutputStream()
-            val key = backupCrypto.vaultKey()
-            try {
-                BackupCrypto.encryptStream(key, ByteArrayInputStream(plainBytes), encOut)
-            } finally {
-                key.fill(0)
-            }
-            encOut.toByteArray()
+            backupCrypto.encryptThumbnailBytes(plainBytes)
         } catch (t: Throwable) {
             Log.w("MediaThumbnailCache: buildEncryptedThumbnailBytes failed", t)
             null
@@ -222,14 +214,7 @@ class MediaThumbnailCache @Inject constructor(
             collage.compress(Bitmap.CompressFormat.JPEG, 82, jpegOut)
             val plain = jpegOut.toByteArray()
             if (plain.isEmpty()) return@withContext null
-            val encOut = ByteArrayOutputStream()
-            val key = backupCrypto.vaultKey()
-            try {
-                BackupCrypto.encryptStream(key, ByteArrayInputStream(plain), encOut)
-            } finally {
-                key.fill(0)
-            }
-            encOut.toByteArray()
+            backupCrypto.encryptThumbnailBytes(plain)
         } catch (t: Throwable) {
             Log.w("MediaThumbnailCache: buildEncryptedCollageBytes failed", t)
             null
@@ -331,16 +316,7 @@ class MediaThumbnailCache @Inject constructor(
         if (!f.isFile || f.length() <= 0L) return@withContext null
         touchIfStale(f)
         runCatching {
-            val out = ByteArrayOutputStream()
-            val key = backupCrypto.vaultKey()
-            try {
-                f.inputStream().buffered().use { input ->
-                    BackupCrypto.decryptStream(key, input, out)
-                }
-            } finally {
-                key.fill(0)
-            }
-            val decrypted = out.toByteArray()
+            val decrypted = backupCrypto.decryptThumbnailBytes(f.readBytes()) ?: return@runCatching null
             if (decrypted.isNotEmpty() && decrypted.size <= MAX_CACHED_SINGLE_THUMB_BYTES) {
                 decryptedThumbCache.put(encryptedThumbPath, decrypted)
             }

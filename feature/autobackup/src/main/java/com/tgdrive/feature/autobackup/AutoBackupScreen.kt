@@ -139,6 +139,7 @@ fun AutoBackupScreen(
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
     var showTimePickerDialog by remember { mutableStateOf(false) }
     var showPassphraseDialog by remember { mutableStateOf(false) }
+    var pendingEnableEncryptAll by remember { mutableStateOf(false) }
     var targetOverrideUri by remember { mutableStateOf<String?>(null) }
     var permissionVersion by remember { mutableIntStateOf(0) }
     var dismissBatteryBanner by remember { mutableStateOf(false) }
@@ -242,16 +243,18 @@ fun AutoBackupScreen(
 
     if (showPassphraseDialog) {
         BackupPassphraseDialog(
-            hasSavedPassphrase = state.hasCustomPassphrase,
             onSavePassphrase = { passphrase ->
                 showPassphraseDialog = false
-                vm.setCustomBackupPassphrase(passphrase)
+                vm.setVaultPassphrase(passphrase)
+                if (pendingEnableEncryptAll) {
+                    pendingEnableEncryptAll = false
+                    vm.setEncryptAll(true)
+                }
             },
-            onResetToVaultKey = {
+            onDismiss = {
+                pendingEnableEncryptAll = false
                 showPassphraseDialog = false
-                vm.setCustomBackupPassphrase(null)
             },
-            onDismiss = { showPassphraseDialog = false },
         )
     }
 
@@ -995,12 +998,19 @@ fun AutoBackupScreen(
                         title = stringResource(R.string.backup_encrypt_all_title),
                         description = stringResource(R.string.backup_encrypt_all_desc),
                         checked = prefs.backupEncryptAll,
-                        onChange = vm::setEncryptAll,
+                        onChange = { enabled ->
+                            if (enabled && !state.hasVaultPassphrase) {
+                                pendingEnableEncryptAll = true
+                                showPassphraseDialog = true
+                            } else {
+                                vm.setEncryptAll(enabled)
+                            }
+                        },
                     )
-                    val keyModeSummary = if (prefs.backupUseCustomPassphrase && state.hasCustomPassphrase) {
+                    val keyModeSummary = if (state.hasVaultPassphrase) {
                         stringResource(R.string.backup_key_mode_passphrase)
                     } else {
-                        stringResource(R.string.backup_key_mode_vault)
+                        stringResource(R.string.backup_key_mode_unset)
                     }
                     SectionCard(stringResource(R.string.backup_key_mode_title)) {
                         Row(
@@ -1126,9 +1136,7 @@ private fun ShortcutCard(
 
 @Composable
 private fun BackupPassphraseDialog(
-    hasSavedPassphrase: Boolean,
     onSavePassphrase: (String) -> Unit,
-    onResetToVaultKey: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     var passphrase by remember { mutableStateOf("") }
@@ -1215,15 +1223,8 @@ private fun BackupPassphraseDialog(
             }
         },
         dismissButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                if (hasSavedPassphrase) {
-                    TextButton(onClick = onResetToVaultKey) {
-                        Text(stringResource(R.string.backup_use_vault_key))
-                    }
-                }
-                TextButton(onClick = onDismiss) {
-                    Text(stringResource(R.string.backup_dismiss))
-                }
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.backup_dismiss))
             }
         },
     )

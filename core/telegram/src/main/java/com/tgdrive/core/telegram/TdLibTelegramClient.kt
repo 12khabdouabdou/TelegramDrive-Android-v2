@@ -145,6 +145,7 @@ class TdLibTelegramClient(
     override val messageIdUpdates: kotlinx.coroutines.flow.SharedFlow<MessageIdUpdate> = _messageIdUpdates.asSharedFlow()
 
     private val initLock = Mutex()
+    private val systemChannelLock = Mutex()
     private val requestSemaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
 
     private fun <V : Any> putBoundedOrphan(
@@ -662,36 +663,56 @@ class TdLibTelegramClient(
         folders
     }
 
-    override suspend fun getOrCreateSystemChannel(): Long? = withContext(dispatchers.io) {
-        systemChannelIdCache?.let { return@withContext it }
-        try {
-            try {
-                send<TdApi.Ok>(TdApi.LoadChats(TdApi.ChatListMain(), 200))
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (_: Throwable) {}
-            val resp = send<TdApi.Chats>(TdApi.GetChats(TdApi.ChatListMain(), 200))
-            for (id in resp.chatIds) {
-                val chat = runCatching { send<TdApi.Chat>(TdApi.GetChat(id)) }.getOrNull() ?: continue
-                val type = chat.type
-                if (type is TdApi.ChatTypeSupergroup && type.isChannel && chat.title == TelegramClient.SYSTEM_CHANNEL_TITLE) {
-                    val supergroup = runCatching { send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId)) }.getOrNull()
-                    if (supergroup?.status is TdApi.ChatMemberStatusCreator) {
-                        systemChannelIdCache = chat.id
-                        return@withContext chat.id
-                    }
+    override suspend fun findAllSystemChannelIds(): List<Long> = withContext(dispatchers.io) {
+        var mainResp = fetchMainChats()
+        if (mainResp.chatIds.isEmpty()) {
+            delay(500L)
+            mainResp = fetchMainChats()
+        }
+        val serverResp = runCatching {
+            send<TdApi.Chats>(TdApi.SearchChatsOnServer(TelegramClient.SYSTEM_CHANNEL_TITLE, null, 20))
+        }.getOrNull()
+        val candidateIds = buildList {
+            mainResp.chatIds.forEach { add(it) }
+            serverResp?.chatIds?.forEach { add(it) }
+        }.distinct()
+
+        val ownedChannels = mutableListOf<Long>()
+        for (id in candidateIds) {
+            val chat = runCatching { send<TdApi.Chat>(TdApi.GetChat(id)) }.getOrNull() ?: continue
+            val type = chat.type
+            if (type is TdApi.ChatTypeSupergroup && type.isChannel && chat.title == TelegramClient.SYSTEM_CHANNEL_TITLE) {
+                val supergroup = runCatching { send<TdApi.Supergroup>(TdApi.GetSupergroup(type.supergroupId)) }.getOrNull()
+                if (supergroup?.status is TdApi.ChatMemberStatusCreator) {
+                    ownedChannels.add(chat.id)
                 }
             }
-            val created = send<TdApi.Chat>(
-                TdApi.CreateNewSupergroupChat(TelegramClient.SYSTEM_CHANNEL_TITLE, false, true, null, null, 0, false),
-            )
-            systemChannelIdCache = created.id
-            created.id
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (t: Throwable) {
-            Log.w("getOrCreateSystemChannel failed", t)
-            null
+        }
+        ownedChannels.sorted()
+    }
+
+    override suspend fun getOrCreateSystemChannel(): Long? = withContext(dispatchers.io) {
+        systemChannelIdCache?.let { return@withContext it }
+        systemChannelLock.withLock {
+            systemChannelIdCache?.let { return@withLock it }
+            try {
+                val existing = findAllSystemChannelIds()
+                if (existing.isNotEmpty()) {
+                    val primary = existing.first()
+                    systemChannelIdCache = primary
+                    return@withLock primary
+                }
+                val created = send<TdApi.Chat>(
+                    TdApi.CreateNewSupergroupChat(TelegramClient.SYSTEM_CHANNEL_TITLE, false, true, null, null, 0, false),
+                )
+                systemChannelIdCache = created.id
+                created.id
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.w("getOrCreateSystemChannel failed", t)
+                null
+            }
         }
     }
 

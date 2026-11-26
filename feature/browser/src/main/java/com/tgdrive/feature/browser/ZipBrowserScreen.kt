@@ -408,11 +408,13 @@ fun ZipBrowserScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        TextButton(onClick = { vm.unlockPreviewsWithVault() }) {
-                            Text(
-                                stringResource(R.string.zip_unlock_previews_vault),
-                                fontWeight = FontWeight.Bold,
-                            )
+                        if (state.hasSavedBackupPassphrase) {
+                            TextButton(onClick = { vm.unlockPreviewsWithSavedPassphrase() }) {
+                                Text(
+                                    stringResource(R.string.zip_unlock_previews_vault),
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                         TextButton(onClick = {
                             passwordForExtractAll = false
@@ -582,50 +584,26 @@ fun ZipBrowserScreen(
                     password = passwordInput,
                     hasSavedBackupPassphrase = state.hasSavedBackupPassphrase,
                     onPasswordChange = { passwordInput = it },
-                    onUnlockWithVaultKey = {
-                        showPasswordDialog = null
-                        passwordInput = ""
-                        if (passwordForPreviewsOnly) {
-                            passwordForPreviewsOnly = false
-                            vm.unlockPreviewsWithVault(useSavedBackupPassphrase = false)
-                        } else if (passwordForExtractAll) {
-                            passwordForExtractAll = false
-                            vm.unlockWithVaultKey(
-                                entryName = null,
-                                onUnlocked = { vm.extractAllToDownloads() },
-                            )
-                        } else if (passwordForSaveEntry) {
-                            passwordForSaveEntry = false
-                            vm.unlockWithVaultKey(
-                                entryName = null,
-                                onUnlocked = { vm.extractSingleEntryToDownloads(entryName) },
-                            )
-                        } else {
-                            vm.unlockWithVaultKey(entryName = entryName)
-                        }
-                    },
                     onUnlockWithSavedPassphrase = {
                         showPasswordDialog = null
                         passwordInput = ""
                         if (passwordForPreviewsOnly) {
                             passwordForPreviewsOnly = false
-                            vm.unlockPreviewsWithVault(useSavedBackupPassphrase = true)
+                            vm.unlockPreviewsWithSavedPassphrase()
                         } else if (passwordForExtractAll) {
                             passwordForExtractAll = false
-                            vm.unlockWithVaultKey(
+                            vm.unlockWithSavedPassphrase(
                                 entryName = null,
-                                useSavedBackupPassphrase = true,
                                 onUnlocked = { vm.extractAllToDownloads() },
                             )
                         } else if (passwordForSaveEntry) {
                             passwordForSaveEntry = false
-                            vm.unlockWithVaultKey(
+                            vm.unlockWithSavedPassphrase(
                                 entryName = null,
-                                useSavedBackupPassphrase = true,
                                 onUnlocked = { vm.extractSingleEntryToDownloads(entryName) },
                             )
                         } else {
-                            vm.unlockWithVaultKey(entryName = entryName, useSavedBackupPassphrase = true)
+                            vm.unlockWithSavedPassphrase(entryName = entryName)
                         }
                     },
                     onConfirm = {
@@ -1505,7 +1483,6 @@ private fun PasswordDialog(
     password: String,
     hasSavedBackupPassphrase: Boolean = false,
     onPasswordChange: (String) -> Unit,
-    onUnlockWithVaultKey: () -> Unit = {},
     onUnlockWithSavedPassphrase: () -> Unit = {},
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
@@ -1531,24 +1508,18 @@ private fun PasswordDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = TgTypography.Display.bodySmall,
                 )
-                OutlinedButton(
-                    onClick = onUnlockWithVaultKey,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(
-                        Icons.Filled.LockOpen,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Spacer(Modifier.size(8.dp))
-                    Text(stringResource(R.string.zip_browser_unlock_vault))
-                }
                 if (hasSavedBackupPassphrase) {
                     OutlinedButton(
                         onClick = onUnlockWithSavedPassphrase,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(stringResource(R.string.zip_browser_use_saved_passphrase))
+                        Icon(
+                            Icons.Filled.LockOpen,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.size(8.dp))
+                        Text(stringResource(R.string.zip_browser_unlock_vault))
                     }
                 }
                 OutlinedTextField(

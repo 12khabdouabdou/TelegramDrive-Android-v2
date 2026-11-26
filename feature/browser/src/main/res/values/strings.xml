@@ -269,11 +269,11 @@
     <string name="browser_folder_upload_title">Upload folder files</string>
     <string name="browser_folder_upload_desc">Upload all files from \"%1$s\" keeping subfolder structure.</string>
     <string name="browser_folder_encrypt_label">Encrypt uploaded files (.tgenc)</string>
-    <string name="zip_browser_unlock_vault">Unlock with Vault Key</string>
-    <string name="zip_browser_use_saved_passphrase">Use Backup Passphrase</string>
+    <string name="zip_browser_unlock_vault">Unlock with PassVault</string>
+    <string name="zip_browser_use_saved_passphrase">Use Saved Passphrase</string>
     <string name="zip_unlock_previews_title">Thumbnails locked</string>
     <string name="zip_unlock_previews_desc">Unlock encrypted previews in this archive</string>
-    <string name="zip_unlock_previews_vault">Vault Key</string>
+    <string name="zip_unlock_previews_vault">PassVault</string>
     <string name="zip_unlock_previews_password">Password</string>
     <string name="zip_browser_toggle_grid">Grid view</string>
     <string name="zip_browser_toggle_list">List view</string>
@@ -286,7 +286,7 @@
     <string name="browser_batch_decrypt">Decrypt selected</string>
     <string name="browser_batch_decrypt_title">Decrypt %1$d encrypted file(s)</string>
     <string name="browser_batch_decrypt_desc">All selected files will be decrypted and saved to Downloads/TelegramDrive.</string>
-    <string name="browser_batch_decrypt_passphrase_hint">Passphrase (leave blank for Device Vault Key)</string>
+    <string name="browser_batch_decrypt_passphrase_hint">Passphrase (leave blank for saved PassVault passphrase)</string>
     <string name="browser_batch_decrypt_action">Decrypt &amp; Save</string>
     <string name="browser_batch_decrypt_progress">Decrypting %1$d / %2$d…</string>
     <string name="browser_batch_decrypt_done">Decrypted %1$d file(s) to Downloads</string>
@@ -302,6 +302,13 @@
     <string name="vault_items_count">%1$d encrypted item(s)</string>
     <string name="vault_biometric_title">Unlock Private Vault</string>
     <string name="vault_biometric_subtitle">Confirm your identity to access encrypted files</string>
+    <string name="vault_no_passphrase_title">PassVault passphrase not set</string>
+    <string name="vault_no_passphrase_desc">Enter your portable PassVault passphrase to unlock encrypted thumbnails and 1-tap file decryption on this device.</string>
+    <string name="vault_enter_passphrase_action">Set / Enter Passphrase</string>
+    <string name="vault_passphrase_dialog_title">PassVault passphrase</string>
+    <string name="vault_passphrase_dialog_desc">Use the same PassVault passphrase you encrypted files with on your previous device, or create a new one.</string>
+    <string name="vault_passphrase_cloud_mismatch">This passphrase does not match your cloud PassVault verifier on Telegram. Use the matching passphrase or replace it.</string>
+    <string name="vault_passphrase_replace_action">Replace anyway</string>
     <string name="search_scope_encrypted">Encrypted</string>
     <string name="search_filters_toggle">Search filters</string>
     <string name="search_filter_folder">Folder</string>

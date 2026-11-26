@@ -11,7 +11,6 @@ import com.tgdrive.core.common.Log
 import com.tgdrive.core.security.BackupCrypto
 import net.lingala.zip4j.ZipFile
 import net.lingala.zip4j.model.FileHeader
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
@@ -314,11 +313,7 @@ class ZipThumbnailGenerator(
                 val crypto = backupCrypto ?: return@runCatching null
                 val f = File(dir, "$hash.tgethumb")
                 if (!f.isFile || f.length() <= 0L) return@runCatching null
-                val out = ByteArrayOutputStream()
-                f.inputStream().buffered().use { input ->
-                    BackupCrypto.decryptStream(crypto.vaultKey(), input, out)
-                }
-                val bytes = out.toByteArray()
+                val bytes = crypto.decryptThumbnailBytes(f.readBytes()) ?: return@runCatching null
                 if (bytes.isEmpty()) null else BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             }
         }.getOrNull()
@@ -340,9 +335,8 @@ class ZipThumbnailGenerator(
             if (!encrypted) {
                 tmp.writeBytes(plain)
             } else {
-                tmp.outputStream().buffered().use { out ->
-                    BackupCrypto.encryptStream(backupCrypto!!.vaultKey(), ByteArrayInputStream(plain), out)
-                }
+                val enc = backupCrypto!!.encryptThumbnailBytes(plain) ?: return@runCatching
+                tmp.writeBytes(enc)
             }
             if (!tmp.renameTo(dest)) {
                 tmp.copyTo(dest, overwrite = true)

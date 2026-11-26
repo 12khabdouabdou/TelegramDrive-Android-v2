@@ -633,6 +633,8 @@ fun HomeScreen(
                 onDismiss = vm::dismissFileReview,
                 onConfirm = vm::confirmFileReview,
                 defaultWifiOnly = state.manualUploadWifiOnly,
+                hasSavedPassphrase = state.hasSavedPassphrase,
+                onSavePassphrase = vm::saveVaultPassphrase,
             )
         }
     }
@@ -643,6 +645,8 @@ fun HomeScreen(
             summary = zipPreviewSummary,
             summaryLoading = zipPreviewLoading,
             defaultWifiOnly = state.manualUploadWifiOnly,
+            hasSavedPassphrase = state.hasSavedPassphrase,
+            onSavePassphrase = vm::saveVaultPassphrase,
             onExcludePatternsChanged = { pat ->
                 zipExcludesDraft = pat
                 vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)

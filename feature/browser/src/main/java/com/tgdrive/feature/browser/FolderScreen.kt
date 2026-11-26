@@ -79,6 +79,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -790,6 +791,8 @@ fun FolderScreen(
             onDismiss = vm::dismissFileUploadReview,
             onConfirm = vm::confirmFileReview,
             defaultWifiOnly = state.manualUploadWifiOnly,
+            hasSavedPassphrase = state.hasSavedBackupPassphrase,
+            onSavePassphrase = vm::saveVaultPassphrase,
         )
     }
 
@@ -797,6 +800,8 @@ fun FolderScreen(
         FolderNormalUploadDialog(
             folderName = folderName,
             defaultWifiOnly = state.manualUploadWifiOnly,
+            hasSavedPassphrase = state.hasSavedBackupPassphrase,
+            onSavePassphrase = vm::saveVaultPassphrase,
             onDismiss = { pendingNormalFolder = null },
             onConfirm = { options ->
                 pendingNormalFolder = null
@@ -811,6 +816,8 @@ fun FolderScreen(
             summary = state.zipPreviewSummary,
             summaryLoading = state.zipPreviewLoading,
             defaultWifiOnly = state.manualUploadWifiOnly,
+            hasSavedPassphrase = state.hasSavedBackupPassphrase,
+            onSavePassphrase = vm::saveVaultPassphrase,
             onExcludePatternsChanged = { pat ->
                 zipExcludesDraft = pat
                 vm.inspectZipFolder(treeUri, pat, zipPartCapDraft)
@@ -853,6 +860,7 @@ fun FolderScreen(
             onDecryptAndOpen = { pwd -> vm.decryptTarget(pwd, saveToDownloads = false) },
             onDecryptAndSave = { pwd -> vm.decryptTarget(pwd, saveToDownloads = true) },
             onDismiss = vm::dismissDecryptDialog,
+            onSaveAsVaultPassphrase = vm::saveVaultPassphrase,
         )
     }
 
@@ -1313,12 +1321,15 @@ private fun UploadsStrip(
 private fun FolderNormalUploadDialog(
     folderName: String,
     defaultWifiOnly: Boolean = false,
+    hasSavedPassphrase: Boolean = false,
+    onSavePassphrase: ((String) -> Unit)? = null,
     onDismiss: () -> Unit,
     onConfirm: (NormalUploadOptions) -> Unit,
 ) {
     var conflict by remember { mutableStateOf(UploadConflictStrategy.KEEP_BOTH) }
     var encrypt by remember { mutableStateOf(false) }
-    var useVaultKey by remember { mutableStateOf(true) }
+    var useSavedPassphrase by remember(hasSavedPassphrase) { mutableStateOf(hasSavedPassphrase) }
+    var saveAsPassVault by remember { mutableStateOf(false) }
     var wifiOnly by remember(defaultWifiOnly) { mutableStateOf(defaultWifiOnly) }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
@@ -1390,23 +1401,26 @@ private fun FolderNormalUploadDialog(
                 if (encrypt) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
-                            selected = useVaultKey,
+                            selected = useSavedPassphrase,
+                            enabled = hasSavedPassphrase,
                             onClick = {
-                                useVaultKey = true
-                                error = null
+                                if (hasSavedPassphrase) {
+                                    useSavedPassphrase = true
+                                    error = null
+                                }
                             },
-                            label = { Text("Device Vault Key") },
+                            label = { Text("PassVault passphrase") },
                         )
                         FilterChip(
-                            selected = !useVaultKey,
+                            selected = !useSavedPassphrase,
                             onClick = {
-                                useVaultKey = false
+                                useSavedPassphrase = false
                                 error = null
                             },
                             label = { Text("Custom password") },
                         )
                     }
-                    if (!useVaultKey) {
+                    if (!useSavedPassphrase) {
                         OutlinedTextField(
                             value = password,
                             onValueChange = {
@@ -1447,6 +1461,29 @@ private fun FolderNormalUploadDialog(
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        if (!hasSavedPassphrase && onSavePassphrase != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .toggleable(
+                                        value = saveAsPassVault,
+                                        role = Role.Checkbox,
+                                        onValueChange = {
+                                            saveAsPassVault = it
+                                            error = null
+                                        },
+                                    ),
+                            ) {
+                                Checkbox(checked = saveAsPassVault, onCheckedChange = null)
+                                Text(
+                                    "Save as my PassVault passphrase",
+                                    style = TgTypography.Caption,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
                 Row(
@@ -1474,19 +1511,26 @@ private fun FolderNormalUploadDialog(
         confirmButton = {
             TextButton(onClick = {
                 when {
-                    encrypt && !useVaultKey && password.length < 4 -> error = "Use at least 4 characters"
-                    encrypt && !useVaultKey && password != confirm -> error = "Passwords don't match"
-                    else -> onConfirm(
-                        NormalUploadOptions(
-                            conflictStrategy = conflict,
-                            encryption = UploadEncryptionSpec(
-                                enabled = encrypt,
-                                useVaultKey = useVaultKey,
-                                customPassphrase = if (encrypt && !useVaultKey) password else null,
+                    encrypt && !useSavedPassphrase && password.length < 4 -> error = "Use at least 4 characters"
+                    encrypt && !useSavedPassphrase && password != confirm -> error = "Passwords don't match"
+                    encrypt && !useSavedPassphrase && saveAsPassVault && password.trim().length < 8 ->
+                        error = "Use at least 8 characters to save as PassVault passphrase"
+                    else -> {
+                        if (encrypt && !useSavedPassphrase && saveAsPassVault) {
+                            onSavePassphrase?.invoke(password.trim())
+                        }
+                        onConfirm(
+                            NormalUploadOptions(
+                                conflictStrategy = conflict,
+                                encryption = UploadEncryptionSpec(
+                                    enabled = encrypt,
+                                    useSavedPassphrase = useSavedPassphrase,
+                                    customPassphrase = if (encrypt && !useSavedPassphrase) password else null,
+                                ),
+                                wifiOnly = wifiOnly,
                             ),
-                            wifiOnly = wifiOnly,
-                        ),
-                    )
+                        )
+                    }
                 }
             }) {
                 Text(stringResource(R.string.browser_action_upload), fontWeight = FontWeight.Bold)

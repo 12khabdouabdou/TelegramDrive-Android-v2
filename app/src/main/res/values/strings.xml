@@ -45,8 +45,9 @@
     <string name="share_zip_name_label">ZIP archive name (optional)</string>
     <string name="share_zip_password_label">Encryption password</string>
     <string name="share_encrypt_files">Encrypt with AES-256</string>
-    <string name="share_encrypt_vault_key">Device Vault Key</string>
+    <string name="share_encrypt_vault_key">PassVault passphrase</string>
     <string name="share_encrypt_custom_password">Custom password</string>
+    <string name="share_save_as_passvault">Save as my PassVault passphrase</string>
     <string name="share_wifi_only">Upload over Wi-Fi only</string>
     <string name="share_upload_action">Upload</string>
 

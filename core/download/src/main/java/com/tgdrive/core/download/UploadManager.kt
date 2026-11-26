@@ -3,7 +3,6 @@ package com.tgdrive.core.download
 import android.content.Context
 import android.media.ExifInterface
 import android.net.Uri
-import android.os.Build
 import android.os.StatFs
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -51,8 +50,6 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -703,7 +700,8 @@ class UploadManager @Inject constructor(
                 val canDirectStreamEncrypt = options.encryption.enabled &&
                     item.sizeBytes in 1L..maxLimit &&
                     (
-                        !options.encryption.useVaultKey ||
+                        !options.encryption.useSavedPassphrase ||
+                            !backupCrypto.hasVaultPassphrase() ||
                             classifyFile(item.mimeType, rawName) !in setOf(
                                 FileBucket.IMAGES,
                                 FileBucket.VIDEOS,
@@ -727,14 +725,14 @@ class UploadManager @Inject constructor(
                     uploadTracker.updatePhase(
                         id = id,
                         status = UploadStatus.ENCRYPTING,
-                        detail = if (options.encryption.useVaultKey) "Encrypting (Vault Key)…" else "Encrypting (AES-256)…",
+                        detail = if (options.encryption.useSavedPassphrase) "Encrypting (PassVault)…" else "Encrypting (AES-256)…",
                         progress = 0f,
                         fileName = targetName,
                         isEncrypted = true,
                     )
                     val encOut = File(stagingDir, "${UUID.randomUUID().toString().take(8)}_${rawName}${BackupCrypto.ENCRYPTED_EXT}")
                     encryptedFile = encOut
-                    val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
+                    val customPass = if (options.encryption.useSavedPassphrase) null else options.encryption.customPassphrase
                     val stream = openUriStream(item.uri)
                         ?: throw IllegalStateException("Cannot open selected file")
                     stream.use { input ->
@@ -803,7 +801,11 @@ class UploadManager @Inject constructor(
                         return@withPermit splitOk
                     }
 
-                    encryptedThumbBytes = if (options.encryption.enabled && options.encryption.useVaultKey) {
+                    encryptedThumbBytes = if (
+                        options.encryption.enabled &&
+                        options.encryption.useSavedPassphrase &&
+                        backupCrypto.hasVaultPassphrase()
+                    ) {
                         runCatching {
                             mediaThumbnailCache.buildEncryptedThumbnailBytes(
                                 localPath = tempRaw.absolutePath,
@@ -821,13 +823,13 @@ class UploadManager @Inject constructor(
                         uploadTracker.updatePhase(
                             id = id,
                             status = UploadStatus.ENCRYPTING,
-                            detail = if (options.encryption.useVaultKey) "Encrypting (Vault Key)…" else "Encrypting (AES-256)…",
+                            detail = if (options.encryption.useSavedPassphrase) "Encrypting (PassVault)…" else "Encrypting (AES-256)…",
                             progress = 0f,
                             isEncrypted = true,
                         )
                         val encOut = File(stagingDir, "${tempRaw.name}${BackupCrypto.ENCRYPTED_EXT}")
                         encryptedFile = encOut
-                        val customPass = if (options.encryption.useVaultKey) null else options.encryption.customPassphrase
+                        val customPass = if (options.encryption.useSavedPassphrase) null else options.encryption.customPassphrase
                         backupCrypto.encryptFile(
                             inputFile = tempRaw,
                             outputFile = encOut,
@@ -1146,7 +1148,7 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
-                                useVaultKey = request.encryption.useVaultKey,
+                                useSavedPassphrase = request.encryption.useSavedPassphrase,
                                 zipPassword = password,
                                 virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
@@ -1183,7 +1185,7 @@ class UploadManager @Inject constructor(
                                 chatId = chatId,
                                 part = part,
                                 isEncrypted = isEncrypted,
-                                useVaultKey = request.encryption.useVaultKey,
+                                useSavedPassphrase = request.encryption.useSavedPassphrase,
                                 zipPassword = password,
                                 virtualPath = request.virtualPath,
                                 uploadedParts = uploadedParts,
@@ -1291,7 +1293,7 @@ class UploadManager @Inject constructor(
         chatId: Long,
         part: com.tgdrive.core.zip.ZipPartOutput,
         isEncrypted: Boolean,
-        useVaultKey: Boolean = true,
+        useSavedPassphrase: Boolean = true,
         zipPassword: String?,
         virtualPath: String = "",
         uploadedParts: MutableList<UploadedZipPartRecord>,
@@ -1314,7 +1316,7 @@ class UploadManager @Inject constructor(
             fileName = partName,
             mimeType = "application/zip",
         )
-        val partThumb = if (isEncrypted && useVaultKey) {
+        val partThumb = if (isEncrypted && useSavedPassphrase && backupCrypto.hasVaultPassphrase()) {
             runCatching {
                 mediaThumbnailCache.generateAndSyncEncryptedThumb(
                     chatId = chatId,
@@ -1443,10 +1445,10 @@ class UploadManager @Inject constructor(
 
     private fun resolveEncryptionPassphrase(spec: UploadEncryptionSpec): String? {
         if (!spec.enabled) return null
-        return if (spec.useVaultKey) {
-            backupCrypto.zipVaultPassword()
+        return if (spec.useSavedPassphrase) {
+            backupCrypto.requireVaultPassphrase()
         } else {
-            spec.customPassphrase?.takeIf { it.isNotBlank() } ?: backupCrypto.zipVaultPassword()
+            spec.customPassphrase?.takeIf { it.isNotBlank() } ?: backupCrypto.requireVaultPassphrase()
         }
     }
 
@@ -1806,10 +1808,10 @@ class UploadManager @Inject constructor(
                     "split" to spec.options.autoSplitOversized.toString(),
                     "wifi" to spec.options.wifiOnly.toString(),
                     "enc" to spec.options.encryption.enabled.toString(),
-                    "vault" to spec.options.encryption.useVaultKey.toString(),
+                    "saved_pass" to spec.options.encryption.useSavedPassphrase.toString(),
                 )
                 val pass = spec.options.encryption.customPassphrase
-                if (spec.options.encryption.enabled && !spec.options.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                if (spec.options.encryption.enabled && !spec.options.encryption.useSavedPassphrase && !pass.isNullOrBlank()) {
                     encryptSecretHex(pass)?.let { map["pass"] = it }
                 }
                 KIND_SINGLE to encodeKvMap(map)
@@ -1825,11 +1827,11 @@ class UploadManager @Inject constructor(
                     "wifi" to req.wifiOnly.toString(),
                     "vpath" to req.virtualPath,
                     "enc" to req.encryption.enabled.toString(),
-                    "vault" to req.encryption.useVaultKey.toString(),
+                    "saved_pass" to req.encryption.useSavedPassphrase.toString(),
                 )
                 req.maxPartBytesOverride?.let { map["maxPart"] = it.toString() }
                 val pass = req.encryption.customPassphrase
-                if (req.encryption.enabled && !req.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                if (req.encryption.enabled && !req.encryption.useSavedPassphrase && !pass.isNullOrBlank()) {
                     encryptSecretHex(pass)?.let { map["pass"] = it }
                 }
                 KIND_FOLDER_ZIP to encodeKvMap(map)
@@ -1845,12 +1847,12 @@ class UploadManager @Inject constructor(
                     "wifi" to req.wifiOnly.toString(),
                     "vpath" to req.virtualPath,
                     "enc" to req.encryption.enabled.toString(),
-                    "vault" to req.encryption.useVaultKey.toString(),
+                    "saved_pass" to req.encryption.useSavedPassphrase.toString(),
                     "count" to spec.files.size.toString(),
                 )
                 req.maxPartBytesOverride?.let { map["maxPart"] = it.toString() }
                 val pass = req.encryption.customPassphrase
-                if (req.encryption.enabled && !req.encryption.useVaultKey && !pass.isNullOrBlank()) {
+                if (req.encryption.enabled && !req.encryption.useSavedPassphrase && !pass.isNullOrBlank()) {
                     encryptSecretHex(pass)?.let { map["pass"] = it }
                 }
                 spec.files.forEachIndexed { idx, f ->
@@ -1870,7 +1872,7 @@ class UploadManager @Inject constructor(
         val customPass = map["pass"]?.let { decryptSecretHex(it) }
         val encSpec = UploadEncryptionSpec(
             enabled = map["enc"]?.toBooleanStrictOrNull() ?: false,
-            useVaultKey = map["vault"]?.toBooleanStrictOrNull() ?: true,
+            useSavedPassphrase = (map["saved_pass"] ?: map["vault"])?.toBooleanStrictOrNull() ?: true,
             customPassphrase = customPass,
         )
         return when (kind) {
@@ -1957,39 +1959,9 @@ class UploadManager @Inject constructor(
         }
     }
 
-    private fun encryptSecretHex(raw: String): String? = runCatching {
-        val key = backupCrypto.vaultKey()
-        try {
-            val out = ByteArrayOutputStream()
-            BackupCrypto.encryptStream(
-                keyBytes = key,
-                input = ByteArrayInputStream(raw.toByteArray(Charsets.UTF_8)),
-                output = out,
-            )
-            out.toByteArray().joinToString("") { "%02x".format(it) }
-        } finally {
-            key.fill(0)
-        }
-    }.getOrNull()
+    private fun encryptSecretHex(raw: String): String? = backupCrypto.encryptLocalQueueSecret(raw)
 
-    private fun decryptSecretHex(hex: String): String? = runCatching {
-        if (hex.length % 2 != 0 || hex.isEmpty()) return@runCatching null
-        val bytes = ByteArray(hex.length / 2) { idx ->
-            hex.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
-        }
-        val key = backupCrypto.vaultKey()
-        try {
-            val out = ByteArrayOutputStream()
-            BackupCrypto.decryptStream(
-                keyBytes = key,
-                input = ByteArrayInputStream(bytes),
-                output = out,
-            )
-            out.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
-        } finally {
-            key.fill(0)
-        }
-    }.getOrNull()
+    private fun decryptSecretHex(hex: String): String? = backupCrypto.decryptLocalQueueSecret(hex)
 
     private fun encodeKvMap(map: Map<String, String>): String =
         map.entries.joinToString("\n") { (k, v) ->

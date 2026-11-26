@@ -15,7 +15,6 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.Base64
 import java.util.concurrent.CancellationException
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
@@ -40,56 +39,88 @@ class WrongPassphraseException(
 /**
  * Streaming chunked AES-256-GCM helper used by AutoBackup and manual uploads/decryptions.
  *
- * Supports two authenticated container formats:
- * - `"TGE1"`: device Vault Key stored in [KeystoreHelper]
+ * Uses the portable passphrase-based container format:
  * - `"TGE2"`: passphrase-derived key via PBKDF2WithHmacSHA256 (cross-device portable)
  *
- * Both formats process data in bounded chunks with constant O(1) memory and authenticate
- * every chunk plus a final EOF sentinel chunk so truncation or reordering fails with
- * [AEADBadTagException].
+ * [EncryptedFileFormat.VAULT_TGE1] is retained strictly for read-only header detection of
+ * legacy files. Every chunk and a final EOF sentinel chunk are authenticated so truncation or
+ * reordering fails with [AEADBadTagException].
  */
 @Singleton
 class BackupCrypto @Inject constructor(
     private val keystoreHelper: KeystoreHelper,
 ) {
+    private var cachedThumbPassSha: ByteArray? = null
+    private var cachedThumbKey: ByteArray? = null
+
+    fun getVaultPassphrase(): String? =
+        keystoreHelper.getString(KEY_BACKUP_PASSPHRASE_V1)?.takeIf { it.isNotBlank() }
+
+    fun hasVaultPassphrase(): Boolean = getVaultPassphrase() != null
+
+    fun requireVaultPassphrase(): String =
+        getVaultPassphrase()
+            ?: throw IllegalStateException(
+                "PassVault passphrase is not set. Configure it in Settings → PassVault & Encryption.",
+            )
 
     @Synchronized
-    fun vaultKey(): ByteArray {
-        val stored = keystoreHelper.getString(KEY_BACKUP_VAULT_V1)
-        if (!stored.isNullOrBlank()) {
-            val decoded = runCatching { Base64.getDecoder().decode(stored.trim()) }.getOrNull()
-            if (decoded != null && decoded.size == KEY_BYTES) {
-                return decoded
-            }
+    fun setVaultPassphrase(passphrase: String?) {
+        val clean = passphrase?.trim()
+        clearThumbKeyCacheLocked()
+        if (clean.isNullOrBlank()) {
+            keystoreHelper.remove(KEY_BACKUP_PASSPHRASE_V1)
+        } else {
+            keystoreHelper.putString(KEY_BACKUP_PASSPHRASE_V1, clean)
         }
-        val key = ByteArray(KEY_BYTES).also { SecureRandom().nextBytes(it) }
-        keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(key))
-        return key
     }
 
-    /** Password string derived from [vaultKey] for AES-256 encrypted ZIP archives. */
-    fun zipVaultPassword(): String {
-        val key = vaultKey()
-        return try {
-            Base64.getEncoder().encodeToString(key)
+    @Synchronized
+    private fun clearThumbKeyCacheLocked() {
+        cachedThumbKey?.fill(0)
+        cachedThumbKey = null
+        cachedThumbPassSha?.fill(0)
+        cachedThumbPassSha = null
+    }
+
+    /**
+     * Deterministically derives (and caches in-memory) the 256-bit thumbnail subkey from the
+     * active PassVault passphrase using [THUMB_DOMAIN_SALT], making encrypted cloud thumbnails
+     * portable across devices and reinstalls. Returns `null` when no passphrase is saved.
+     */
+    @Synchronized
+    fun deriveThumbnailKey(): ByteArray? {
+        val pass = getVaultPassphrase() ?: run {
+            clearThumbKeyCacheLocked()
+            return null
+        }
+        val passBytes = pass.toByteArray(Charsets.UTF_8)
+        val passSha = try {
+            MessageDigest.getInstance("SHA-256").digest(passBytes)
         } finally {
-            key.fill(0)
+            passBytes.fill(0)
         }
-    }
-
-    /** Exports the active 256-bit Device Vault Key as Base64 for manual backup/restore. */
-    fun exportVaultKeyBase64(): String {
-        val key = vaultKey()
-        return try {
-            Base64.getEncoder().encodeToString(key)
+        val existingKey = cachedThumbKey
+        val existingSha = cachedThumbPassSha
+        if (existingKey != null && existingSha != null && existingSha.contentEquals(passSha)) {
+            passSha.fill(0)
+            return existingKey.copyOf()
+        }
+        val passChars = pass.toCharArray()
+        val derived = try {
+            deriveKeyFromPassphrase(passChars, THUMB_DOMAIN_SALT, PBKDF2_ITERATIONS)
         } finally {
-            key.fill(0)
+            passChars.fill('\u0000')
         }
+        clearThumbKeyCacheLocked()
+        cachedThumbPassSha = passSha
+        cachedThumbKey = derived
+        return derived.copyOf()
     }
 
-    /** Short verification fingerprint (e.g. `A1B2-C3D4`) for displaying the active Vault Key. */
-    fun vaultKeyFingerprint(): String {
-        val key = vaultKey()
+    /** Short verification fingerprint (e.g. `A1B2-C3D4`) derived deterministically from the PassVault passphrase. */
+    fun passphraseFingerprint(): String? {
+        val key = deriveThumbnailKey() ?: return null
         return try {
             val digest = MessageDigest.getInstance("SHA-256").digest(key)
             "%02X%02X-%02X%02X".format(digest[0], digest[1], digest[2], digest[3])
@@ -98,115 +129,120 @@ class BackupCrypto @Inject constructor(
         }
     }
 
-    /** Restores a previously exported 256-bit Base64 Vault Key; returns `false` if invalid. */
-    @Synchronized
-    fun importVaultKeyBase64(encoded: String): Boolean {
-        val clean = encoded.trim()
-        if (clean.isEmpty()) return false
-        val decoded = runCatching { Base64.getDecoder().decode(clean) }.getOrNull() ?: return false
-        if (decoded.size != KEY_BYTES) {
-            decoded.fill(0)
-            return false
-        }
+    fun encryptThumbnailBytes(plainBytes: ByteArray): ByteArray? {
+        if (plainBytes.isEmpty()) return null
+        val key = deriveThumbnailKey() ?: return null
         return try {
-            keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(decoded))
-            true
+            val out = ByteArrayOutputStream()
+            encryptStream(key, ByteArrayInputStream(plainBytes), out)
+            out.toByteArray()
+        } catch (_: Throwable) {
+            null
         } finally {
-            decoded.fill(0)
+            key.fill(0)
         }
     }
 
-    /** Wraps the 256-bit Device Vault Key in an AES-256 `TGE2` container protected by [recoveryPassphrase]. */
-    fun wrapVaultKeyWithPassphrase(recoveryPassphrase: String): ByteArray {
-        val cleanPass = recoveryPassphrase.trim()
-        require(cleanPass.length >= 8) { "Recovery passphrase must be at least 8 characters" }
-        val passChars = cleanPass.toCharArray()
-        val key = vaultKey()
+    fun decryptThumbnailBytes(encryptedBytes: ByteArray): ByteArray? {
+        if (encryptedBytes.isEmpty()) return null
+        val key = deriveThumbnailKey() ?: return null
+        return try {
+            val out = ByteArrayOutputStream()
+            decryptStream(key, ByteArrayInputStream(encryptedBytes), out)
+            out.toByteArray()
+        } catch (_: Throwable) {
+            null
+        } finally {
+            key.fill(0)
+        }
+    }
+
+    /** Creates a zero-knowledge `TGE2` verifier blob containing only a known constant sentinel. */
+    fun createPassphraseVerifier(passphrase: String): ByteArray {
+        val clean = passphrase.trim()
+        require(clean.length >= 8) { "Passphrase must be at least 8 characters" }
+        val passChars = clean.toCharArray()
         return try {
             val out = ByteArrayOutputStream()
             encryptStreamWithPassphrase(
                 passphrase = passChars,
-                input = ByteArrayInputStream(key),
+                input = ByteArrayInputStream(VERIFIER_PAYLOAD),
                 output = out,
             )
             out.toByteArray()
         } finally {
             passChars.fill('\u0000')
-            key.fill(0)
         }
     }
 
-    /** Unwraps a passphrase-protected Vault Key blob produced by [wrapVaultKeyWithPassphrase] and imports it. */
-    @Synchronized
-    fun unwrapAndImportVaultKey(
-        wrappedBytes: ByteArray,
-        recoveryPassphrase: String,
+    /** Verifies [candidatePassphrase] against a cloud verifier blob created by [createPassphraseVerifier]. */
+    fun verifyPassphraseAgainstVerifier(
+        verifierBytes: ByteArray,
+        candidatePassphrase: String,
     ): Boolean {
-        val cleanPass = recoveryPassphrase.trim()
-        if (cleanPass.isEmpty()) throw WrongPassphraseException("Recovery passphrase is required")
-        val passChars = cleanPass.toCharArray()
-        val out = ByteArrayOutputStream()
-        val key = try {
-            try {
-                decryptStreamWithPassphrase(
-                    passphrase = passChars,
-                    input = ByteArrayInputStream(wrappedBytes),
-                    output = out,
-                )
-            } catch (e: AEADBadTagException) {
-                throw WrongPassphraseException("Incorrect recovery passphrase", e)
-            }
-            out.toByteArray()
+        val clean = candidatePassphrase.trim()
+        if (clean.isEmpty() || verifierBytes.size < MAGIC_V2.size) return false
+        val passChars = clean.toCharArray()
+        return try {
+            val out = ByteArrayOutputStream()
+            decryptStreamWithPassphrase(
+                passphrase = passChars,
+                input = ByteArrayInputStream(verifierBytes),
+                output = out,
+            )
+            out.toByteArray().contentEquals(VERIFIER_PAYLOAD)
+        } catch (_: Throwable) {
+            false
         } finally {
             passChars.fill('\u0000')
         }
-        return try {
-            if (key.size != KEY_BYTES) return false
-            keystoreHelper.putString(KEY_BACKUP_VAULT_V1, Base64.getEncoder().encodeToString(key))
-            true
+    }
+
+    fun encryptLocalQueueSecret(raw: String): String? = runCatching {
+        val key = keystoreHelper.localQueueKey()
+        try {
+            val out = ByteArrayOutputStream()
+            encryptStream(
+                keyBytes = key,
+                input = ByteArrayInputStream(raw.toByteArray(Charsets.UTF_8)),
+                output = out,
+            )
+            out.toByteArray().joinToString("") { "%02x".format(it) }
         } finally {
             key.fill(0)
         }
-    }
+    }.getOrNull()
 
-    fun getCustomBackupPassphrase(): String? =
-        keystoreHelper.getString(KEY_BACKUP_PASSPHRASE_V1)?.takeIf { it.isNotBlank() }
-
-    fun hasCustomBackupPassphrase(): Boolean = getCustomBackupPassphrase() != null
-
-    fun setCustomBackupPassphrase(passphrase: String?) {
-        val clean = passphrase?.trim()
-        if (clean.isNullOrBlank()) {
-            keystoreHelper.remove(KEY_BACKUP_PASSPHRASE_V1)
-        } else {
-            keystoreHelper.putString(KEY_BACKUP_PASSPHRASE_V1, clean)
+    fun decryptLocalQueueSecret(hex: String): String? = runCatching {
+        if (hex.length % 2 != 0 || hex.isEmpty()) return@runCatching null
+        val bytes = ByteArray(hex.length / 2) { idx ->
+            hex.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
         }
-    }
-
-    fun activeBackupZipPassword(useCustomPassphrase: Boolean): String {
-        if (useCustomPassphrase) {
-            return getCustomBackupPassphrase()
-                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
+        val key = keystoreHelper.localQueueKey()
+        try {
+            val out = ByteArrayOutputStream()
+            decryptStream(
+                keyBytes = key,
+                input = ByteArrayInputStream(bytes),
+                output = out,
+            )
+            out.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
+        } finally {
+            key.fill(0)
         }
-        return zipVaultPassword()
-    }
+    }.getOrNull()
+
+    fun activeBackupZipPassword(): String = requireVaultPassphrase()
 
     fun encryptFileWithBackupSettings(
         inputFile: File,
         outputFile: File,
-        useCustomPassphrase: Boolean,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
     ) {
-        val custom = if (useCustomPassphrase) {
-            getCustomBackupPassphrase()
-                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
-        } else {
-            null
-        }
         encryptFile(
             inputFile = inputFile,
             outputFile = outputFile,
-            passphrase = custom,
+            passphrase = requireVaultPassphrase(),
             onProgress = onProgress,
         )
     }
@@ -214,21 +250,14 @@ class BackupCrypto @Inject constructor(
     fun encryptInputStreamWithBackupSettings(
         input: InputStream,
         outputFile: File,
-        useCustomPassphrase: Boolean,
         totalBytes: Long = -1L,
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
         cancelCheck: (() -> Boolean)? = null,
     ) {
-        val custom = if (useCustomPassphrase) {
-            getCustomBackupPassphrase()
-                ?: throw IllegalStateException("Custom backup passphrase is enabled but not configured")
-        } else {
-            null
-        }
         encryptInputStream(
             input = input,
             outputFile = outputFile,
-            passphrase = custom,
+            passphrase = requireVaultPassphrase(),
             totalBytes = totalBytes,
             onProgress = onProgress,
             cancelCheck = cancelCheck,
@@ -243,6 +272,7 @@ class BackupCrypto @Inject constructor(
         onProgress: ((bytesProcessed: Long, totalBytes: Long) -> Unit)? = null,
         cancelCheck: (() -> Boolean)? = null,
     ) {
+        val resolvedPass = passphrase?.takeIf { it.isNotBlank() } ?: requireVaultPassphrase()
         val total = totalBytes.coerceAtLeast(0L)
         outputFile.parentFile?.mkdirs()
         val progressCb = onProgress?.let { cb -> { bytes: Long -> cb(bytes, total) } }
@@ -254,33 +284,17 @@ class BackupCrypto @Inject constructor(
             }
             bufferedInput.use { src ->
                 BufferedOutputStream(FileOutputStream(outputFile), DEFAULT_CHUNK_SIZE).use { output ->
-                    val cleanPass = passphrase?.takeIf { it.isNotBlank() }
-                    if (cleanPass != null) {
-                        val passChars = cleanPass.toCharArray()
-                        try {
-                            encryptStreamWithPassphrase(
-                                passphrase = passChars,
-                                input = src,
-                                output = output,
-                                onBytesProcessed = progressCb,
-                                cancelCheck = cancelCheck,
-                            )
-                        } finally {
-                            passChars.fill('\u0000')
-                        }
-                    } else {
-                        val key = vaultKey()
-                        try {
-                            encryptStream(
-                                keyBytes = key,
-                                input = src,
-                                output = output,
-                                onBytesProcessed = progressCb,
-                                cancelCheck = cancelCheck,
-                            )
-                        } finally {
-                            key.fill(0)
-                        }
+                    val passChars = resolvedPass.toCharArray()
+                    try {
+                        encryptStreamWithPassphrase(
+                            passphrase = passChars,
+                            input = src,
+                            output = output,
+                            onBytesProcessed = progressCb,
+                            cancelCheck = cancelCheck,
+                        )
+                    } finally {
+                        passChars.fill('\u0000')
                     }
                 }
             }
@@ -334,22 +348,13 @@ class BackupCrypto @Inject constructor(
                     val progressCb = onProgress?.let { cb -> { bytes: Long -> cb(bytes, total) } }
                     when (format) {
                         EncryptedFileFormat.VAULT_TGE1 -> {
-                            val key = vaultKey()
-                            try {
-                                decryptStream(
-                                    keyBytes = key,
-                                    input = input,
-                                    output = output,
-                                    onBytesProcessed = progressCb,
-                                    cancelCheck = cancelCheck,
-                                )
-                            } finally {
-                                key.fill(0)
-                            }
+                            throw WrongPassphraseException(
+                                "This file uses the removed legacy Device Vault Key (TGE1) format and cannot be decrypted with a passphrase",
+                            )
                         }
                         EncryptedFileFormat.PASSPHRASE_TGE2 -> {
-                            val resolved = passphrase?.takeIf { it.isNotBlank() } ?: getCustomBackupPassphrase()
-                                ?: throw WrongPassphraseException("Passphrase is required to decrypt this file")
+                            val resolved = passphrase?.takeIf { it.isNotBlank() } ?: getVaultPassphrase()
+                                ?: throw WrongPassphraseException("Enter your PassVault passphrase to decrypt this file")
                             val passChars = resolved.toCharArray()
                             try {
                                 decryptStreamWithPassphrase(
@@ -380,8 +385,9 @@ class BackupCrypto @Inject constructor(
 
     companion object {
         const val ENCRYPTED_EXT = ".tgenc"
-        private const val KEY_BACKUP_VAULT_V1 = "tgdrive_backup_vault_key_v1"
         private const val KEY_BACKUP_PASSPHRASE_V1 = "tgdrive_backup_custom_passphrase_v1"
+        private val THUMB_DOMAIN_SALT = "tgdrive-thumb-v1".toByteArray(Charsets.UTF_8)
+        private val VERIFIER_PAYLOAD = "TGDRIVE_PASSVAULT_VERIFIER_V1".toByteArray(Charsets.UTF_8)
         private const val KEY_BYTES = 32
         private const val IV_BYTES = 12
         private const val SALT_BYTES = 16

@@ -19,6 +19,7 @@ import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
+import com.tgdrive.core.download.PassVaultCloudVerifier
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
@@ -59,10 +60,17 @@ data class VaultUiState(
     val ready: Boolean = false,
     val decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
     val decryptDialog: DecryptDialogState? = null,
-    val hasSavedBackupPassphrase: Boolean = false,
+    val hasVaultPassphrase: Boolean = false,
+    val hasCloudVerifier: Boolean = false,
+    val passphraseBusy: Boolean = false,
     val batchProgress: Pair<Int, Int>? = null,
     val error: String? = null,
 )
+
+enum class VaultPassphraseSaveStatus {
+    SAVED,
+    CLOUD_MISMATCH,
+}
 
 @HiltViewModel
 class VaultViewModel @Inject constructor(
@@ -74,6 +82,7 @@ class VaultViewModel @Inject constructor(
     private val offlinePinStore: OfflinePinStore,
     private val uploadManager: UploadManager,
     private val backupCrypto: BackupCrypto,
+    private val passVaultCloudVerifier: PassVaultCloudVerifier,
     private val cloudSyncManager: CloudSyncManager,
     private val audioPlayerController: AudioPlayerController,
     private val dispatchers: DispatchersProvider,
@@ -85,6 +94,9 @@ class VaultViewModel @Inject constructor(
     private val _isUnlocked = MutableStateFlow(false)
     private val _ready = MutableStateFlow(false)
     private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
+    private val _hasVaultPassphrase = MutableStateFlow(backupCrypto.hasVaultPassphrase())
+    private val _hasCloudVerifier = MutableStateFlow(false)
+    private val _passphraseBusy = MutableStateFlow(false)
     private val _batchProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     private val _error = MutableStateFlow<String?>(null)
     private val _snackbar = MutableStateFlow<String?>(null)
@@ -95,6 +107,7 @@ class VaultViewModel @Inject constructor(
         ioDispatcher = dispatchers.io,
         downloadState = downloadManager.state,
         detectFormat = { file -> uploadManager.detectEncryptedFormat(file) },
+        hasSavedPassphrase = { backupCrypto.hasVaultPassphrase() },
         decryptFile = { encryptedFile, originalDisplayName, passphrase, saveToDownloads, chatId, messageId ->
             uploadManager.decryptLocalFile(
                 encryptedFile = encryptedFile,
@@ -132,8 +145,11 @@ class VaultViewModel @Inject constructor(
             decryptFlow.dialog,
             _batchProgress,
             _error,
-        ) { thumbs, dialog, batch, err ->
-            listOf(thumbs, dialog, batch, err)
+            combine(_hasVaultPassphrase, _hasCloudVerifier, _passphraseBusy) { hasPass, hasVer, busy ->
+                Triple(hasPass, hasVer, busy)
+            },
+        ) { thumbs, dialog, batch, err, passTuple ->
+            listOf(thumbs, dialog, batch, err, passTuple)
         },
     ) { core, aux ->
         @Suppress("UNCHECKED_CAST")
@@ -150,6 +166,8 @@ class VaultViewModel @Inject constructor(
         @Suppress("UNCHECKED_CAST")
         val batch = aux[2] as Pair<Int, Int>?
         val err = aux[3] as String?
+        @Suppress("UNCHECKED_CAST")
+        val passTuple = aux[4] as Triple<Boolean, Boolean, Boolean>
 
         VaultUiState(
             items = items,
@@ -159,13 +177,18 @@ class VaultViewModel @Inject constructor(
             ready = ready,
             decryptedThumbs = if (unlocked) thumbs else emptyMap(),
             decryptDialog = dialog,
-            hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+            hasVaultPassphrase = passTuple.first,
+            hasCloudVerifier = passTuple.second,
+            passphraseBusy = passTuple.third,
             batchProgress = batch,
             error = err,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultUiState())
 
     init {
+        viewModelScope.launch(dispatchers.io) {
+            _hasCloudVerifier.value = runCatching { passVaultCloudVerifier.hasCloudVerifier() }.getOrDefault(false)
+        }
         viewModelScope.launch(dispatchers.io) {
             preferences.data.collect { prefs ->
                 val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
@@ -386,6 +409,62 @@ class VaultViewModel @Inject constructor(
             ?.takeIf { it.status == DownloadStatus.DONE }
             ?.localPath
         return dl?.takeIf { File(it).isFile }
+    }
+
+    fun saveVaultPassphraseQuietly(passphrase: String) {
+        val clean = passphrase.trim()
+        if (clean.length < 8) return
+        viewModelScope.launch(dispatchers.io) {
+            backupCrypto.setVaultPassphrase(clean)
+            mediaThumbnailCache.clearDecryptedMemoryCache()
+            _hasVaultPassphrase.value = true
+            _decryptedThumbs.value = emptyMap()
+            synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+            if (_isUnlocked.value && state.value.items.isNotEmpty()) {
+                warmEncryptedThumbnails(state.value.items)
+            }
+        }
+    }
+
+    suspend fun setAndVerifyVaultPassphrase(
+        passphrase: String,
+        forceReplace: Boolean = false,
+    ): Result<VaultPassphraseSaveStatus> = withContext(dispatchers.io) {
+        val clean = passphrase.trim()
+        require(clean.length >= 8) { "Passphrase must be at least 8 characters" }
+        _passphraseBusy.value = true
+        try {
+            val verify = if (forceReplace) {
+                PassVaultCloudVerifier.CloudVerifyResult.NO_CLOUD_VERIFIER
+            } else {
+                passVaultCloudVerifier.verifyAgainstCloud(clean)
+            }
+            if (verify == PassVaultCloudVerifier.CloudVerifyResult.MISMATCH) {
+                _hasCloudVerifier.value = true
+                return@withContext Result.success(VaultPassphraseSaveStatus.CLOUD_MISMATCH)
+            }
+            backupCrypto.setVaultPassphrase(clean)
+            mediaThumbnailCache.clearDecryptedMemoryCache()
+            _hasVaultPassphrase.value = true
+            if (verify == PassVaultCloudVerifier.CloudVerifyResult.NO_CLOUD_VERIFIER || forceReplace) {
+                runCatching { passVaultCloudVerifier.publishVerifier(clean) }
+                    .onSuccess { _hasCloudVerifier.value = true }
+            } else if (verify == PassVaultCloudVerifier.CloudVerifyResult.MATCHED) {
+                _hasCloudVerifier.value = true
+            }
+            _decryptedThumbs.value = emptyMap()
+            synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+            if (_isUnlocked.value && state.value.items.isNotEmpty()) {
+                warmEncryptedThumbnails(state.value.items)
+            }
+            Result.success(VaultPassphraseSaveStatus.SAVED)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Result.failure(t)
+        } finally {
+            _passphraseBusy.value = false
+        }
     }
 
     fun startDecryptFlow(item: FileCacheEntity) {

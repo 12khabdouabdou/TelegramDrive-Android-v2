@@ -27,6 +27,7 @@ import com.tgdrive.core.download.UploadFileItem
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipExcludeMatcher
 import com.tgdrive.core.zip.ZipSelectionSummary
@@ -71,6 +72,7 @@ data class HomeUiState(
     val trashCount: Int = 0,
     val encryptedVaultCount: Int = 0,
     val manualUploadWifiOnly: Boolean = false,
+    val hasSavedPassphrase: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
 )
@@ -87,6 +89,7 @@ private data class HomeDashboardStats(
     val trashCount: Int = 0,
     val encryptedVaultCount: Int = 0,
     val manualUploadWifiOnly: Boolean = false,
+    val hasSavedPassphrase: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
 )
@@ -103,6 +106,7 @@ class HomeViewModel
         private val downloadManager: DownloadManager,
         private val uploadManager: UploadManager,
         private val mediaThumbnailCache: MediaThumbnailCache,
+        private val backupCrypto: BackupCrypto,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
         @ApplicationContext private val appContext: Context,
@@ -178,6 +182,7 @@ class HomeViewModel
                     trashCount = trashCount,
                     encryptedVaultCount = vaultCount,
                     manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                    hasSavedPassphrase = backupCrypto.hasVaultPassphrase(),
                     cloudSyncing = syncing,
                     lastCloudSyncMs = prefs.lastCloudSyncMs,
                 )
@@ -547,7 +552,7 @@ class HomeViewModel
                     _snackbar.value = "Uploading ${action.files.size} file(s) in background"
                 }
                 is FileReviewAction.PackAsZip -> {
-                    val encEnabled = action.options.useVaultKey || !action.options.password.isNullOrBlank()
+                    val encEnabled = action.options.useSavedPassphrase || !action.options.password.isNullOrBlank()
                     uploadManager.enqueueUrisAsZip(
                         files = action.files,
                         request = ZipUploadRequest(
@@ -558,7 +563,7 @@ class HomeViewModel
                             excludePatterns = action.options.excludePatterns,
                             encryption = UploadEncryptionSpec(
                                 enabled = encEnabled,
-                                useVaultKey = action.options.useVaultKey,
+                                useSavedPassphrase = action.options.useSavedPassphrase,
                                 customPassphrase = action.options.password,
                             ),
                             wifiOnly = action.options.wifiOnly,
@@ -623,10 +628,18 @@ class HomeViewModel
             }
         }
 
+        fun saveVaultPassphrase(passphrase: String) {
+            val clean = passphrase.trim()
+            if (clean.length >= 8) {
+                backupCrypto.setVaultPassphrase(clean)
+                mediaThumbnailCache.clearDecryptedMemoryCache()
+            }
+        }
+
         fun confirmZipFolderUpload(options: ZipUploadOptions) {
             val (chatId, treeUri, _) = _pendingZipFolder.value ?: return
             dismissZipDialog()
-            val encEnabled = options.useVaultKey || !options.password.isNullOrBlank()
+            val encEnabled = options.useSavedPassphrase || !options.password.isNullOrBlank()
             uploadManager.enqueueFolderAsZip(
                 treeUri = treeUri,
                 request = ZipUploadRequest(
@@ -637,7 +650,7 @@ class HomeViewModel
                     excludePatterns = options.excludePatterns,
                     encryption = UploadEncryptionSpec(
                         enabled = encEnabled,
-                        useVaultKey = options.useVaultKey,
+                        useSavedPassphrase = options.useSavedPassphrase,
                         customPassphrase = options.password,
                     ),
                     wifiOnly = options.wifiOnly,

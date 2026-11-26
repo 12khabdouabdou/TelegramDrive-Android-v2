@@ -12,7 +12,7 @@ enum class UploadConflictStrategy {
 
 data class UploadEncryptionSpec(
     val enabled: Boolean = false,
-    val useVaultKey: Boolean = true,
+    val useSavedPassphrase: Boolean = true,
     val customPassphrase: String? = null,
 )
 

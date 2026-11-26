@@ -609,6 +609,7 @@ fun GlobalSearchScreen(
             onDecryptAndOpen = { pwd -> vm.decryptTarget(pwd, saveToDownloads = false) },
             onDecryptAndSave = { pwd -> vm.decryptTarget(pwd, saveToDownloads = true) },
             onDismiss = vm::dismissDecryptDialog,
+            onSaveAsVaultPassphrase = vm::saveVaultPassphrase,
         )
     }
 

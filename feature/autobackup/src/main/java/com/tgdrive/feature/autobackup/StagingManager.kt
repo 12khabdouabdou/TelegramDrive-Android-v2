@@ -95,24 +95,6 @@ class StagingManager @Inject constructor(
         expectedSize: Long,
         quality: BackupQuality,
         encrypt: Boolean,
-    ): StageOutcome = stageForUpload(
-        uriStr = uriStr,
-        displayName = displayName,
-        mimeType = mimeType,
-        expectedSize = expectedSize,
-        quality = quality,
-        encrypt = encrypt,
-        useCustomPassphrase = false,
-    )
-
-    fun stageForUpload(
-        uriStr: String,
-        displayName: String,
-        mimeType: String,
-        expectedSize: Long,
-        quality: BackupQuality,
-        encrypt: Boolean,
-        useCustomPassphrase: Boolean,
     ): StageOutcome {
         val willCompress = quality == BackupQuality.STORAGE_SAVER &&
             shouldTryStorageSaver(displayName, mimeType, expectedSize)
@@ -141,7 +123,6 @@ class StagingManager @Inject constructor(
                     backupCrypto.encryptInputStreamWithBackupSettings(
                         input = src,
                         outputFile = encFile,
-                        useCustomPassphrase = useCustomPassphrase,
                         totalBytes = expectedSize,
                     )
                 }
@@ -191,7 +172,7 @@ class StagingManager @Inject constructor(
         if (encrypt) {
             val encFile = File(stagingDir, "${currentFile.name}.tgenc")
             return try {
-                backupCrypto.encryptFileWithBackupSettings(currentFile, encFile, useCustomPassphrase)
+                backupCrypto.encryptFileWithBackupSettings(currentFile, encFile)
                 currentFile.delete()
                 StageOutcome.Ready(
                     path = encFile.absolutePath,

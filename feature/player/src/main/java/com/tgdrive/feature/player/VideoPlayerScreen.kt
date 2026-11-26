@@ -288,13 +288,13 @@ class VideoPlayerViewModel @Inject constructor(
         text: String,
         virtualPath: String = "",
         mimeType: String? = null,
-        encryptWithVaultKey: Boolean = false,
+        encryptWithPassVault: Boolean = false,
     ) {
         if (chatId == 0L) return
         viewModelScope.launch(dispatchers.io) {
             val dir = File(appContext.cacheDir, "text_edits").apply { mkdirs() }
             val safeName = fileName.replace(Regex("[/\\\\]"), "_").ifBlank { "edited.txt" }
-            val uploadName = if (encryptWithVaultKey) safeName.removeSuffix(".tgenc").ifBlank { "edited.txt" } else safeName
+            val uploadName = if (encryptWithPassVault) safeName.removeSuffix(".tgenc").ifBlank { "edited.txt" } else safeName
             val out = File(dir, "${System.currentTimeMillis()}_$uploadName")
             out.writeText(text, Charsets.UTF_8)
             val uri = Uri.fromFile(out)
@@ -311,8 +311,8 @@ class VideoPlayerViewModel @Inject constructor(
                 options = NormalUploadOptions(
                     conflictStrategy = UploadConflictStrategy.REPLACE,
                     encryption = UploadEncryptionSpec(
-                        enabled = encryptWithVaultKey,
-                        useVaultKey = true,
+                        enabled = encryptWithPassVault,
+                        useSavedPassphrase = true,
                     ),
                     virtualPath = virtualPath,
                 ),

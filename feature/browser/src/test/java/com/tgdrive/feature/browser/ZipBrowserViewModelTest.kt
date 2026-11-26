@@ -250,10 +250,11 @@ class ZipBrowserViewModelTest {
         }
 
     @Test
-    fun `unlockWithVaultKey unlocks vault-encrypted entry automatically`() =
+    fun `unlockWithSavedPassphrase unlocks passphrase-encrypted archive entry automatically`() =
         runTest {
-            val vaultPwd = backupCrypto.zipVaultPassword()
-            zipUploader.setRequiredPassword(vaultPwd)
+            val savedPwd = "portable-pass-2026"
+            backupCrypto.setVaultPassphrase(savedPwd)
+            zipUploader.setRequiredPassword(savedPwd)
             zipUploader.setEntries(
                 listOf(
                     ZipEntryInfo(
@@ -269,11 +270,11 @@ class ZipBrowserViewModelTest {
             vm.load("/tmp/vault.zip")
             advanceUntilIdle()
 
-            vm.unlockWithVaultKey("vault.jpg")
+            vm.unlockWithSavedPassphrase("vault.jpg")
             advanceUntilIdle()
 
             val s = vm.state.value
-            assertThat(s.unlockedPassword).isEqualTo(vaultPwd)
+            assertThat(s.unlockedPassword).isEqualTo(savedPwd)
             assertThat(s.extractedPath).isNotNull()
             assertThat(s.error).isNull()
         }

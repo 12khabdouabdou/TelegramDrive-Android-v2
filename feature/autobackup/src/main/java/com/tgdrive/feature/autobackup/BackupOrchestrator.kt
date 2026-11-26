@@ -476,6 +476,17 @@ class BackupOrchestrator @Inject constructor(
                 return RunOutcome.Failed(msg, 0, failures.size, retryable = false)
             }
 
+            val needsEncryption = eligibleToUpload.any { f ->
+                prefs.isFolderEncrypted(sourceUriByPath[f.absolutePath].orEmpty())
+            } || (prefs.backupZipFolders && folderUris.any { prefs.isFolderEncrypted(it) })
+            if (needsEncryption && !backupCrypto.hasVaultPassphrase()) {
+                val msg = "PassVault passphrase is not set. Configure it in Settings → PassVault & Encryption."
+                finalize(jobId, startedAt, filesScanned, 0, filesSkipped, "FAILURE", msg)
+                notifier.showResult(jobId, 0, filesSkipped, partial = false, failed = true, failedCount = 0)
+                registry.updatePhase(BackupPhase.Failed(msg, 0, 0))
+                return RunOutcome.Failed(msg, 0, 0, retryable = false)
+            }
+
             // --- 6.5. ZIP mode
             if (prefs.backupZipFolders && onlyLocalPaths == null) {
                 Log.i("BackupOrchestrator: zip mode enabled")
@@ -531,15 +542,9 @@ class BackupOrchestrator @Inject constructor(
                         val first = eligibleToUpload[0]
                         val (q, enc) = stageOptionsFor(first)
                         async(dispatchers.io) {
-                            if (prefs.backupUseCustomPassphrase) {
-                                stagingManager.stageForUpload(
-                                    first.absolutePath, first.name, first.mimeType, first.size, q, enc, true,
-                                )
-                            } else {
-                                stagingManager.stageForUpload(
-                                    first.absolutePath, first.name, first.mimeType, first.size, q, enc,
-                                )
-                            }
+                            stagingManager.stageForUpload(
+                                first.absolutePath, first.name, first.mimeType, first.size, q, enc,
+                            )
                         }
                     } else {
                         null
@@ -588,15 +593,9 @@ class BackupOrchestrator @Inject constructor(
                             val nextFile = eligibleToUpload[i + 1]
                             val (nq, nenc) = stageOptionsFor(nextFile)
                             async(dispatchers.io) {
-                                if (prefs.backupUseCustomPassphrase) {
-                                    stagingManager.stageForUpload(
-                                        nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc, true,
-                                    )
-                                } else {
-                                    stagingManager.stageForUpload(
-                                        nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc,
-                                    )
-                                }
+                                stagingManager.stageForUpload(
+                                    nextFile.absolutePath, nextFile.name, nextFile.mimeType, nextFile.size, nq, nenc,
+                                )
                             }
                         } else {
                             null
@@ -1050,7 +1049,7 @@ class BackupOrchestrator @Inject constructor(
             val folderPrefTarget = overrideTargetFolderId ?: prefs.targetFolderFor(folderUri)
             val destChatId = resolveTargetCached(folderPrefTarget)
             val encryptZip = prefs.isFolderEncrypted(folderUri)
-            val zipPassword = if (encryptZip) backupCrypto.activeBackupZipPassword(prefs.backupUseCustomPassphrase) else null
+            val zipPassword = if (encryptZip) backupCrypto.activeBackupZipPassword() else null
             val includedUris = if (prefs.backupZipIncremental) folderToUpload.map { it.absolutePath }.toSet() else null
 
             registry.updatePhase(

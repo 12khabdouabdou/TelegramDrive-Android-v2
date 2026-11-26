@@ -24,9 +24,11 @@
     <string name="upload_zip_part_size_label">Split size cap</string>
     <string name="upload_zip_part_auto">Auto</string>
     <string name="upload_zip_excludes_label">Exclude patterns (optional)</string>
-    <string name="upload_encrypt_vault_key">Device Vault Key</string>
+    <string name="upload_encrypt_vault_key">PassVault passphrase</string>
     <string name="upload_encrypt_custom_password">Custom password</string>
-    <string name="upload_encrypt_vault_hint">Auto-unlocks with 1 tap on this device.</string>
+    <string name="upload_encrypt_vault_hint">Portable cross-device AES-256 using your PassVault passphrase.</string>
+    <string name="upload_encrypt_save_as_passvault">Save as my PassVault passphrase</string>
+    <string name="upload_encrypt_error_passvault_short">Use at least 8 characters to save as PassVault passphrase</string>
     <string name="upload_pwd_weak">Weak password</string>
     <string name="upload_pwd_medium">Medium password</string>
     <string name="upload_pwd_strong">Strong password</string>
@@ -48,9 +50,10 @@
     <string name="upload_encrypt_and_upload">Encrypt &amp; Upload</string>
     <string name="upload_pack_and_upload">Pack &amp; Upload</string>
     <string name="decrypt_dialog_title">Decrypt file</string>
-    <string name="decrypt_vault_ready_hint">Encrypted with your device Vault Key. Tap below to decrypt.</string>
+    <string name="decrypt_legacy_vault_unsupported">This file was encrypted with the removed Device Vault Key (TGE1) format and cannot be decrypted with a passphrase.</string>
     <string name="decrypt_passphrase_hint">Enter the passphrase used when encrypting this file.</string>
-    <string name="decrypt_passphrase_or_saved_hint">Enter passphrase, or leave blank to use your saved backup passphrase.</string>
+    <string name="decrypt_passphrase_or_saved_hint">Enter passphrase, or leave blank to use your saved PassVault passphrase.</string>
+    <string name="decrypt_save_as_passvault">Save as my PassVault passphrase</string>
     <string name="decrypt_action_open">Decrypt &amp; Open</string>
     <string name="decrypt_action_save">Save to Downloads</string>
     <string name="upload_wifi_only_title">Upload over Wi-Fi only</string>

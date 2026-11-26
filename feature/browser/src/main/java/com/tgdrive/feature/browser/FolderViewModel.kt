@@ -180,6 +180,7 @@ class FolderViewModel
             ioDispatcher = dispatchers.io,
             downloadState = downloadManager.state,
             detectFormat = { file -> uploadManager.detectEncryptedFormat(file) },
+            hasSavedPassphrase = { backupCrypto.hasVaultPassphrase() },
             decryptFile = { encryptedFile, originalDisplayName, passphrase, saveToDownloads, chatId, messageId ->
                 uploadManager.decryptLocalFile(
                     encryptedFile = encryptedFile,
@@ -404,7 +405,7 @@ class FolderViewModel
                     zipPreviewSummary = overlays.zipSummary,
                     zipPreviewLoading = overlays.zipSummaryLoading,
                     decryptDialog = overlays.decryptDialog,
-                    hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+                    hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase(),
                     manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                     batchDecryptProgress = batchProgress,
                     currentVirtualPath = rawVirtualPath,
@@ -923,7 +924,7 @@ class FolderViewModel
                     uploadManager.enqueueFiles(chatId, action.files, opts)
                 }
                 is FileReviewAction.PackAsZip -> {
-                    val encEnabled = action.options.useVaultKey || !action.options.password.isNullOrBlank()
+                    val encEnabled = action.options.useSavedPassphrase || !action.options.password.isNullOrBlank()
                     uploadManager.enqueueUrisAsZip(
                         files = action.files,
                         request = ZipUploadRequest(
@@ -934,7 +935,7 @@ class FolderViewModel
                             excludePatterns = action.options.excludePatterns,
                             encryption = UploadEncryptionSpec(
                                 enabled = encEnabled,
-                                useVaultKey = action.options.useVaultKey,
+                                useSavedPassphrase = action.options.useSavedPassphrase,
                                 customPassphrase = action.options.password,
                             ),
                             wifiOnly = action.options.wifiOnly,
@@ -1006,12 +1007,20 @@ class FolderViewModel
             }
         }
 
+        fun saveVaultPassphrase(passphrase: String) {
+            val clean = passphrase.trim()
+            if (clean.length >= 8) {
+                backupCrypto.setVaultPassphrase(clean)
+                mediaThumbnailCache.clearDecryptedMemoryCache()
+            }
+        }
+
         fun confirmZipFolderUpload(options: ZipUploadOptions) {
             val treeUri = _pendingZipFolder.value.first ?: return
             val chatId = currentChatId ?: return
             val activeVPath = normalizeVirtualPath(_virtualPath.value)
             dismissZipDialog()
-            val encEnabled = options.useVaultKey || !options.password.isNullOrBlank()
+            val encEnabled = options.useSavedPassphrase || !options.password.isNullOrBlank()
             uploadManager.enqueueFolderAsZip(
                 treeUri = treeUri,
                 request = ZipUploadRequest(
@@ -1022,7 +1031,7 @@ class FolderViewModel
                     excludePatterns = options.excludePatterns,
                     encryption = UploadEncryptionSpec(
                         enabled = encEnabled,
-                        useVaultKey = options.useVaultKey,
+                        useSavedPassphrase = options.useSavedPassphrase,
                         customPassphrase = options.password,
                     ),
                     wifiOnly = options.wifiOnly,

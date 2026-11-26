@@ -219,7 +219,7 @@ class UploadManagerTest {
             options = NormalUploadOptions(
                 encryption = UploadEncryptionSpec(
                     enabled = true,
-                    useVaultKey = false,
+                    useSavedPassphrase = false,
                     customPassphrase = "my-strong-passphrase",
                 ),
             ),

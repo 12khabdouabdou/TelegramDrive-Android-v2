@@ -138,4 +138,38 @@ class TdLibSendTest {
             1001L to "Photos",
         ).inOrder()
     }
+
+    @Test
+    fun `findAllSystemChannelIds retries empty main chats and merges server search sorted`() = runTest {
+        val client = makeClient(StandardTestDispatcher(testScheduler))
+        var getChatsCalls = 0
+        client.rawSendOverride = { fn, onResult, _ ->
+            when (fn) {
+                is TdApi.LoadChats -> onResult(TdApi.Ok())
+                is TdApi.GetChats -> {
+                    getChatsCalls++
+                    val ids = if (getChatsCalls == 1) longArrayOf() else longArrayOf(300L, 200L)
+                    onResult(TdApi.Chats().apply { chatIds = ids })
+                }
+                is TdApi.SearchChatsOnServer -> {
+                    onResult(TdApi.Chats().apply { chatIds = longArrayOf(100L, 300L) })
+                }
+                is TdApi.GetChat -> onResult(TdApi.Chat().apply {
+                    id = fn.chatId
+                    title = if (fn.chatId == 200L) "Other" else TelegramClient.SYSTEM_CHANNEL_TITLE
+                    type = TdApi.ChatTypeSupergroup(fn.chatId + 10L, true)
+                })
+                is TdApi.GetSupergroup -> onResult(TdApi.Supergroup().apply {
+                    id = fn.supergroupId
+                    status = TdApi.ChatMemberStatusCreator()
+                })
+                else -> onResult(TdApi.Ok())
+            }
+        }
+
+        val channels = client.findAllSystemChannelIds()
+
+        assertThat(getChatsCalls).isEqualTo(2)
+        assertThat(channels).containsExactly(100L, 300L).inOrder()
+    }
 }

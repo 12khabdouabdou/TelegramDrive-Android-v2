@@ -425,7 +425,7 @@ fun TextViewerScreen(
                                     text = editDraft,
                                     virtualPath = cachedEntry?.virtualPath.orEmpty(),
                                     mimeType = cachedEntry?.mimeType,
-                                    encryptWithVaultKey = isEncryptedSource,
+                                    encryptWithPassVault = isEncryptedSource,
                                 )
                                 val updatedText = editDraft
                                 content = content?.let { cur ->

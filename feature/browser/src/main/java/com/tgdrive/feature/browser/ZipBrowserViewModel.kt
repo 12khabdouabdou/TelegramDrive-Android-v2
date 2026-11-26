@@ -79,7 +79,7 @@ class ZipBrowserViewModel
         val backupCrypto: BackupCrypto,
     ) : ViewModel() {
         private val _state = MutableStateFlow(
-            ZipBrowserUiState(hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase()),
+            ZipBrowserUiState(hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase()),
         )
         val state: StateFlow<ZipBrowserUiState> = _state.asStateFlow()
 
@@ -193,15 +193,9 @@ class ZipBrowserViewModel
                     }
                     val hasEncrypted = entries.any { e -> e.isEncrypted }
                     if (hasEncrypted && cachedPassword == null) {
-                        val candidates = buildList {
-                            add(backupCrypto.zipVaultPassword())
-                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        }.distinct()
-                        for (candidate in candidates) {
-                            if (probeZipPassword(zipPath, entries, candidate)) {
-                                cachedPassword = candidate
-                                break
-                            }
+                        val saved = backupCrypto.getVaultPassphrase()
+                        if (saved != null && probeZipPassword(zipPath, entries, saved)) {
+                            cachedPassword = saved
                         }
                     }
                     _state.update {
@@ -213,7 +207,7 @@ class ZipBrowserViewModel
                             archiveFileName = currentZipName,
                             passwordRequired = hasEncrypted,
                             unlockedPassword = cachedPassword,
-                            hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase(),
+                            hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase(),
                         )
                     }
                 } catch (e: CancellationException) {
@@ -427,14 +421,13 @@ class ZipBrowserViewModel
                 onNeedPassword()
                 return
             }
-            unlockWithVaultKey(entryName = entry.name) {
+            unlockWithSavedPassphrase(entryName = entry.name) {
                 onNeedPassword()
             }
         }
 
-        fun unlockWithVaultKey(
+        fun unlockWithSavedPassphrase(
             entryName: String? = null,
-            useSavedBackupPassphrase: Boolean = false,
             onFailurePromptNeeded: (() -> Unit)? = null,
             onUnlocked: (() -> Unit)? = null,
         ) {
@@ -446,15 +439,8 @@ class ZipBrowserViewModel
             if (_state.value.extractingEntry != null) return
             _state.update { it.copy(extractingEntry = targetName, error = null) }
             viewModelScope.launch(dispatchers.io) {
-                val candidates = buildList {
-                    if (useSavedBackupPassphrase) {
-                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        add(backupCrypto.zipVaultPassword())
-                    } else {
-                        add(backupCrypto.zipVaultPassword())
-                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                    }
-                }.distinct()
+                val saved = backupCrypto.getVaultPassphrase()
+                val candidates = listOfNotNull(saved)
 
                 val outDir = File(appContext.cacheDir, "zip_extracts").apply { mkdirs() }
                 for (candidate in candidates) {
@@ -468,7 +454,7 @@ class ZipBrowserViewModel
                                 extractingEntry = null,
                                 extractedPath = if (entryName != null) extracted else null,
                                 unlockedPassword = candidate,
-                                statusMessage = if (entryName == null) "Archive unlocked with Vault Key" else null,
+                                statusMessage = if (entryName == null) "Archive unlocked with PassVault passphrase" else null,
                             )
                         }
                         withContext(dispatchers.main) { onUnlocked?.invoke() }
@@ -565,10 +551,7 @@ class ZipBrowserViewModel
                     }
                     val candidates = when {
                         !supplied.isNullOrBlank() -> listOf(supplied)
-                        targetEntry?.isEncrypted == true -> buildList {
-                            add(backupCrypto.zipVaultPassword())
-                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        }.distinct()
+                        targetEntry?.isEncrypted == true -> listOfNotNull(backupCrypto.getVaultPassphrase())
                         else -> listOf<String?>(null)
                     }
 
@@ -673,10 +656,7 @@ class ZipBrowserViewModel
 
                     val candidates = when {
                         !supplied.isNullOrBlank() -> listOf(supplied)
-                        hasEncrypted && isVaultHinted -> buildList {
-                            add(backupCrypto.zipVaultPassword())
-                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        }.distinct()
+                        hasEncrypted && isVaultHinted -> listOfNotNull(backupCrypto.getVaultPassphrase())
                         else -> listOf<String?>(null)
                     }
 
@@ -796,7 +776,7 @@ class ZipBrowserViewModel
             currentZipName = ""
             cachedPassword = null
             isVaultHinted = false
-            _state.value = ZipBrowserUiState(hasSavedBackupPassphrase = backupCrypto.hasCustomBackupPassphrase())
+            _state.value = ZipBrowserUiState(hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase())
         }
 
         fun clearError() {
@@ -845,26 +825,16 @@ class ZipBrowserViewModel
             }
         }
 
-        fun unlockPreviewsWithVault(useSavedBackupPassphrase: Boolean = false) {
+        fun unlockPreviewsWithSavedPassphrase() {
             val zipPath = currentZipPath ?: return
             viewModelScope.launch(dispatchers.io) {
-                val candidates = buildList {
-                    if (useSavedBackupPassphrase) {
-                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        add(backupCrypto.zipVaultPassword())
-                    } else {
-                        add(backupCrypto.zipVaultPassword())
-                        backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                    }
-                }.distinct()
-                for (candidate in candidates) {
-                    if (probeZipPassword(zipPath, _state.value.entries, candidate)) {
-                        cachedPassword = candidate
-                        _state.update { it.copy(unlockedPassword = candidate, error = null) }
-                        return@launch
-                    }
+                val saved = backupCrypto.getVaultPassphrase()
+                if (saved != null && probeZipPassword(zipPath, _state.value.entries, saved)) {
+                    cachedPassword = saved
+                    _state.update { it.copy(unlockedPassword = saved, error = null) }
+                    return@launch
                 }
-                _state.update { it.copy(error = "Vault key did not unlock previews — enter password") }
+                _state.update { it.copy(error = "Saved PassVault passphrase did not unlock previews — enter password") }
             }
         }
 
@@ -886,16 +856,10 @@ class ZipBrowserViewModel
                 try {
                     var activePassword = cachedPassword
                     if (targetEntry.isEncrypted && activePassword == null) {
-                        val candidates = buildList {
-                            add(backupCrypto.zipVaultPassword())
-                            backupCrypto.getCustomBackupPassphrase()?.let { add(it) }
-                        }.distinct()
-                        for (candidate in candidates) {
-                            if (probeZipPassword(zipPath, _state.value.entries, candidate)) {
-                                activePassword = candidate
-                                cachedPassword = candidate
-                                break
-                            }
+                        val saved = backupCrypto.getVaultPassphrase()
+                        if (saved != null && probeZipPassword(zipPath, _state.value.entries, saved)) {
+                            activePassword = saved
+                            cachedPassword = saved
                         }
                         if (activePassword == null) {
                             _state.update { it.copy(extractingEntry = null) }

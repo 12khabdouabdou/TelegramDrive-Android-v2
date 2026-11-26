@@ -1,13 +1,7 @@
 package com.tgdrive.feature.settings
 
-import android.content.ClipData
-import android.content.ClipDescription
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
-import android.os.Build
-import android.os.PersistableBundle
-import android.view.WindowManager
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -35,20 +29,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CleaningServices
-import androidx.compose.material.icons.filled.CloudDownload
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Logout
-import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
@@ -125,14 +114,14 @@ fun SettingsScreen(
     var showApiDialog by remember { mutableStateOf(false) }
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPassphraseDialog by remember { mutableStateOf(false) }
-    var exportedVaultKey by remember { mutableStateOf<String?>(null) }
-    var showImportVaultDialog by remember { mutableStateOf(false) }
-    var showCloudBackupDialog by remember { mutableStateOf(false) }
-    var showCloudRestoreDialog by remember { mutableStateOf(false) }
+    var pendingEnableEncrypt by remember { mutableStateOf(false) }
     var passvaultNotice by remember { mutableStateOf<String?>(null) }
     var bioAvail by remember { mutableStateOf(vm.biometricAvailability()) }
 
-    LaunchedEffect(Unit) { vm.refreshTempStats() }
+    LaunchedEffect(Unit) {
+        vm.refreshTempStats()
+        vm.refreshCloudVerifierStatus()
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -283,12 +272,19 @@ fun SettingsScreen(
         var confirmInput by remember { mutableStateOf("") }
         var showPass by remember { mutableStateOf(false) }
         var passErr by remember { mutableStateOf<String?>(null) }
+        var cloudMismatch by remember { mutableStateOf(false) }
         val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
         val mismatchErr = stringResource(R.string.settings_passvault_passphrase_mismatch)
+        val cloudMismatchMsg = stringResource(R.string.settings_passvault_cloud_mismatch)
         val savedMsg = stringResource(R.string.settings_passvault_passphrase_saved)
         val resetMsg = stringResource(R.string.settings_passvault_passphrase_reset)
         AlertDialog(
-            onDismissRequest = { showPassphraseDialog = false },
+            onDismissRequest = {
+                if (!state.passVaultBusy) {
+                    pendingEnableEncrypt = false
+                    showPassphraseDialog = false
+                }
+            },
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             title = {
                 Text(
@@ -306,9 +302,14 @@ fun SettingsScreen(
                     )
                     OutlinedTextField(
                         value = passInput,
-                        onValueChange = { passInput = it; passErr = null },
+                        onValueChange = {
+                            passInput = it
+                            passErr = null
+                            cloudMismatch = false
+                        },
                         label = { Text(stringResource(R.string.settings_passvault_passphrase_label)) },
                         singleLine = true,
+                        enabled = !state.passVaultBusy,
                         visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
                         trailingIcon = {
                             IconButton(onClick = { showPass = !showPass }) {
@@ -326,10 +327,24 @@ fun SettingsScreen(
                         onValueChange = { confirmInput = it; passErr = null },
                         label = { Text(stringResource(R.string.settings_passvault_passphrase_confirm)) },
                         singleLine = true,
+                        enabled = !state.passVaultBusy,
                         visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         modifier = Modifier.fillMaxWidth(),
                     )
+                    if (state.passVaultBusy) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text(
+                                stringResource(R.string.settings_passvault_verifying),
+                                style = TgTypography.Caption,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
                     passErr?.let {
                         Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
                     }
@@ -337,15 +352,32 @@ fun SettingsScreen(
             },
             confirmButton = {
                 Button(
+                    enabled = !state.passVaultBusy,
                     onClick = {
                         val trimmed = passInput.trim()
                         when {
-                            trimmed.length < 4 -> passErr = shortErr
+                            trimmed.length < 8 -> passErr = shortErr
                             trimmed != confirmInput.trim() -> passErr = mismatchErr
                             else -> {
-                                vm.saveBackupPassphrase(trimmed)
-                                passvaultNotice = savedMsg
-                                showPassphraseDialog = false
+                                scope.launch {
+                                    vm.saveVaultPassphrase(trimmed, forceReplace = false)
+                                        .onSuccess { res ->
+                                            if (res == PassVaultSaveStatus.CLOUD_MISMATCH) {
+                                                cloudMismatch = true
+                                                passErr = cloudMismatchMsg
+                                            } else {
+                                                if (pendingEnableEncrypt) {
+                                                    pendingEnableEncrypt = false
+                                                    vm.setBackupEncryptAll(true)
+                                                }
+                                                passvaultNotice = savedMsg
+                                                showPassphraseDialog = false
+                                            }
+                                        }
+                                        .onFailure { t ->
+                                            passErr = t.message ?: "Failed to save passphrase"
+                                        }
+                                }
                             }
                         }
                     },
@@ -355,355 +387,54 @@ fun SettingsScreen(
             },
             dismissButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (state.hasCustomPassphrase || state.backupUseCustomPassphrase) {
+                    if (cloudMismatch) {
                         TextButton(
+                            enabled = !state.passVaultBusy,
                             onClick = {
-                                vm.clearBackupPassphrase()
+                                val trimmed = passInput.trim()
+                                scope.launch {
+                                    vm.saveVaultPassphrase(trimmed, forceReplace = true)
+                                        .onSuccess {
+                                            if (pendingEnableEncrypt) {
+                                                pendingEnableEncrypt = false
+                                                vm.setBackupEncryptAll(true)
+                                            }
+                                            passvaultNotice = savedMsg
+                                            showPassphraseDialog = false
+                                        }
+                                        .onFailure { t ->
+                                            passErr = t.message ?: "Failed to save passphrase"
+                                        }
+                                }
+                            },
+                        ) {
+                            Text(
+                                stringResource(R.string.settings_passvault_replace_anyway),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    } else if (state.hasVaultPassphrase) {
+                        TextButton(
+                            enabled = !state.passVaultBusy,
+                            onClick = {
+                                pendingEnableEncrypt = false
+                                vm.clearVaultPassphrase()
                                 passvaultNotice = resetMsg
                                 showPassphraseDialog = false
                             },
                         ) {
-                            Text(stringResource(R.string.settings_passvault_use_vault))
+                            Text(stringResource(R.string.settings_passvault_forget_local))
                         }
                     }
-                    TextButton(onClick = { showPassphraseDialog = false }) {
+                    TextButton(
+                        enabled = !state.passVaultBusy,
+                        onClick = {
+                            pendingEnableEncrypt = false
+                            showPassphraseDialog = false
+                        },
+                    ) {
                         Text(stringResource(R.string.settings_api_cancel))
                     }
-                }
-            },
-        )
-    }
-
-    exportedVaultKey?.let { keyText ->
-        val copiedMsg = stringResource(R.string.settings_passvault_copied)
-        DisposableEffect(context, keyText) {
-            val window = context.findFragmentActivity()?.window
-            val hadSecure = ((window?.attributes?.flags ?: 0) and WindowManager.LayoutParams.FLAG_SECURE) != 0
-            if (!hadSecure) {
-                window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-            }
-            onDispose {
-                if (!hadSecure) {
-                    window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-                }
-            }
-        }
-        AlertDialog(
-            onDismissRequest = { exportedVaultKey = null },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = {
-                Text(
-                    stringResource(R.string.settings_passvault_export_title),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                )
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        stringResource(R.string.settings_passvault_export_desc),
-                        style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                            .padding(12.dp),
-                    ) {
-                        Text(
-                            text = keyText,
-                            style = TgTypography.Mono,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        val clip = ClipData.newPlainText("TelegramDrive Vault Key", keyText).apply {
-                            description.extras = PersistableBundle().apply {
-                                val key = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    ClipDescription.EXTRA_IS_SENSITIVE
-                                } else {
-                                    "android.content.extra.IS_SENSITIVE"
-                                }
-                                putBoolean(key, true)
-                            }
-                        }
-                        cb?.setPrimaryClip(clip)
-                        passvaultNotice = copiedMsg
-                        exportedVaultKey = null
-                    },
-                ) {
-                    Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.settings_passvault_copy_key))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { exportedVaultKey = null }) {
-                    Text(stringResource(R.string.settings_api_cancel))
-                }
-            },
-        )
-    }
-
-    if (showImportVaultDialog) {
-        var keyInput by remember { mutableStateOf("") }
-        var importErr by remember { mutableStateOf<String?>(null) }
-        val invalidMsg = stringResource(R.string.settings_passvault_restore_invalid)
-        AlertDialog(
-            onDismissRequest = { showImportVaultDialog = false },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = {
-                Text(
-                    stringResource(R.string.settings_passvault_restore_title),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                )
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        stringResource(R.string.settings_passvault_restore_desc),
-                        style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    OutlinedTextField(
-                        value = keyInput,
-                        onValueChange = { keyInput = it; importErr = null },
-                        label = { Text(stringResource(R.string.settings_passvault_restore_label)) },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    importErr?.let {
-                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (vm.importVaultKey(keyInput)) {
-                            passvaultNotice = "Vault key restored"
-                            showImportVaultDialog = false
-                        } else {
-                            importErr = invalidMsg
-                        }
-                    },
-                ) {
-                    Text(stringResource(R.string.settings_api_save))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showImportVaultDialog = false }) {
-                    Text(stringResource(R.string.settings_api_cancel))
-                }
-            },
-        )
-    }
-
-    if (showCloudBackupDialog) {
-        var passInput by remember { mutableStateOf("") }
-        var confirmInput by remember { mutableStateOf("") }
-        var showPass by remember { mutableStateOf(false) }
-        var dialogErr by remember { mutableStateOf<String?>(null) }
-        val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
-        val mismatchErr = stringResource(R.string.settings_passvault_passphrase_mismatch)
-        val backupOkMsg = stringResource(R.string.settings_passvault_cloud_backup_ok)
-
-        AlertDialog(
-            onDismissRequest = { if (!state.cloudVaultBusy) showCloudBackupDialog = false },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = {
-                Text(
-                    stringResource(R.string.settings_passvault_cloud_backup_title),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                )
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        stringResource(R.string.settings_passvault_cloud_backup_desc),
-                        style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    OutlinedTextField(
-                        value = passInput,
-                        onValueChange = { passInput = it; dialogErr = null },
-                        label = { Text(stringResource(R.string.settings_passvault_cloud_passphrase_label)) },
-                        singleLine = true,
-                        enabled = !state.cloudVaultBusy,
-                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        trailingIcon = {
-                            IconButton(onClick = { showPass = !showPass }) {
-                                Icon(
-                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    contentDescription = null,
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = confirmInput,
-                        onValueChange = { confirmInput = it; dialogErr = null },
-                        label = { Text(stringResource(R.string.settings_passvault_passphrase_confirm)) },
-                        singleLine = true,
-                        enabled = !state.cloudVaultBusy,
-                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    if (state.cloudVaultBusy) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Text(
-                                stringResource(R.string.settings_passvault_cloud_busy),
-                                style = TgTypography.Caption,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                    }
-                    dialogErr?.let {
-                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    enabled = !state.cloudVaultBusy,
-                    onClick = {
-                        when {
-                            passInput.trim().length < 8 -> dialogErr = shortErr
-                            passInput != confirmInput -> dialogErr = mismatchErr
-                            else -> {
-                                scope.launch {
-                                    vm.backupVaultKeyToCloud(passInput.trim())
-                                        .onSuccess {
-                                            passvaultNotice = backupOkMsg
-                                            showCloudBackupDialog = false
-                                        }
-                                        .onFailure { err ->
-                                            dialogErr = err.message ?: "Cloud backup failed"
-                                        }
-                                }
-                            }
-                        }
-                    },
-                ) {
-                    Text(stringResource(R.string.settings_passvault_cloud_backup))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !state.cloudVaultBusy,
-                    onClick = { showCloudBackupDialog = false },
-                ) {
-                    Text(stringResource(R.string.settings_api_cancel))
-                }
-            },
-        )
-    }
-
-    if (showCloudRestoreDialog) {
-        var passInput by remember { mutableStateOf("") }
-        var showPass by remember { mutableStateOf(false) }
-        var dialogErr by remember { mutableStateOf<String?>(null) }
-        val shortErr = stringResource(R.string.settings_passvault_passphrase_short)
-        val restoreOkFmt = stringResource(R.string.settings_passvault_cloud_restore_ok)
-
-        AlertDialog(
-            onDismissRequest = { if (!state.cloudVaultBusy) showCloudRestoreDialog = false },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = {
-                Text(
-                    stringResource(R.string.settings_passvault_cloud_restore_title),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Bold,
-                )
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        stringResource(R.string.settings_passvault_cloud_restore_desc),
-                        style = TgTypography.Display.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    OutlinedTextField(
-                        value = passInput,
-                        onValueChange = { passInput = it; dialogErr = null },
-                        label = { Text(stringResource(R.string.settings_passvault_cloud_passphrase_label)) },
-                        singleLine = true,
-                        enabled = !state.cloudVaultBusy,
-                        visualTransformation = if (showPass) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        trailingIcon = {
-                            IconButton(onClick = { showPass = !showPass }) {
-                                Icon(
-                                    if (showPass) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    contentDescription = null,
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    if (state.cloudVaultBusy) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Text(
-                                stringResource(R.string.settings_passvault_cloud_busy),
-                                style = TgTypography.Caption,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                    }
-                    dialogErr?.let {
-                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    enabled = !state.cloudVaultBusy,
-                    onClick = {
-                        if (passInput.isBlank()) {
-                            dialogErr = "Recovery passphrase is required"
-                        } else {
-                            scope.launch {
-                                vm.restoreVaultKeyFromCloud(passInput.trim())
-                                    .onSuccess { fp ->
-                                        passvaultNotice = String.format(restoreOkFmt, fp)
-                                        showCloudRestoreDialog = false
-                                    }
-                                    .onFailure { err ->
-                                        dialogErr = err.message ?: "Cloud restore failed"
-                                    }
-                            }
-                        }
-                    },
-                ) {
-                    Text(stringResource(R.string.settings_passvault_cloud_restore))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !state.cloudVaultBusy,
-                    onClick = { showCloudRestoreDialog = false },
-                ) {
-                    Text(stringResource(R.string.settings_api_cancel))
                 }
             },
         )
@@ -1105,18 +836,30 @@ fun SettingsScreen(
 
         // PassVault & Encryption
         EditorialSection(title = stringResource(R.string.settings_passvault)) {
-            val modeLabel = if (state.backupUseCustomPassphrase && state.hasCustomPassphrase) {
-                stringResource(R.string.settings_passvault_mode_passphrase, state.vaultKeyFingerprint)
+            val modeLabel = if (state.hasVaultPassphrase && !state.passphraseFingerprint.isNullOrBlank()) {
+                stringResource(R.string.settings_passvault_mode_passphrase, state.passphraseFingerprint!!)
             } else {
-                stringResource(R.string.settings_passvault_mode_vault, state.vaultKeyFingerprint)
+                stringResource(R.string.settings_passvault_mode_unset)
             }
             Text(
                 text = modeLabel,
                 style = TgTypography.Mono,
-                color = MaterialTheme.colorScheme.primary,
+                color = if (state.hasVaultPassphrase) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
                 fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(bottom = 10.dp),
+                modifier = Modifier.padding(bottom = if (state.hasCloudVerifier) 4.dp else 10.dp),
             )
+            if (state.hasCloudVerifier) {
+                Text(
+                    text = stringResource(R.string.settings_passvault_verifier_badge),
+                    style = TgTypography.Caption,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.padding(bottom = 10.dp),
+                )
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1125,7 +868,14 @@ fun SettingsScreen(
                     .toggleable(
                         value = state.backupEncryptAll,
                         role = Role.Switch,
-                        onValueChange = vm::setBackupEncryptAll,
+                        onValueChange = { enabled ->
+                            if (enabled && !state.hasVaultPassphrase) {
+                                pendingEnableEncrypt = true
+                                showPassphraseDialog = true
+                            } else {
+                                vm.setBackupEncryptAll(enabled)
+                            }
+                        },
                     )
                     .padding(vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1173,7 +923,7 @@ fun SettingsScreen(
                         fontWeight = FontWeight.Medium,
                     )
                     Text(
-                        text = if (state.hasCustomPassphrase) {
+                        text = if (state.hasVaultPassphrase) {
                             stringResource(R.string.settings_passvault_passphrase_set)
                         } else {
                             stringResource(R.string.settings_passvault_passphrase_unset)
@@ -1187,69 +937,6 @@ fun SettingsScreen(
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            }
-            val verifyExportTitle = stringResource(R.string.settings_passvault_verify_export)
-            val verifyExportSubtitle = stringResource(R.string.settings_biometric_confirm_subtitle)
-            Spacer(Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = {
-                        if (state.biometricEnabled && bioAvail == BiometricHelper.Availability.AVAILABLE) {
-                            val activity = context.findFragmentActivity()
-                            if (activity != null) {
-                                vm.authenticateForBiometricToggle(
-                                    activity = activity,
-                                    title = verifyExportTitle,
-                                    subtitle = verifyExportSubtitle,
-                                    onSuccess = { exportedVaultKey = vm.exportVaultKey() },
-                                    onError = { err -> passvaultNotice = err },
-                                )
-                            } else {
-                                exportedVaultKey = vm.exportVaultKey()
-                            }
-                        } else {
-                            exportedVaultKey = vm.exportVaultKey()
-                        }
-                    },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Filled.VpnKey, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.settings_passvault_backup_key), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                OutlinedButton(
-                    onClick = { showImportVaultDialog = true },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Filled.Restore, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.settings_passvault_restore_key), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = { showCloudBackupDialog = true },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Filled.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.settings_passvault_cloud_backup), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                OutlinedButton(
-                    onClick = { showCloudRestoreDialog = true },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(stringResource(R.string.settings_passvault_cloud_restore), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
             }
             Spacer(Modifier.height(10.dp))
             Text(

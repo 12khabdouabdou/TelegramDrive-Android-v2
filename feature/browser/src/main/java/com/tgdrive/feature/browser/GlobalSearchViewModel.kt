@@ -135,6 +135,7 @@ class GlobalSearchViewModel
             ioDispatcher = dispatchers.io,
             downloadState = downloadManager.state,
             detectFormat = { file -> uploadManager.detectEncryptedFormat(file) },
+            hasSavedPassphrase = { backupCrypto.hasVaultPassphrase() },
             decryptFile = { encryptedFile, originalDisplayName, passphrase, saveToDownloads, chatId, messageId ->
                 uploadManager.decryptLocalFile(
                     encryptedFile = encryptedFile,
@@ -172,7 +173,7 @@ class GlobalSearchViewModel
                     _filterCriteria.update { it.copy(folderNames = map) }
                     systemChannelId = runCatching { telegramClient.getOrCreateSystemChannel() }.getOrNull()
                     _hasSavedBackupPassphrase.value = runCatching {
-                        backupCrypto.hasCustomBackupPassphrase()
+                        backupCrypto.hasVaultPassphrase()
                     }.getOrDefault(false)
                 } catch (e: CancellationException) {
                     throw e
@@ -184,6 +185,17 @@ class GlobalSearchViewModel
                 preferences.data.collect { prefs ->
                     _recentQueries.value = prefs.recentSearches()
                 }
+            }
+        }
+
+        fun hasSavedPassphrase(): Boolean = backupCrypto.hasVaultPassphrase()
+
+        fun saveVaultPassphrase(passphrase: String) {
+            val clean = passphrase.trim()
+            if (clean.length >= 8) {
+                backupCrypto.setVaultPassphrase(clean)
+                _hasSavedBackupPassphrase.value = true
+                mediaThumbnailCache.clearDecryptedMemoryCache()
             }
         }
 

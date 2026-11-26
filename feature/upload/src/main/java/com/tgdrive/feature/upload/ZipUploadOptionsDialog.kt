@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -60,7 +61,7 @@ import java.util.Locale
 data class ZipUploadOptions(
     val name: String,
     val password: String?,
-    val useVaultKey: Boolean = false,
+    val useSavedPassphrase: Boolean = false,
     val compressionMode: ZipCompressionMode = ZipCompressionMode.SMART,
     val maxPartBytesOverride: Long? = null,
     val excludePatterns: String = "",
@@ -77,6 +78,8 @@ fun ZipUploadOptionsDialog(
     summaryLoading: Boolean = false,
     showExcludePatterns: Boolean = true,
     defaultWifiOnly: Boolean = false,
+    hasSavedPassphrase: Boolean = false,
+    onSavePassphrase: ((String) -> Unit)? = null,
     onExcludePatternsChanged: ((String) -> Unit)? = null,
     onMaxPartSizeChanged: ((Long?) -> Unit)? = null,
 ) {
@@ -93,7 +96,8 @@ fun ZipUploadOptionsDialog(
     var partCapOverride by remember { mutableStateOf<Long?>(null) }
     var excludePatterns by remember { mutableStateOf("") }
     var encrypt by remember { mutableStateOf(false) }
-    var useVaultKey by remember { mutableStateOf(true) }
+    var useSavedPassphrase by remember(hasSavedPassphrase) { mutableStateOf(hasSavedPassphrase) }
+    var saveAsPassVault by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
@@ -104,6 +108,7 @@ fun ZipUploadOptionsDialog(
     val errEmptyPwd = stringResource(R.string.upload_zip_error_empty_password)
     val errMismatch = stringResource(R.string.upload_zip_error_mismatch)
     val errShort = stringResource(R.string.upload_zip_error_short)
+    val errSaveShort = stringResource(R.string.upload_encrypt_error_passvault_short)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -332,24 +337,27 @@ fun ZipUploadOptionsDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         FilterChip(
-                            selected = useVaultKey,
+                            selected = useSavedPassphrase,
+                            enabled = hasSavedPassphrase,
                             onClick = {
-                                useVaultKey = true
-                                error = null
+                                if (hasSavedPassphrase) {
+                                    useSavedPassphrase = true
+                                    error = null
+                                }
                             },
                             label = { Text(stringResource(R.string.upload_encrypt_vault_key)) },
                         )
                         FilterChip(
-                            selected = !useVaultKey,
+                            selected = !useSavedPassphrase,
                             onClick = {
-                                useVaultKey = false
+                                useSavedPassphrase = false
                                 error = null
                             },
                             label = { Text(stringResource(R.string.upload_encrypt_custom_password)) },
                         )
                     }
 
-                    if (useVaultKey) {
+                    if (useSavedPassphrase) {
                         Text(
                             stringResource(R.string.upload_encrypt_vault_hint),
                             style = TgTypography.Caption,
@@ -414,6 +422,29 @@ fun ZipUploadOptionsDialog(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp),
                         )
+                        if (!hasSavedPassphrase && onSavePassphrase != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .toggleable(
+                                        value = saveAsPassVault,
+                                        role = Role.Checkbox,
+                                        onValueChange = {
+                                            saveAsPassVault = it
+                                            error = null
+                                        },
+                                    ),
+                            ) {
+                                Checkbox(checked = saveAsPassVault, onCheckedChange = null)
+                                Text(
+                                    stringResource(R.string.upload_encrypt_save_as_passvault),
+                                    style = TgTypography.Caption,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -468,18 +499,18 @@ fun ZipUploadOptionsDialog(
                         ZipUploadOptions(
                             name = trimmedName,
                             password = null,
-                            useVaultKey = false,
+                            useSavedPassphrase = false,
                             compressionMode = compressionMode,
                             maxPartBytesOverride = partCapOverride,
                             excludePatterns = excludePatterns.trim(),
                             wifiOnly = wifiOnly,
                         ),
                     )
-                    useVaultKey -> onConfirm(
+                    useSavedPassphrase -> onConfirm(
                         ZipUploadOptions(
                             name = trimmedName,
                             password = null,
-                            useVaultKey = true,
+                            useSavedPassphrase = true,
                             compressionMode = compressionMode,
                             maxPartBytesOverride = partCapOverride,
                             excludePatterns = excludePatterns.trim(),
@@ -488,18 +519,24 @@ fun ZipUploadOptionsDialog(
                     )
                     password.isBlank() -> error = errEmptyPwd
                     password != confirm -> error = errMismatch
+                    saveAsPassVault && password.trim().length < 8 -> error = errSaveShort
                     password.length < 4 -> error = errShort
-                    else -> onConfirm(
-                        ZipUploadOptions(
-                            name = trimmedName,
-                            password = password,
-                            useVaultKey = false,
-                            compressionMode = compressionMode,
-                            maxPartBytesOverride = partCapOverride,
-                            excludePatterns = excludePatterns.trim(),
-                            wifiOnly = wifiOnly,
-                        ),
-                    )
+                    else -> {
+                        if (saveAsPassVault) {
+                            onSavePassphrase?.invoke(password.trim())
+                        }
+                        onConfirm(
+                            ZipUploadOptions(
+                                name = trimmedName,
+                                password = password,
+                                useSavedPassphrase = false,
+                                compressionMode = compressionMode,
+                                maxPartBytesOverride = partCapOverride,
+                                excludePatterns = excludePatterns.trim(),
+                                wifiOnly = wifiOnly,
+                            ),
+                        )
+                    }
                 }
             }) {
                 Text(

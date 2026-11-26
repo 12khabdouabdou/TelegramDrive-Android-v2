@@ -212,27 +212,44 @@ open class KeystoreHelper @Inject constructor(
     }
 
     @Synchronized
-    fun tdlibSessionKey(): ByteArray {
-        val existing = safeRead { it.getString(KEY_TDLIB_SESSION_KEY, null) }
+    fun tdlibSessionKey(): ByteArray =
+        readOrGenerate32ByteKey(KEY_TDLIB_SESSION_KEY, "TDLib session key")
+
+    /**
+     * Device-local key strictly for encrypting transient secrets in the local Room upload retry queue.
+     * Never used to encrypt user files uploaded to Telegram.
+     */
+    @Synchronized
+    open fun localQueueKey(): ByteArray =
+        readOrGenerate32ByteKey(KEY_LOCAL_QUEUE_KEY, "local queue key")
+
+    private fun readOrGenerate32ByteKey(
+        prefKey: String,
+        label: String,
+    ): ByteArray {
+        val existing = safeRead { it.getString(prefKey, null) }
         if (existing != null) {
             try {
                 val decoded = Base64.decode(existing, Base64.NO_WRAP)
                 if (decoded.size == 32) {
                     return decoded
                 }
-                Log.w("KeystoreHelper: stored TDLib key invalid length (${decoded.size} bytes) — regenerating")
+                Log.w("KeystoreHelper: stored $label invalid length (${decoded.size} bytes) — regenerating")
             } catch (t: Throwable) {
-                Log.w("KeystoreHelper: stored TDLib key corrupt — regenerating", t)
+                Log.w("KeystoreHelper: stored $label corrupt — regenerating", t)
             }
         }
-        return generateAndStore()
+        return generateAndStore(prefKey, label)
     }
 
-    private fun generateAndStore(): ByteArray {
+    private fun generateAndStore(
+        prefKey: String = KEY_TDLIB_SESSION_KEY,
+        label: String = "TDLib session key",
+    ): ByteArray {
         val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        val ok = safeWrite { it.putString(KEY_TDLIB_SESSION_KEY, Base64.encodeToString(key, Base64.NO_WRAP)) }
+        val ok = safeWrite { it.putString(prefKey, Base64.encodeToString(key, Base64.NO_WRAP)) }
         if (!ok) {
-            Log.e("KeystoreHelper: failed to persist TDLib session key — key is in-memory only, will be lost on process death")
+            Log.e("KeystoreHelper: failed to persist $label — key is in-memory only, will be lost on process death")
         }
         return key
     }
@@ -244,7 +261,7 @@ open class KeystoreHelper @Inject constructor(
     fun regenerateTdlibSessionKey(): ByteArray {
         Log.i("KeystoreHelper: regenerating TDLib session key (preserving API creds)")
         safeWrite { it.remove(KEY_TDLIB_SESSION_KEY) }
-        return generateAndStore()
+        return generateAndStore(KEY_TDLIB_SESSION_KEY, "TDLib session key")
     }
 
     @Synchronized
@@ -289,8 +306,9 @@ open class KeystoreHelper @Inject constructor(
         const val KEY_API_HASH = "telegram_api_hash"
         private const val KEY_CANARY = "_keystore_canary"
         private const val KEY_TDLIB_SESSION_KEY = "tdlib_session_key_b64"
+        private const val KEY_LOCAL_QUEUE_KEY = "tgdrive_local_queue_key_v1"
         private val SENSITIVE_KEYS = setOf(
-            "tgdrive_backup_vault_key_v1",
+            KEY_LOCAL_QUEUE_KEY,
             "tgdrive_backup_custom_passphrase_v1",
         )
     }
