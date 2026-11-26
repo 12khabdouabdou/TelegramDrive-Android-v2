@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -130,6 +131,7 @@ fun GlobalSearchScreen(
     val aiIndexing by vm.aiIndexing.collectAsStateWithLifecycle()
     val decryptDialog by vm.decryptDialog.collectAsStateWithLifecycle()
     val hasSavedBackupPassphrase by vm.hasSavedBackupPassphrase.collectAsStateWithLifecycle()
+    val decryptedThumbs by vm.decryptedThumbs.collectAsStateWithLifecycle()
     val decryptedOpenEvent by vm.decryptedOpenEvent.collectAsStateWithLifecycle()
     val snackbarMessage by vm.snackbar.collectAsStateWithLifecycle()
 
@@ -140,7 +142,9 @@ fun GlobalSearchScreen(
     var showFiltersRow by remember { mutableStateOf(false) }
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
 
-    val parsed = remember(query) { SmartSearchEngine.parseQuery(query) }
+    val parsed = remember(query, folderNames) {
+        SmartSearchEngine.parseQuery(query, knownFolderNames = folderNames.values)
+    }
 
     LaunchedEffect(snackbarMessage) {
         val msg = snackbarMessage ?: return@LaunchedEffect
@@ -244,6 +248,43 @@ fun GlobalSearchScreen(
                     shape = TgShapes.XLarge,
                     modifier = Modifier.weight(1f),
                 )
+            }
+
+            // Natural-language interpretation chips ("Understood as:")
+            if (parsed.interpretedChips.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.AutoAwesome,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        text = stringResource(R.string.search_understood_as),
+                        style = TgTypography.Mono,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    parsed.interpretedChips.forEach { chipLabel ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = chipLabel,
+                                style = TgTypography.Mono,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            )
+                        }
+                    }
+                }
             }
 
             // Scope filter chips
@@ -394,6 +435,14 @@ fun GlobalSearchScreen(
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
                                 AssistChip(
+                                    onClick = { vm.search("encrypted photos", immediate = true) },
+                                    label = { Text(stringResource(R.string.search_preset_encrypted_photos)) },
+                                )
+                                AssistChip(
+                                    onClick = { vm.search("pdfs from last month", immediate = true) },
+                                    label = { Text(stringResource(R.string.search_preset_recent_pdfs)) },
+                                )
+                                AssistChip(
                                     onClick = { vm.search("size:>10mb", immediate = true) },
                                     label = { Text(stringResource(R.string.search_preset_large_files)) },
                                 )
@@ -539,6 +588,7 @@ fun GlobalSearchScreen(
                                         CloudFileResultRow(
                                             msg = msg,
                                             folderTitle = folderTitle,
+                                            decryptedThumbBytes = decryptedThumbs[msg.chatId to msg.messageId],
                                             matchHint = hit.matchHint,
                                             highlightTokens = highlightTokens,
                                             onClick = {
@@ -844,14 +894,22 @@ private fun rememberHighlightedText(
 private fun CloudFileResultRow(
     msg: FileCacheEntity,
     folderTitle: String,
+    decryptedThumbBytes: ByteArray?,
     matchHint: String?,
     highlightTokens: List<String>,
     onClick: () -> Unit,
     onShowInFolder: () -> Unit,
 ) {
-    val (icon, tint) = searchVisual(msg.mimeType, msg.fileName)
-    val thumbFile = remember(msg.thumbnailPath) {
-        msg.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    val isEncrypted = remember(msg) { SmartSearchEngine.isEncrypted(msg) }
+    val (icon, tint) = searchVisual(
+        if (isEncrypted) null else msg.mimeType,
+        SmartSearchEngine.effectiveFileName(msg.fileName),
+    )
+    val plainThumbFile = remember(msg.thumbnailPath) {
+        msg.thumbnailPath
+            ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let(::File)
+            ?.takeIf { it.isFile && it.length() > 0L }
     }
     Row(
         modifier = Modifier
@@ -869,15 +927,39 @@ private fun CloudFileResultRow(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            if (thumbFile != null) {
+            if (decryptedThumbBytes != null) {
                 AsyncImage(
-                    model = thumbFile,
+                    model = decryptedThumbBytes,
+                    contentDescription = msg.fileName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else if (plainThumbFile != null) {
+                AsyncImage(
+                    model = plainThumbFile,
                     contentDescription = msg.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
                 Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+            }
+            if (isEncrypted) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(2.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.9f))
+                        .padding(2.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Lock,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.size(10.dp),
+                    )
+                }
             }
         }
         Column(

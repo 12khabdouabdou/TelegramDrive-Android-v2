@@ -12,9 +12,11 @@ import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.dao.ZipEntryDao
 import com.tgdrive.core.db.entity.AlbumEntity
 import com.tgdrive.core.db.entity.AlbumItemEntity
+import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.SyncedFileEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
+import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.DownloadUpdate
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.TelegramMessage
@@ -625,7 +627,11 @@ class CloudSyncManager @Inject constructor(
             )
         }
         val aiEntries = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
-        fileCacheDao.getAll().forEach { f ->
+        val allFiles = fileCacheDao.getAll()
+        val privateKeys = allFiles
+            .filter { isPrivateOrEncryptedForSync(it) }
+            .mapTo(HashSet()) { it.chatId to it.messageId }
+        filterPublicAiFiles(allFiles).forEach { f ->
             if (f.ocrText != null || f.aiTags != null || f.exifLat != null || f.exifLng != null) {
                 val key = f.chatId to f.messageId
                 aiEntries[key] = localAiTimestamps[key]
@@ -640,7 +646,9 @@ class CloudSyncManager @Inject constructor(
                     )
             }
         }
-        localAiTimestamps.forEach { (key, rec) -> aiEntries[key] = rec }
+        localAiTimestamps.forEach { (key, rec) ->
+            if (key !in privateKeys) aiEntries[key] = rec
+        }
         return CloudSyncCodec.CloudSearchIndexSnapshot(
             version = 1,
             updatedAtMs = System.currentTimeMillis(),
@@ -948,5 +956,11 @@ class CloudSyncManager @Inject constructor(
     companion object {
         private const val PUSH_DEBOUNCE_MS = 8_000L
         const val TRASH_RETENTION_MS = 30L * 24L * 60L * 60L * 1000L
+
+        internal fun isPrivateOrEncryptedForSync(file: FileCacheEntity): Boolean =
+            file.isLocked || file.isEncryptedVault || BackupCrypto.isEncryptedFileName(file.fileName)
+
+        internal fun filterPublicAiFiles(files: List<FileCacheEntity>): List<FileCacheEntity> =
+            files.filterNot(::isPrivateOrEncryptedForSync)
     }
 }

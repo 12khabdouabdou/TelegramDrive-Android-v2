@@ -10,6 +10,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,11 +28,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fingerprint
@@ -43,6 +46,7 @@ import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -394,39 +398,110 @@ fun VaultScreen(
                         VaultNoPassphraseBanner(
                             onConfigureClick = { showPassphraseDialog = true },
                         )
+                    } else if (state.aiIndexingProgress != null || state.unindexedAiCount > 0) {
+                        VaultAiIndexBanner(
+                            unindexedCount = state.unindexedAiCount,
+                            progress = state.aiIndexingProgress,
+                            onIndexClick = vm::indexVaultAi,
+                        )
                     }
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(2),
-                        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 32.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) {
-                        items(state.items, key = { "${it.chatId}_${it.messageId}" }) { item ->
-                            val thumbBytes = state.decryptedThumbs[item.chatId to item.messageId]
-                            VaultGridCard(
-                                item = item,
-                                decryptedThumbBytes = thumbBytes,
-                                isSelected = (item.chatId to item.messageId) in state.selectedIds,
-                                onClick = {
-                                    if (selectionMode) {
-                                        vm.toggleSelection(item.chatId, item.messageId)
-                                    } else {
-                                        vm.openUnlockedVaultItem(
-                                            item = item,
-                                            onOpenZip = onOpenZip,
-                                            onOpenVideo = onOpenVideo,
-                                            onOpenImage = onOpenImage,
-                                            onOpenPdf = onOpenPdf,
-                                            onOpenText = onOpenText,
-                                        )
-                                    }
-                                },
-                                onLongClick = {
-                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    vm.toggleSelection(item.chatId, item.messageId)
-                                },
+                    OutlinedTextField(
+                        value = state.searchQuery,
+                        onValueChange = vm::setSearchQuery,
+                        placeholder = { Text(stringResource(R.string.vault_search_hint), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                        trailingIcon = {
+                            if (state.searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { vm.setSearchQuery("") }) {
+                                    Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.browser_clear))
+                                }
+                            }
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                    if (state.interpretedChips.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 12.dp, vertical = 2.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Filled.AutoAwesome,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(14.dp),
                             )
+                            Text(
+                                text = stringResource(R.string.search_understood_as),
+                                style = TgTypography.Mono,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            state.interpretedChips.forEach { chipLabel ->
+                                Surface(
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f),
+                                    shape = RoundedCornerShape(8.dp),
+                                ) {
+                                    Text(
+                                        text = chipLabel,
+                                        style = TgTypography.Mono,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (state.filteredItems.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            EditorialEmptyState(
+                                icon = Icons.Filled.Search,
+                                title = stringResource(R.string.browser_empty_filtered),
+                                description = stringResource(R.string.browser_search_empty, state.searchQuery),
+                            )
+                        }
+                    } else {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(2),
+                            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 32.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxSize(),
+                        ) {
+                            items(state.filteredItems, key = { "${it.chatId}_${it.messageId}" }) { item ->
+                                val thumbBytes = state.decryptedThumbs[item.chatId to item.messageId]
+                                val matchHint = state.matchHints[item.chatId to item.messageId]
+                                VaultGridCard(
+                                    item = item,
+                                    decryptedThumbBytes = thumbBytes,
+                                    matchHint = matchHint,
+                                    isSelected = (item.chatId to item.messageId) in state.selectedIds,
+                                    onClick = {
+                                        if (selectionMode) {
+                                            vm.toggleSelection(item.chatId, item.messageId)
+                                        } else {
+                                            vm.openUnlockedVaultItem(
+                                                item = item,
+                                                onOpenZip = onOpenZip,
+                                                onOpenVideo = onOpenVideo,
+                                                onOpenImage = onOpenImage,
+                                                onOpenPdf = onOpenPdf,
+                                                onOpenText = onOpenText,
+                                            )
+                                        }
+                                    },
+                                    onLongClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        vm.toggleSelection(item.chatId, item.messageId)
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -661,6 +736,7 @@ private fun VaultLockGate(
 private fun VaultGridCard(
     item: FileCacheEntity,
     decryptedThumbBytes: ByteArray?,
+    matchHint: String?,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -766,9 +842,25 @@ private fun VaultGridCard(
                 style = TgTypography.Display.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface,
                 fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
+                maxLines = if (matchHint != null) 1 else 2,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (!matchHint.isNullOrBlank()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.padding(top = 3.dp),
+                ) {
+                    Text(
+                        text = matchHint,
+                        style = TgTypography.Mono,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                    )
+                }
+            }
             Spacer(Modifier.weight(1f))
             Text(
                 text = item.fileSize.toHumanSize(),
@@ -776,6 +868,60 @@ private fun VaultGridCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
             )
+        }
+    }
+}
+
+@Composable
+private fun VaultAiIndexBanner(
+    unindexedCount: Int,
+    progress: Pair<Int, Int>?,
+    onIndexClick: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.72f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.AutoAwesome,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = if (progress != null) {
+                        stringResource(R.string.vault_index_ai_progress, progress.first, progress.second)
+                    } else {
+                        stringResource(R.string.vault_index_ai_banner, unindexedCount)
+                    },
+                    style = TgTypography.Display.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                if (progress == null) {
+                    TextButton(onClick = onIndexClick) {
+                        Text(stringResource(R.string.search_index_ai_action), fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            if (progress != null && progress.second > 0) {
+                LinearProgressIndicator(
+                    progress = { progress.first.toFloat() / progress.second.toFloat() },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                )
+            }
         }
     }
 }

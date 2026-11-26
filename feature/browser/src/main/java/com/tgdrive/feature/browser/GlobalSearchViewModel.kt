@@ -23,10 +23,13 @@ import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.ai.MediaAiIndexWorker
 import com.tgdrive.core.download.ai.MediaAiIndexer
 import com.tgdrive.core.download.index.ZipIndexService
+import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.feature.browser.search.SearchConcepts
 import com.tgdrive.feature.browser.search.SearchFilterCriteria
 import com.tgdrive.feature.browser.search.SearchScopeFilter
 import com.tgdrive.feature.browser.search.SearchSortOrder
@@ -44,6 +47,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
@@ -89,6 +94,7 @@ class GlobalSearchViewModel
         private val trashEntryDao: TrashEntryDao,
         private val zipIndexService: ZipIndexService,
         private val mediaAiIndexer: MediaAiIndexer,
+        private val cloudSyncManager: CloudSyncManager,
         private val downloadManager: DownloadManager,
         private val offlinePinStore: OfflinePinStore,
         private val uploadManager: UploadManager,
@@ -127,6 +133,9 @@ class GlobalSearchViewModel
         private val _hasSavedBackupPassphrase = MutableStateFlow(false)
         val hasSavedBackupPassphrase: StateFlow<Boolean> = _hasSavedBackupPassphrase.asStateFlow()
 
+        private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
+        val decryptedThumbs: StateFlow<Map<Pair<Long, Long>, ByteArray>> = _decryptedThumbs.asStateFlow()
+
         private val _snackbar = MutableStateFlow<String?>(null)
         val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
 
@@ -161,6 +170,8 @@ class GlobalSearchViewModel
         private var searchJob: Job? = null
         private var audioWaitJob: Job? = null
         private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val attemptedEncThumbKeys = HashSet<Pair<Long, Long>>()
+        private val encThumbSemaphore = Semaphore(2)
 
         init {
             viewModelScope.launch(dispatchers.io) {
@@ -195,7 +206,12 @@ class GlobalSearchViewModel
             if (clean.length >= 8) {
                 backupCrypto.setVaultPassphrase(clean)
                 _hasSavedBackupPassphrase.value = true
+                _decryptedThumbs.value = emptyMap()
+                synchronized(attemptedEncThumbKeys) { attemptedEncThumbKeys.clear() }
                 mediaThumbnailCache.clearDecryptedMemoryCache()
+                MediaAiIndexWorker.enqueueSoon(appContext)
+                viewModelScope.launch(dispatchers.io) { refreshUnindexedAiCount() }
+                (_state.value as? GlobalSearchUiState.Results)?.let { warmEncryptedSearchThumbnails(it.hits) }
             }
         }
 
@@ -281,12 +297,12 @@ class GlobalSearchViewModel
                     _aiIndexing.value = AiIndexingProgress(running = false, unindexedCount = 0)
                     return@launch
                 }
-                _aiIndexing.value = AiIndexingProgress(running = true, unindexedCount = pending, done = 0, total = pending.coerceAtMost(30))
+                _aiIndexing.value = AiIndexingProgress(running = true, unindexedCount = pending, done = 0, total = pending.coerceAtMost(50))
                 try {
                     runCatching { mediaAiIndexer.scanLocalExifLocations(excluded) }
                     mediaAiIndexer.indexUnindexedBatch(
                         excludedChatIds = excluded,
-                        maxCount = 30,
+                        maxCount = 50,
                     ) { done, total ->
                         _aiIndexing.value = AiIndexingProgress(
                             running = true,
@@ -363,7 +379,10 @@ class GlobalSearchViewModel
             searchJob?.cancel()
             val activeScope = _scope.value
             val activeCriteria = _filterCriteria.value
-            val parsed = SmartSearchEngine.parseQuery(query)
+            val parsed = SmartSearchEngine.parseQuery(
+                rawQuery = query,
+                knownFolderNames = activeCriteria.folderNames.values,
+            )
             if (query.isBlank() && activeScope == SearchScopeFilter.ALL && !activeCriteria.hasUiFilters) {
                 _state.value = GlobalSearchUiState.Idle
                 return
@@ -372,8 +391,12 @@ class GlobalSearchViewModel
                 if (!immediate) delay(220L)
                 val trimmed = query.trim()
                 val excludedIds = systemChannelId?.let { setOf(it) } ?: emptySet()
+                val hasConceptExpansion = SmartSearchEngine.tokenize(parsed.textQuery)
+                    .any { SearchConcepts.expandConcepts(it).isNotEmpty() }
                 val canTryFts = parsed.textQuery.isNotBlank() &&
                     !parsed.hasOperators &&
+                    !parsed.hasNaturalIntents &&
+                    !hasConceptExpansion &&
                     activeScope == SearchScopeFilter.ALL &&
                     !activeCriteria.hasUiFilters &&
                     cachedFiles.isEmpty()
@@ -416,6 +439,7 @@ class GlobalSearchViewModel
                 if (localHits.isNotEmpty() || remoteText.length < 2) {
                     _state.value = GlobalSearchUiState.Results(localHits)
                     warmSearchThumbnails(localHits)
+                    warmEncryptedSearchThumbnails(localHits)
                 } else {
                     _state.value = GlobalSearchUiState.Searching
                 }
@@ -454,6 +478,7 @@ class GlobalSearchViewModel
                             )
                             _state.value = GlobalSearchUiState.Results(mergedHits)
                             warmSearchThumbnails(mergedHits)
+                            warmEncryptedSearchThumbnails(mergedHits)
                         } else if (_state.value is GlobalSearchUiState.Searching) {
                             _state.value = GlobalSearchUiState.Results(localHits)
                         }
@@ -463,6 +488,39 @@ class GlobalSearchViewModel
                         Log.w("GlobalSearchVM: remote search failed", t)
                         if (_state.value is GlobalSearchUiState.Searching) {
                             _state.value = GlobalSearchUiState.Results(localHits)
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun warmEncryptedSearchThumbnails(hits: List<SmartSearchHit>) {
+            if (!backupCrypto.hasVaultPassphrase()) return
+            val candidates = hits
+                .filterIsInstance<SmartSearchHit.CloudFileHit>()
+                .map { it.entity }
+                .filter { SmartSearchEngine.isEncrypted(it) }
+                .take(20)
+            for (entity in candidates) {
+                val key = entity.chatId to entity.messageId
+                val path = entity.thumbnailPath
+                val hasLocal = (path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true && File(path).isFile) ||
+                    mediaThumbnailCache.getEncryptedThumbnailPath(entity.chatId, entity.messageId) != null
+                val hasCloud = cloudSyncManager.getCloudEncryptedThumbRemoteId(entity.chatId, entity.messageId) != null
+                if (!hasLocal && !hasCloud) continue
+                val shouldTry = synchronized(attemptedEncThumbKeys) { attemptedEncThumbKeys.add(key) }
+                if (!shouldTry) continue
+                viewModelScope.launch(dispatchers.io) {
+                    encThumbSemaphore.withPermit {
+                        val encPath = when {
+                            path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true &&
+                                File(path).isFile -> path
+                            else -> mediaThumbnailCache.getEncryptedThumbnailPath(entity.chatId, entity.messageId)
+                                ?: mediaThumbnailCache.restoreEncryptedThumbFromCloud(entity.chatId, entity.messageId)
+                        } ?: return@withPermit
+                        val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(encPath) }.getOrNull()
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            _decryptedThumbs.update { cur -> cur + (key to bytes) }
                         }
                     }
                 }
@@ -658,5 +716,12 @@ class GlobalSearchViewModel
 
         fun retry() {
             search(_query.value, immediate = true)
+        }
+
+        override fun onCleared() {
+            super.onCleared()
+            _decryptedThumbs.value = emptyMap()
+            synchronized(attemptedEncThumbKeys) { attemptedEncThumbKeys.clear() }
+            mediaThumbnailCache.clearDecryptedMemoryCache()
         }
     }

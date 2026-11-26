@@ -159,6 +159,7 @@ class TelegramDriveApp :
                 Log.w("TelegramDriveApp: scheduledUploadScheduler failed", t)
             }
             com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(this@TelegramDriveApp)
+            com.tgdrive.core.download.ai.MediaAiIndexWorker.schedulePeriodic(this@TelegramDriveApp)
         }
     }
 

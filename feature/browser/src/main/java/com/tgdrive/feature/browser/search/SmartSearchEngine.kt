@@ -5,7 +5,9 @@ import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
 import com.tgdrive.core.security.BackupCrypto
+import java.time.Instant
 import java.time.LocalDate
+import java.time.Month
 import java.time.ZoneId
 import kotlin.math.abs
 
@@ -40,9 +42,16 @@ data class ParsedSearchQuery(
     val requireStarred: Boolean = false,
     val requireOffline: Boolean = false,
     val requireEncrypted: Boolean = false,
+    val inferredScope: SearchScopeFilter? = null,
+    val inferredSort: SearchSortOrder? = null,
+    val interpretedChips: List<String> = emptyList(),
+    val hasNaturalIntents: Boolean = false,
 ) {
     val hasOperators: Boolean
-        get() = extensions.isNotEmpty() ||
+        get() = hasExplicitOperators
+
+    private var hasExplicitOperators: Boolean =
+        extensions.isNotEmpty() ||
             folderFilter != null ||
             afterEpochMs != null ||
             beforeEpochMs != null ||
@@ -51,6 +60,11 @@ data class ParsedSearchQuery(
             requireStarred ||
             requireOffline ||
             requireEncrypted
+
+    internal fun withExplicitFlag(explicit: Boolean): ParsedSearchQuery {
+        hasExplicitOperators = explicit
+        return this
+    }
 
     val highlightTokens: List<String>
         get() = SmartSearchEngine.tokenize(textQuery)
@@ -103,30 +117,67 @@ sealed interface SmartSearchHit {
 
 /**
  * On-device zero-network smart search engine supporting:
- * - Multi-field matching (filename, notes, folder path, ML Kit AI tags & OCR text, ZIP members)
- * - CamelCase / separator tokenization + bounded Levenshtein typo tolerance
- * - Inline operators (`ext:`, `in:`, `after:`, `before:`, `size:>`, `size:<`, `is:starred|offline|encrypted`)
- * - Structured filters & sorting while suppressing locked items and `.tgethumb` sidecars
+ * - Natural language query understanding (dates, media types, sizes, folders, vault/starred/offline flags)
+ * - Cross-field semantic fusion (filename, notes, folder path, EXIF place tags, audio ID3 tags,
+ *   ML Kit AI labels, OCR/text snippets, date tokens, and ZIP members)
+ * - Bilingual EN/FR stemming, diacritic folding, concept synonym expansion, and typo tolerance
+ * - Full support for PassVault `.tgenc` effective file types and local-only Vault search
  */
 object SmartSearchEngine {
 
-    private val TGETHUMB_SUFFIX = ".tgethumb"
+    private const val TGETHUMB_SUFFIX = ".tgethumb"
 
-    fun parseQuery(rawQuery: String): ParsedSearchQuery {
+    private enum class MatchField(val weight: Float) {
+        FILENAME(1.0f),
+        NOTE(0.95f),
+        LOCATION(0.92f),
+        AUDIO(0.90f),
+        FOLDER(0.88f),
+        AI_TAGS(0.85f),
+        OCR(0.82f),
+        DATE(0.75f),
+    }
+
+    private data class QueryTokenMeta(
+        val raw: String,
+        val norm: String,
+        val stem: String,
+        val concepts: Set<String>,
+    )
+
+    private data class CandidateField(
+        val field: MatchField,
+        val rawText: String,
+        val normalizedText: String,
+        val tokens: List<String>,
+        val stems: List<String>,
+    )
+
+    private data class TokenFieldMatch(
+        val field: MatchField,
+        val score: Int,
+        val conceptMatchedTerm: String? = null,
+    )
+
+    fun parseQuery(
+        rawQuery: String,
+        knownFolderNames: Collection<String> = emptyList(),
+        nowDate: LocalDate = LocalDate.now(),
+    ): ParsedSearchQuery {
         val trimmed = rawQuery.trim()
         if (trimmed.isEmpty()) return ParsedSearchQuery(rawQuery = rawQuery, textQuery = "")
 
         val parts = splitRespectingQuotes(trimmed)
         val freeTokens = ArrayList<String>(parts.size)
         val extensions = LinkedHashSet<String>()
-        var folderFilter: String? = null
-        var afterMs: Long? = null
-        var beforeMs: Long? = null
-        var minSize: Long? = null
-        var maxSize: Long? = null
-        var reqStarred = false
-        var reqOffline = false
-        var reqEncrypted = false
+        var explicitFolderFilter: String? = null
+        var explicitAfterMs: Long? = null
+        var explicitBeforeMs: Long? = null
+        var explicitMinSize: Long? = null
+        var explicitMaxSize: Long? = null
+        var explicitStarred = false
+        var explicitOffline = false
+        var explicitEncrypted = false
 
         for (token in parts) {
             val lower = token.lowercase()
@@ -139,42 +190,67 @@ object SmartSearchEngine {
                 }
                 lower.startsWith("in:") && token.length > 3 -> {
                     val value = token.substring(3).trim('"').trim()
-                    if (value.isNotEmpty()) folderFilter = value
+                    if (value.isNotEmpty()) explicitFolderFilter = value
                 }
                 lower.startsWith("after:") && token.length > 6 -> {
-                    parseDateStartMs(token.substring(6))?.let { afterMs = it }
+                    parseDateStartMs(token.substring(6))?.let { explicitAfterMs = it }
                 }
                 lower.startsWith("before:") && token.length > 7 -> {
-                    parseDateEndMs(token.substring(7))?.let { beforeMs = it }
+                    parseDateEndMs(token.substring(7))?.let { explicitBeforeMs = it }
                 }
                 lower.startsWith("size:") && token.length > 5 -> {
                     val expr = token.substring(5).trim()
                     when {
-                        expr.startsWith(">") -> parseByteSize(expr.substring(1))?.let { minSize = it }
-                        expr.startsWith("<") -> parseByteSize(expr.substring(1))?.let { maxSize = it }
-                        else -> parseByteSize(expr)?.let { minSize = it }
+                        expr.startsWith(">") -> parseByteSize(expr.substring(1))?.let { explicitMinSize = it }
+                        expr.startsWith("<") -> parseByteSize(expr.substring(1))?.let { explicitMaxSize = it }
+                        else -> parseByteSize(expr)?.let { explicitMinSize = it }
                     }
                 }
-                lower == "is:starred" || lower == "is:fav" || lower == "is:favorite" -> reqStarred = true
-                lower == "is:offline" || lower == "is:pinned" -> reqOffline = true
-                lower == "is:encrypted" || lower == "is:vault" -> reqEncrypted = true
+                lower == "is:starred" || lower == "is:fav" || lower == "is:favorite" -> explicitStarred = true
+                lower == "is:offline" || lower == "is:pinned" -> explicitOffline = true
+                lower == "is:encrypted" || lower == "is:vault" -> explicitEncrypted = true
                 else -> freeTokens.add(token)
             }
         }
 
+        val hasExplicit = extensions.isNotEmpty() ||
+            explicitFolderFilter != null ||
+            explicitAfterMs != null ||
+            explicitBeforeMs != null ||
+            explicitMinSize != null ||
+            explicitMaxSize != null ||
+            explicitStarred ||
+            explicitOffline ||
+            explicitEncrypted
+
+        val nl = NaturalLanguageQueryParser.parseNaturalLanguage(
+            freeText = freeTokens.joinToString(" "),
+            knownFolderNames = knownFolderNames,
+            nowDate = nowDate,
+        )
+
+        val mergedExts = LinkedHashSet<String>(extensions.size + nl.inferredExtensions.size).apply {
+            addAll(extensions)
+            addAll(nl.inferredExtensions)
+        }
+
         return ParsedSearchQuery(
             rawQuery = rawQuery,
-            textQuery = freeTokens.joinToString(" ").trim(),
-            extensions = extensions,
-            folderFilter = folderFilter,
-            afterEpochMs = afterMs,
-            beforeEpochMs = beforeMs,
-            minSizeBytes = minSize,
-            maxSizeBytes = maxSize,
-            requireStarred = reqStarred,
-            requireOffline = reqOffline,
-            requireEncrypted = reqEncrypted,
-        )
+            textQuery = nl.cleanedTextQuery,
+            extensions = mergedExts,
+            folderFilter = explicitFolderFilter ?: nl.inferredFolderFilter,
+            afterEpochMs = listOfNotNull(explicitAfterMs, nl.inferredAfterMs).maxOrNull(),
+            beforeEpochMs = listOfNotNull(explicitBeforeMs, nl.inferredBeforeMs).minOrNull(),
+            minSizeBytes = listOfNotNull(explicitMinSize, nl.inferredMinSizeBytes).maxOrNull(),
+            maxSizeBytes = listOfNotNull(explicitMaxSize, nl.inferredMaxSizeBytes).minOrNull(),
+            requireStarred = explicitStarred || nl.requireStarred,
+            requireOffline = explicitOffline || nl.requireOffline,
+            requireEncrypted = explicitEncrypted || nl.requireEncrypted,
+            inferredScope = nl.inferredScope,
+            inferredSort = nl.inferredSort,
+            interpretedChips = nl.interpretedChips,
+            hasNaturalIntents = nl.hasIntents,
+        ).withExplicitFlag(hasExplicit)
     }
 
     fun search(
@@ -184,12 +260,19 @@ object SmartSearchEngine {
         scope: SearchScopeFilter = SearchScopeFilter.ALL,
         excludedChatIds: Set<Long> = emptySet(),
         criteria: SearchFilterCriteria = SearchFilterCriteria(),
+        includeLocked: Boolean = false,
     ): List<SmartSearchHit> {
-        val parsed = parseQuery(query)
+        val parsed = parseQuery(query, knownFolderNames = criteria.folderNames.values)
         val text = parsed.textQuery
         val queryTokens = tokenize(text)
-        val hasActiveCriteria = scope != SearchScopeFilter.ALL || parsed.hasOperators || criteria.hasUiFilters
+        val hasActiveCriteria = scope != SearchScopeFilter.ALL ||
+            parsed.hasOperators ||
+            parsed.hasNaturalIntents ||
+            criteria.hasUiFilters
         if (text.isEmpty() && !hasActiveCriteria) return emptyList()
+
+        val queryMeta = buildQueryTokenMeta(queryTokens)
+        val normFullQuery = normalizeForSearch(text)
 
         val effectiveAfterMs = listOfNotNull(parsed.afterEpochMs, criteria.afterEpochMs).maxOrNull()
         val effectiveBeforeMs = listOfNotNull(parsed.beforeEpochMs, criteria.beforeEpochMs).minOrNull()
@@ -198,12 +281,14 @@ object SmartSearchEngine {
 
         val hits = ArrayList<SmartSearchHit>()
 
-        if (scope != SearchScopeFilter.IN_ZIPS) {
+        if (scope != SearchScopeFilter.IN_ZIPS && parsed.inferredScope != SearchScopeFilter.IN_ZIPS) {
             for (file in files) {
                 if (file.chatId in excludedChatIds) continue
-                if (file.isLocked) continue
+                if (!includeLocked && file.isLocked) continue
                 if (file.fileName.endsWith(TGETHUMB_SUFFIX, ignoreCase = true)) continue
                 if (!matchesScope(file, scope)) continue
+                val nlScope = parsed.inferredScope
+                if (nlScope != null && !matchesScope(file, nlScope)) continue
                 if (!matchesStructuredFilters(
                         file = file,
                         parsed = parsed,
@@ -217,71 +302,25 @@ object SmartSearchEngine {
                     continue
                 }
 
-                if (text.isEmpty()) {
+                if (queryMeta.isEmpty()) {
                     hits += SmartSearchHit.CloudFileHit(file, 10)
                     continue
                 }
 
-                var bestScore = scoreCandidate(text, queryTokens, file.fileName)
-                var hint: String? = null
-                val note = file.userNote
-                if (!note.isNullOrBlank()) {
-                    val noteScore = scoreCandidate(text, queryTokens, note)
-                    if (noteScore > 0) {
-                        val weighted = (noteScore * 0.9f).toInt().coerceAtLeast(1)
-                        if (weighted > bestScore) {
-                            bestScore = weighted
-                            hint = "Note: ${note.replace('\n', ' ').take(48)}"
-                        } else if (hint == null) {
-                            hint = "Note: ${note.replace('\n', ' ').take(48)}"
-                        }
-                    }
-                }
-                if (file.virtualPath.isNotBlank()) {
-                    val pathScore = scoreCandidate(text, queryTokens, file.virtualPath)
-                    if (pathScore > 0) {
-                        val weighted = (pathScore * 0.85f).toInt().coerceAtLeast(1)
-                        if (weighted > bestScore) {
-                            bestScore = weighted
-                            hint = "Folder: ${file.virtualPath}"
-                        } else if (hint == null) {
-                            hint = "Folder: ${file.virtualPath}"
-                        }
-                    }
-                }
-                val tags = file.aiTags
-                if (!tags.isNullOrBlank()) {
-                    val tagScore = scoreCandidate(text, queryTokens, tags)
-                    if (tagScore > 0) {
-                        val weighted = (tagScore * 0.85f).toInt().coerceAtLeast(1)
-                        if (weighted > bestScore) {
-                            bestScore = weighted
-                            hint = "AI tag: ${tags.take(48)}"
-                        } else if (hint == null) {
-                            hint = "AI tag: ${tags.take(48)}"
-                        }
-                    }
-                }
-                val ocr = file.ocrText
-                if (!ocr.isNullOrBlank()) {
-                    val ocrScore = scoreCandidate(text, queryTokens, ocr)
-                    if (ocrScore > 0) {
-                        val weighted = (ocrScore * 0.8f).toInt().coerceAtLeast(1)
-                        if (weighted > bestScore) {
-                            bestScore = weighted
-                            hint = "OCR: ${ocr.replace('\n', ' ').take(48)}"
-                        } else if (hint == null) {
-                            hint = "OCR: ${ocr.replace('\n', ' ').take(48)}"
-                        }
-                    }
-                }
-                if (bestScore > 0) {
-                    hits += SmartSearchHit.CloudFileHit(file, bestScore, hint)
+                val scored = scoreCloudFileCrossField(
+                    file = file,
+                    normFullQuery = normFullQuery,
+                    queryMeta = queryMeta,
+                    criteria = criteria,
+                )
+                if (scored != null) {
+                    hits += SmartSearchHit.CloudFileHit(file, scored.first, scored.second)
                 }
             }
         }
 
-        val includeZips = scope == SearchScopeFilter.ALL || scope == SearchScopeFilter.IN_ZIPS
+        val includeZips = (scope == SearchScopeFilter.ALL || scope == SearchScopeFilter.IN_ZIPS) &&
+            (parsed.inferredScope == null || parsed.inferredScope == SearchScopeFilter.IN_ZIPS)
         if (includeZips && !parsed.requireStarred && !parsed.requireOffline) {
             for (entry in zipEntries) {
                 if (entry.chatId in excludedChatIds) continue
@@ -305,7 +344,11 @@ object SmartSearchEngine {
                 if (effectiveMaxSize != null && entry.entrySize > effectiveMaxSize) continue
 
                 val target = "${entry.entryName} ${entry.entryPath}"
-                val score = if (text.isEmpty()) 5 else scoreCandidate(text, queryTokens, target)
+                val score = if (queryMeta.isEmpty()) {
+                    5
+                } else {
+                    scoreZipTarget(normFullQuery, queryMeta, target)
+                }
                 if (score > 0) {
                     val pathHint = entry.entryPath.substringBeforeLast('/', "").takeIf { it.isNotEmpty() }
                     hits += SmartSearchHit.ZipMemberHit(entry, score, pathHint?.let { "ZIP path: $it" })
@@ -313,7 +356,13 @@ object SmartSearchEngine {
             }
         }
 
-        return when (criteria.sortOrder) {
+        val effectiveSort = if (criteria.sortOrder != SearchSortOrder.RELEVANCE) {
+            criteria.sortOrder
+        } else {
+            parsed.inferredSort ?: SearchSortOrder.RELEVANCE
+        }
+
+        return when (effectiveSort) {
             SearchSortOrder.RELEVANCE -> hits.sortedWith(
                 compareByDescending<SmartSearchHit> { it.score }
                     .thenByDescending { it.dateMs }
@@ -334,6 +383,250 @@ object SmartSearchEngine {
         }
     }
 
+    private fun buildQueryTokenMeta(queryTokens: List<String>): List<QueryTokenMeta> =
+        queryTokens.map { raw ->
+            val norm = normalizeForSearch(raw)
+            QueryTokenMeta(
+                raw = raw,
+                norm = norm,
+                stem = stemToken(norm),
+                concepts = SearchConcepts.expandConcepts(norm),
+            )
+        }
+
+    private fun scoreCloudFileCrossField(
+        file: FileCacheEntity,
+        normFullQuery: String,
+        queryMeta: List<QueryTokenMeta>,
+        criteria: SearchFilterCriteria,
+    ): Pair<Int, String?>? {
+        val fields = ArrayList<CandidateField>(8)
+        val effName = effectiveFileName(file.fileName)
+        fields += buildField(MatchField.FILENAME, effName)
+        if (!file.userNote.isNullOrBlank()) {
+            fields += buildField(MatchField.NOTE, file.userNote!!)
+        }
+        val tagParts = SearchConcepts.parseAiTagParts(file.aiTags)
+        if (tagParts.locations.isNotEmpty()) {
+            fields += buildField(MatchField.LOCATION, tagParts.locations.joinToString(", "))
+        }
+        if (tagParts.audioMeta.isNotEmpty()) {
+            fields += buildField(MatchField.AUDIO, tagParts.audioMeta.joinToString(" · "))
+        }
+        val folderText = buildString {
+            criteria.folderNames[file.chatId]?.let { append(it) }
+            if (file.virtualPath.isNotBlank()) {
+                if (isNotEmpty()) append(' ')
+                append(file.virtualPath)
+            }
+        }
+        if (folderText.isNotEmpty()) {
+            fields += buildField(MatchField.FOLDER, folderText)
+        }
+        if (tagParts.visualTags.isNotEmpty()) {
+            fields += buildField(MatchField.AI_TAGS, tagParts.visualTags.joinToString(", "))
+        }
+        if (!file.ocrText.isNullOrBlank()) {
+            fields += buildField(MatchField.OCR, file.ocrText!!)
+        }
+        buildDateText(file.date)?.let { dateStr ->
+            fields += buildField(MatchField.DATE, dateStr)
+        }
+
+        var matchedCount = 0
+        var totalScore = 0
+        var bestEvidence: TokenFieldMatch? = null
+        var filenameMatchedAny = false
+        var bestConceptTerm: String? = null
+
+        for (qt in queryMeta) {
+            var bestForToken: TokenFieldMatch? = null
+            for (field in fields) {
+                val m = scoreTokenAgainstField(qt, field) ?: continue
+                if (bestForToken == null || m.score > bestForToken.score) {
+                    bestForToken = m
+                }
+            }
+            if (bestForToken != null) {
+                matchedCount++
+                totalScore += bestForToken.score
+                if (bestForToken.field == MatchField.FILENAME) {
+                    filenameMatchedAny = true
+                } else if (bestForToken.field != MatchField.DATE) {
+                    if (bestEvidence == null || bestForToken.score > bestEvidence.score) {
+                        bestEvidence = bestForToken
+                    }
+                }
+                if (bestConceptTerm == null && bestForToken.conceptMatchedTerm != null) {
+                    bestConceptTerm = bestForToken.conceptMatchedTerm
+                }
+            }
+        }
+
+        val minRequired = if (queryMeta.size <= 2) queryMeta.size else (queryMeta.size + 1) / 2
+        if (matchedCount < minRequired) return null
+
+        // Multi-token cross-field completeness + full-phrase bonus
+        var phraseBonus = matchedCount * 20
+        if (normFullQuery.isNotEmpty()) {
+            val fileNorm = fields[0].normalizedText
+            when {
+                fileNorm == normFullQuery -> phraseBonus += 800
+                fileNorm.startsWith(normFullQuery) -> phraseBonus += 650
+                fileNorm.contains(normFullQuery) -> phraseBonus += 450
+            }
+            for (f in fields.drop(1)) {
+                if (f.normalizedText.contains(normFullQuery)) {
+                    phraseBonus = maxOf(phraseBonus, (500 * f.field.weight).toInt())
+                    if (f.field != MatchField.DATE && (bestEvidence == null || bestEvidence.field != f.field)) {
+                        bestEvidence = TokenFieldMatch(f.field, (500 * f.field.weight).toInt())
+                    }
+                }
+            }
+        }
+
+        val hint = formatMatchHint(
+            file = file,
+            tagParts = tagParts,
+            bestEvidence = bestEvidence,
+            filenameMatchedAny = filenameMatchedAny,
+            bestConceptTerm = bestConceptTerm,
+        )
+        return (totalScore + phraseBonus).coerceAtLeast(1) to hint
+    }
+
+    private fun formatMatchHint(
+        file: FileCacheEntity,
+        tagParts: AiTagParts,
+        bestEvidence: TokenFieldMatch?,
+        filenameMatchedAny: Boolean,
+        bestConceptTerm: String?,
+    ): String? {
+        if (bestEvidence != null) {
+            return when (bestEvidence.field) {
+                MatchField.LOCATION -> "Location: ${tagParts.locations.joinToString(", ").take(48)}"
+                MatchField.AUDIO -> "Audio: ${tagParts.audioMeta.joinToString(" · ").take(48)}"
+                MatchField.NOTE -> "Note: ${file.userNote.orEmpty().replace('\n', ' ').take(48)}"
+                MatchField.FOLDER -> file.virtualPath.takeIf { it.isNotBlank() }?.let { "Folder: $it" }
+                MatchField.AI_TAGS -> "AI tag: ${tagParts.visualTags.joinToString(", ").take(48)}"
+                MatchField.OCR -> "OCR: ${file.ocrText.orEmpty().replace('\n', ' ').take(48)}"
+                MatchField.FILENAME, MatchField.DATE -> null
+            }
+        }
+        if (!filenameMatchedAny && bestConceptTerm != null) {
+            return "Related: $bestConceptTerm"
+        }
+        if (bestConceptTerm != null) {
+            return "Concept: $bestConceptTerm"
+        }
+        return null
+    }
+
+    private fun buildField(field: MatchField, rawText: String): CandidateField {
+        val tokens = tokenizeNormalized(rawText)
+        val stems = tokens.map { stemToken(it) }
+        return CandidateField(
+            field = field,
+            rawText = rawText,
+            normalizedText = normalizeForSearch(rawText),
+            tokens = tokens,
+            stems = stems,
+        )
+    }
+
+    private fun scoreTokenAgainstField(
+        qt: QueryTokenMeta,
+        field: CandidateField,
+    ): TokenFieldMatch? {
+        if (field.tokens.isEmpty() || qt.norm.isEmpty()) return null
+        var bestRaw = 0
+        var conceptTerm: String? = null
+
+        for (i in field.tokens.indices) {
+            val ct = field.tokens[i]
+            val ctStem = field.stems[i]
+            val base = when {
+                ct == qt.norm -> 120
+                qt.stem.length >= 3 && ctStem == qt.stem -> 110
+                ct.startsWith(qt.norm) -> 95
+                ct in qt.concepts -> {
+                    if (conceptTerm == null) conceptTerm = ct
+                    82
+                }
+                ctStem in qt.concepts -> {
+                    if (conceptTerm == null) conceptTerm = ct
+                    78
+                }
+                ct.contains(qt.norm) -> 75
+                qt.norm.length >= 4 -> {
+                    val maxDist = if (qt.norm.length >= 7) 2 else 1
+                    val d = levenshtein(qt.norm, ct)
+                    if (d <= maxDist) 65 - (d * 15) else 0
+                }
+                else -> 0
+            }
+            if (base > bestRaw) {
+                bestRaw = base
+                if (base >= 95) conceptTerm = null
+            }
+        }
+        if (bestRaw <= 0) return null
+        val weighted = (bestRaw * field.field.weight).toInt().coerceAtLeast(1)
+        return TokenFieldMatch(field.field, weighted, conceptTerm)
+    }
+
+    private fun scoreZipTarget(
+        normFullQuery: String,
+        queryMeta: List<QueryTokenMeta>,
+        target: String,
+    ): Int {
+        val field = buildField(MatchField.FILENAME, target)
+        if (normFullQuery.isNotEmpty()) {
+            when {
+                field.normalizedText == normFullQuery -> return 1000
+                field.normalizedText.startsWith(normFullQuery) -> return 850
+                field.normalizedText.contains(normFullQuery) -> return 700
+            }
+        }
+        var matched = 0
+        var totalScore = 0
+        for (qt in queryMeta) {
+            val m = scoreTokenAgainstField(qt, field)
+            if (m != null) {
+                matched++
+                totalScore += m.score
+            }
+        }
+        val minRequired = if (queryMeta.size <= 2) queryMeta.size else (queryMeta.size + 1) / 2
+        if (matched < minRequired) return 0
+        return totalScore + (matched * 20)
+    }
+
+    private fun buildDateText(rawDate: Long): String? {
+        val ms = normalizeEpochMs(rawDate)
+        if (ms <= 0L) return null
+        val ld = runCatching {
+            Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).toLocalDate()
+        }.getOrNull() ?: return null
+        val frMonth = FRENCH_MONTHS[ld.month].orEmpty()
+        return "${ld.year} ${ld.month.name.lowercase()} $frMonth"
+    }
+
+    private val FRENCH_MONTHS: Map<Month, String> = mapOf(
+        Month.JANUARY to "janvier",
+        Month.FEBRUARY to "fevrier",
+        Month.MARCH to "mars",
+        Month.APRIL to "avril",
+        Month.MAY to "mai",
+        Month.JUNE to "juin",
+        Month.JULY to "juillet",
+        Month.AUGUST to "aout",
+        Month.SEPTEMBER to "septembre",
+        Month.OCTOBER to "octobre",
+        Month.NOVEMBER to "novembre",
+        Month.DECEMBER to "decembre",
+    )
+
     private fun matchesStructuredFilters(
         file: FileCacheEntity,
         parsed: ParsedSearchQuery,
@@ -353,11 +646,10 @@ object SmartSearchEngine {
             if (ext !in parsed.extensions) return false
         }
         if (parsed.folderFilter != null) {
-            val folderTitle = criteria.folderNames[file.chatId].orEmpty()
-            val needle = parsed.folderFilter
-            if (!folderTitle.contains(needle, ignoreCase = true) &&
-                !file.virtualPath.contains(needle, ignoreCase = true)
-            ) {
+            val folderTitle = normalizeForSearch(criteria.folderNames[file.chatId].orEmpty())
+            val vpath = normalizeForSearch(file.virtualPath)
+            val needle = normalizeForSearch(parsed.folderFilter)
+            if (!folderTitle.contains(needle) && !vpath.contains(needle)) {
                 return false
             }
         }
@@ -369,17 +661,26 @@ object SmartSearchEngine {
         return true
     }
 
-    private fun isEncrypted(file: FileCacheEntity): Boolean {
+    fun isEncrypted(file: FileCacheEntity): Boolean {
         return file.isEncryptedVault || BackupCrypto.isEncryptedFileName(file.fileName)
     }
 
-    private fun effectiveExtension(fileName: String): String {
-        val stripped = if (BackupCrypto.isEncryptedFileName(fileName)) {
-            fileName.dropLast(".tgenc".length)
+    fun effectiveFileName(fileName: String): String {
+        return if (BackupCrypto.isEncryptedFileName(fileName)) {
+            BackupCrypto.stripEncryptedExtension(fileName)
         } else {
             fileName
         }
-        return stripped.substringAfterLast('.', "").lowercase()
+    }
+
+    fun effectiveBucket(file: FileCacheEntity): FileBucket {
+        val name = effectiveFileName(file.fileName)
+        val mime = if (isEncrypted(file)) null else file.mimeType
+        return classifyFile(mime, name)
+    }
+
+    private fun effectiveExtension(fileName: String): String {
+        return effectiveFileName(fileName).substringAfterLast('.', "").lowercase()
     }
 
     private fun normalizeEpochMs(rawDate: Long): Long {
@@ -388,12 +689,12 @@ object SmartSearchEngine {
 
     private fun matchesScope(file: FileCacheEntity, scope: SearchScopeFilter): Boolean = when (scope) {
         SearchScopeFilter.ALL -> true
-        SearchScopeFilter.IN_ZIPS -> file.fileName.endsWith(".zip", ignoreCase = true)
-        SearchScopeFilter.IMAGES -> classifyFile(file.mimeType, file.fileName) == FileBucket.IMAGES
-        SearchScopeFilter.VIDEOS -> classifyFile(file.mimeType, file.fileName) == FileBucket.VIDEOS
-        SearchScopeFilter.AUDIO -> classifyFile(file.mimeType, file.fileName) == FileBucket.AUDIO
+        SearchScopeFilter.IN_ZIPS -> effectiveFileName(file.fileName).endsWith(".zip", ignoreCase = true)
+        SearchScopeFilter.IMAGES -> effectiveBucket(file) == FileBucket.IMAGES
+        SearchScopeFilter.VIDEOS -> effectiveBucket(file) == FileBucket.VIDEOS
+        SearchScopeFilter.AUDIO -> effectiveBucket(file) == FileBucket.AUDIO
         SearchScopeFilter.DOCS -> {
-            val b = classifyFile(file.mimeType, file.fileName)
+            val b = effectiveBucket(file)
             b == FileBucket.PDF || b == FileBucket.DOCUMENTS
         }
         SearchScopeFilter.OFFLINE -> file.isPinnedOffline
@@ -401,7 +702,9 @@ object SmartSearchEngine {
         SearchScopeFilter.ENCRYPTED -> isEncrypted(file)
     }
 
-    fun tokenize(text: String): List<String> {
+    fun tokenize(text: String): List<String> = tokenizeNormalized(text)
+
+    private fun tokenizeNormalized(text: String): List<String> {
         val rawParts = text.split('/', '\\', '_', '-', '.', ' ', '\t', ',', ':')
         val out = ArrayList<String>(rawParts.size)
         for (part in rawParts) {
@@ -411,12 +714,12 @@ object SmartSearchEngine {
                 val prev = part[idx - 1]
                 val cur = part[idx]
                 if ((prev.isLowerCase() && cur.isUpperCase()) || (prev.isLetter() && cur.isDigit())) {
-                    val sub = part.substring(start, idx).lowercase()
+                    val sub = normalizeForSearch(part.substring(start, idx))
                     if (sub.isNotEmpty()) out.add(sub)
                     start = idx
                 }
             }
-            val tail = part.substring(start).lowercase()
+            val tail = normalizeForSearch(part.substring(start))
             if (tail.isNotEmpty()) out.add(tail)
         }
         return out.distinct()
@@ -473,50 +776,6 @@ object SmartSearchEngine {
             else -> return null
         }
         return (num * mult).toLong()
-    }
-
-    private fun scoreCandidate(
-        rawQuery: String,
-        queryTokens: List<String>,
-        candidateText: String,
-    ): Int {
-        val candidateLower = candidateText.lowercase()
-        val qLower = rawQuery.lowercase()
-        if (candidateLower == qLower) return 1000
-        if (candidateLower.startsWith(qLower)) return 850
-        if (candidateLower.contains(qLower)) return 700
-        if (queryTokens.isEmpty()) return 0
-
-        val candidateTokens = tokenize(candidateText)
-        if (candidateTokens.isEmpty()) return 0
-
-        var matched = 0
-        var totalScore = 0
-        for (qt in queryTokens) {
-            var bestTokenScore = 0
-            for (ct in candidateTokens) {
-                val score = when {
-                    ct == qt -> 120
-                    ct.startsWith(qt) -> 95
-                    ct.contains(qt) -> 75
-                    qt.length >= 4 -> {
-                        val maxDist = if (qt.length >= 7) 2 else 1
-                        val d = levenshtein(qt, ct)
-                        if (d <= maxDist) 65 - (d * 15) else 0
-                    }
-                    else -> 0
-                }
-                if (score > bestTokenScore) bestTokenScore = score
-            }
-            if (bestTokenScore > 0) {
-                matched++
-                totalScore += bestTokenScore
-            }
-        }
-
-        val minRequired = if (queryTokens.size <= 2) queryTokens.size else (queryTokens.size + 1) / 2
-        if (matched < minRequired) return 0
-        return totalScore + (matched * 20)
     }
 
     internal fun levenshtein(a: String, b: String): Int {

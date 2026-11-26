@@ -21,9 +21,13 @@ import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.PassVaultCloudVerifier
 import com.tgdrive.core.download.UploadManager
+import com.tgdrive.core.download.ai.MediaAiIndexWorker
+import com.tgdrive.core.download.ai.MediaAiIndexer
 import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
+import com.tgdrive.feature.browser.search.SmartSearchEngine
+import com.tgdrive.feature.browser.search.SmartSearchHit
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -54,6 +58,12 @@ data class VaultExternalOpenEvent(
 
 data class VaultUiState(
     val items: List<FileCacheEntity> = emptyList(),
+    val filteredItems: List<FileCacheEntity> = emptyList(),
+    val searchQuery: String = "",
+    val interpretedChips: List<String> = emptyList(),
+    val matchHints: Map<Pair<Long, Long>, String> = emptyMap(),
+    val unindexedAiCount: Int = 0,
+    val aiIndexingProgress: Pair<Int, Int>? = null,
     val selectedIds: Set<Pair<Long, Long>> = emptySet(),
     val biometricRequired: Boolean = false,
     val isUnlocked: Boolean = false,
@@ -84,6 +94,7 @@ class VaultViewModel @Inject constructor(
     private val backupCrypto: BackupCrypto,
     private val passVaultCloudVerifier: PassVaultCloudVerifier,
     private val cloudSyncManager: CloudSyncManager,
+    private val mediaAiIndexer: MediaAiIndexer,
     private val audioPlayerController: AudioPlayerController,
     private val dispatchers: DispatchersProvider,
     @ApplicationContext private val appContext: Context,
@@ -98,6 +109,9 @@ class VaultViewModel @Inject constructor(
     private val _hasCloudVerifier = MutableStateFlow(false)
     private val _passphraseBusy = MutableStateFlow(false)
     private val _batchProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+    private val _searchQuery = MutableStateFlow("")
+    private val _unindexedAiCount = MutableStateFlow(0)
+    private val _aiIndexingProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     private val _error = MutableStateFlow<String?>(null)
     private val _snackbar = MutableStateFlow<String?>(null)
     val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
@@ -130,6 +144,12 @@ class VaultViewModel @Inject constructor(
     private val thumbSemaphore = Semaphore(2)
     private var initialLockEvaluated = false
 
+    private data class VaultAiSearchState(
+        val searchQuery: String,
+        val unindexedAiCount: Int,
+        val aiIndexingProgress: Pair<Int, Int>?,
+    )
+
     val state: StateFlow<VaultUiState> = combine(
         combine(
             fileCacheDao.observeEncryptedVaultFiles(),
@@ -151,7 +171,10 @@ class VaultViewModel @Inject constructor(
         ) { thumbs, dialog, batch, err, passTuple ->
             listOf(thumbs, dialog, batch, err, passTuple)
         },
-    ) { core, aux ->
+        combine(_searchQuery, _unindexedAiCount, _aiIndexingProgress) { sq, unindexed, aiProg ->
+            VaultAiSearchState(sq, unindexed, aiProg)
+        },
+    ) { core, aux, aiSearch ->
         @Suppress("UNCHECKED_CAST")
         val items = core[0] as List<FileCacheEntity>
         @Suppress("UNCHECKED_CAST")
@@ -169,8 +192,32 @@ class VaultViewModel @Inject constructor(
         @Suppress("UNCHECKED_CAST")
         val passTuple = aux[4] as Triple<Boolean, Boolean, Boolean>
 
+        val q = aiSearch.searchQuery
+        val parsedQuery = if (q.isBlank()) null else SmartSearchEngine.parseQuery(q)
+        val searchHits = if (q.isBlank()) {
+            null
+        } else {
+            SmartSearchEngine.search(
+                query = q,
+                files = items,
+                zipEntries = emptyList(),
+                includeLocked = true,
+            ).filterIsInstance<SmartSearchHit.CloudFileHit>()
+        }
+        val filtered = searchHits?.map { it.entity } ?: items
+        val hints = searchHits
+            ?.mapNotNull { hit -> hit.matchHint?.let { (hit.entity.chatId to hit.entity.messageId) to it } }
+            ?.toMap()
+            ?: emptyMap()
+
         VaultUiState(
             items = items,
+            filteredItems = filtered,
+            searchQuery = q,
+            interpretedChips = parsedQuery?.interpretedChips ?: emptyList(),
+            matchHints = hints,
+            unindexedAiCount = aiSearch.unindexedAiCount,
+            aiIndexingProgress = aiSearch.aiIndexingProgress,
             selectedIds = selected,
             biometricRequired = bioReq,
             isUnlocked = unlocked,
@@ -188,6 +235,7 @@ class VaultViewModel @Inject constructor(
     init {
         viewModelScope.launch(dispatchers.io) {
             _hasCloudVerifier.value = runCatching { passVaultCloudVerifier.hasCloudVerifier() }.getOrDefault(false)
+            refreshUnindexedAiCount()
         }
         viewModelScope.launch(dispatchers.io) {
             preferences.data.collect { prefs ->
@@ -286,8 +334,44 @@ class VaultViewModel @Inject constructor(
     }
 
     fun selectAll() {
-        val visible = state.value.items.mapTo(mutableSetOf()) { it.chatId to it.messageId }
-        _selected.value = if (_selected.value.size == visible.size) emptySet() else visible
+        val visible = state.value.filteredItems.mapTo(mutableSetOf()) { it.chatId to it.messageId }
+        _selected.value = if (_selected.value.size == visible.size && visible.isNotEmpty()) emptySet() else visible
+    }
+
+    fun setSearchQuery(query: String) {
+        _searchQuery.value = query
+    }
+
+    fun indexVaultAi() {
+        if (_aiIndexingProgress.value != null || !backupCrypto.hasVaultPassphrase()) return
+        viewModelScope.launch(dispatchers.io) {
+            val pending = runCatching { mediaAiIndexer.countUnindexed(includeLocked = true) }.getOrDefault(0)
+            if (pending == 0) {
+                _unindexedAiCount.value = 0
+                return@launch
+            }
+            _aiIndexingProgress.value = 0 to pending.coerceAtMost(50)
+            try {
+                mediaAiIndexer.indexUnindexedBatch(
+                    maxCount = 50,
+                    includeLocked = true,
+                ) { done, total ->
+                    _aiIndexingProgress.value = done to total
+                }
+            } finally {
+                _aiIndexingProgress.value = null
+                refreshUnindexedAiCount()
+            }
+        }
+    }
+
+    private suspend fun refreshUnindexedAiCount() {
+        val pending = if (backupCrypto.hasVaultPassphrase()) {
+            runCatching { mediaAiIndexer.countUnindexed(includeLocked = true) }.getOrDefault(0)
+        } else {
+            0
+        }
+        _unindexedAiCount.value = pending
     }
 
     fun clearSelection() {
@@ -420,6 +504,8 @@ class VaultViewModel @Inject constructor(
             _hasVaultPassphrase.value = true
             _decryptedThumbs.value = emptyMap()
             synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+            MediaAiIndexWorker.enqueueSoon(appContext)
+            refreshUnindexedAiCount()
             if (_isUnlocked.value && state.value.items.isNotEmpty()) {
                 warmEncryptedThumbnails(state.value.items)
             }
@@ -454,6 +540,8 @@ class VaultViewModel @Inject constructor(
             }
             _decryptedThumbs.value = emptyMap()
             synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+            MediaAiIndexWorker.enqueueSoon(appContext)
+            refreshUnindexedAiCount()
             if (_isUnlocked.value && state.value.items.isNotEmpty()) {
                 warmEncryptedThumbnails(state.value.items)
             }
