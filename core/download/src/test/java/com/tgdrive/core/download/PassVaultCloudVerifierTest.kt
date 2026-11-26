@@ -68,10 +68,15 @@ class PassVaultCloudVerifierTest {
                     id = 55L,
                     chatId = 200L,
                     fileName = PassVaultCloudVerifier.VERIFIER_FILE_NAME,
-                    mimeType = "application/octet-stream",
                     fileSize = uploadedBlob.length(),
+                    mimeType = "application/octet-stream",
+                    date = 500L,
+                    thumbnailPath = null,
                     fileRemoteId = "rem_old",
-                    date = 500,
+                    isVideo = false,
+                    isImage = false,
+                    isAudio = false,
+                    isDocument = true,
                 ),
             )
             coEvery { uploadFile(100L, any(), PassVaultCloudVerifier.VERIFIER_FILE_NAME, any(), any()) } answers {
