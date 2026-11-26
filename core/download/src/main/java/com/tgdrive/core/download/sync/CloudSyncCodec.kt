@@ -13,6 +13,7 @@ object CloudSyncCodec {
 
     const val META_SNAPSHOT_FILE = "tgdrive_meta_v1.json.gz"
     const val SEARCH_INDEX_FILE = "tgdrive_search_index_v1.json.gz"
+    const val VAULT_INDEX_FILE = "tgdrive_vault_index_v1.tgenc"
 
     data class CloudStarRecord(
         val chatId: Long,
@@ -153,6 +154,12 @@ object CloudSyncCodec {
         val updatedAtMs: Long = 0L,
         val zipEntries: List<CloudZipEntryRecord> = emptyList(),
         val aiEntries: List<CloudAiIndexRecord> = emptyList(),
+    )
+
+    data class CloudVaultIndexSnapshot(
+        val version: Int = 1,
+        val updatedAtMs: Long = 0L,
+        val entries: List<CloudAiIndexRecord> = emptyList(),
     )
 
     fun encodeMetaGzip(snapshot: CloudMetaSnapshot): ByteArray =
@@ -337,6 +344,48 @@ object CloudSyncCodec {
             aiEntries = aiEntries,
         )
     }.getOrNull()
+
+    fun encodeVaultIndexGzip(snapshot: CloudVaultIndexSnapshot): ByteArray =
+        gzip(buildVaultIndexJson(snapshot).toByteArray(Charsets.UTF_8))
+
+    fun decodeVaultIndexGzip(bytes: ByteArray): CloudVaultIndexSnapshot? = runCatching {
+        val text = gunzip(bytes).toString(Charsets.UTF_8)
+        val root = MiniJson.parseObject(text) ?: return null
+        val entries = root.optArray("entries").mapNotNull { el ->
+            val o = el as? Map<*, *> ?: return@mapNotNull null
+            CloudAiIndexRecord(
+                chatId = o.longVal("chatId") ?: return@mapNotNull null,
+                messageId = o.longVal("messageId") ?: return@mapNotNull null,
+                ocrText = o.strVal("ocrText"),
+                aiTags = o.strVal("aiTags"),
+                exifLat = o.doubleVal("exifLat"),
+                exifLng = o.doubleVal("exifLng"),
+                updatedAtMs = o.longVal("updatedAtMs") ?: 0L,
+            )
+        }
+        CloudVaultIndexSnapshot(
+            version = root.longVal("version")?.toInt() ?: 1,
+            updatedAtMs = root.longVal("updatedAtMs") ?: 0L,
+            entries = entries,
+        )
+    }.getOrNull()
+
+    fun mergeVaultIndex(
+        local: CloudVaultIndexSnapshot,
+        remote: CloudVaultIndexSnapshot,
+    ): CloudVaultIndexSnapshot {
+        val merged = LinkedHashMap<Pair<Long, Long>, CloudAiIndexRecord>()
+        (local.entries + remote.entries).forEach { e ->
+            val key = e.chatId to e.messageId
+            val cur = merged[key]
+            if (cur == null || e.updatedAtMs >= cur.updatedAtMs) merged[key] = e
+        }
+        return CloudVaultIndexSnapshot(
+            version = 1,
+            updatedAtMs = maxOf(local.updatedAtMs, remote.updatedAtMs, System.currentTimeMillis()),
+            entries = merged.values.toList(),
+        )
+    }
 
     fun mergeMeta(local: CloudMetaSnapshot, remote: CloudMetaSnapshot): CloudMetaSnapshot {
         val starsMap = LinkedHashMap<Pair<Long, Long>, CloudStarRecord>()
@@ -617,15 +666,31 @@ object CloudSyncCodec {
         append("  \"aiEntries\": [")
         s.aiEntries.forEachIndexed { i, a ->
             if (i > 0) append(",")
-            append("{\"chatId\":").append(a.chatId)
-                .append(",\"messageId\":").append(a.messageId)
-                .append(",\"ocrText\":").append(a.ocrText?.let(::jsonStr) ?: "null")
-                .append(",\"aiTags\":").append(a.aiTags?.let(::jsonStr) ?: "null")
-                .append(",\"exifLat\":").append(a.exifLat?.toString() ?: "null")
-                .append(",\"exifLng\":").append(a.exifLng?.toString() ?: "null")
-                .append(",\"updatedAtMs\":").append(a.updatedAtMs).append("}")
+            appendAiIndexRecord(a)
         }
         append("]\n}\n")
+    }
+
+    private fun buildVaultIndexJson(s: CloudVaultIndexSnapshot): String = buildString {
+        append("{\n")
+        append("  \"version\": ").append(s.version).append(",\n")
+        append("  \"updatedAtMs\": ").append(s.updatedAtMs).append(",\n")
+        append("  \"entries\": [")
+        s.entries.forEachIndexed { i, e ->
+            if (i > 0) append(",")
+            appendAiIndexRecord(e)
+        }
+        append("]\n}\n")
+    }
+
+    private fun StringBuilder.appendAiIndexRecord(a: CloudAiIndexRecord) {
+        append("{\"chatId\":").append(a.chatId)
+            .append(",\"messageId\":").append(a.messageId)
+            .append(",\"ocrText\":").append(a.ocrText?.let(::jsonStr) ?: "null")
+            .append(",\"aiTags\":").append(a.aiTags?.let(::jsonStr) ?: "null")
+            .append(",\"exifLat\":").append(a.exifLat?.toString() ?: "null")
+            .append(",\"exifLng\":").append(a.exifLng?.toString() ?: "null")
+            .append(",\"updatedAtMs\":").append(a.updatedAtMs).append("}")
     }
 
     private fun jsonStr(s: String): String = buildString(s.length + 2) {

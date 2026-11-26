@@ -125,7 +125,7 @@ data class FolderUiState(
     val childVirtualFolders: List<Pair<String, Int>> = emptyList(),
     val childVirtualFolderThumbs: Map<String, List<String>> = emptyMap(),
     val allVirtualPaths: List<String> = emptyList(),
-    val decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
+    val encryptedPreviewFingerprint: String? = null,
 )
 
 data class FolderSnackbarEvent(
@@ -154,8 +154,6 @@ class FolderViewModel
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
         private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
-        private val attemptedEncryptedThumbKeys = HashSet<Pair<Long, Long>>()
-        private val encThumbSemaphore = Semaphore(2)
         private val _selected = MutableStateFlow<Set<Long>>(emptySet())
         private val _loading = MutableStateFlow(false)
         private val _refreshing = MutableStateFlow(false)
@@ -163,7 +161,6 @@ class FolderViewModel
         private val _search = MutableStateFlow("")
         private val _virtualPath = MutableStateFlow("")
         private val _createdVirtualFolders = MutableStateFlow<Map<Long, Set<String>>>(emptyMap())
-        private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
         private val _snackbarEvent = MutableStateFlow<FolderSnackbarEvent?>(null)
         val snackbarEvent: StateFlow<FolderSnackbarEvent?> = _snackbarEvent.asStateFlow()
         private val _isSavedMessages = MutableStateFlow(false)
@@ -219,24 +216,12 @@ class FolderViewModel
                     }
                 }
             }
-            viewModelScope.launch(dispatchers.io) {
-                combine(
-                    _items,
-                    preferences.data.map { it.showEncryptedPreviewsWhenUnlocked }.distinctUntilChanged(),
-                ) { items, showEnc -> if (showEnc) items else emptyList() }
-                    .collect { items ->
-                        if (items.isNotEmpty()) {
-                            warmUnlockedEncryptedThumbs(items)
-                        }
-                    }
-            }
         }
 
         private data class FolderAuxTail(
             val boundId: Long?,
             val batchProgress: Pair<Int, Int>?,
             val virtualPath: String,
-            val decryptedThumbs: Map<Pair<Long, Long>, ByteArray>,
             val createdVirtualFolders: Map<Long, Set<String>>,
         )
 
@@ -278,10 +263,9 @@ class FolderViewModel
                         _boundChatId,
                         _batchDecryptProgress,
                         _virtualPath,
-                        _decryptedThumbs,
                         _createdVirtualFolders,
-                    ) { b, bp, vp, decThumbs, createdVps ->
-                        FolderAuxTail(b, bp, vp, decThumbs, createdVps)
+                    ) { b, bp, vp, createdVps ->
+                        FolderAuxTail(b, bp, vp, createdVps)
                     },
                 ) {
                         search,
@@ -412,7 +396,11 @@ class FolderViewModel
                     childVirtualFolders = childFolders,
                     childVirtualFolderThumbs = childThumbs,
                     allVirtualPaths = allVPaths.sorted(),
-                    decryptedThumbs = if (prefs.showEncryptedPreviewsWhenUnlocked) auxTail.decryptedThumbs else emptyMap(),
+                    encryptedPreviewFingerprint = if (prefs.showEncryptedPreviewsWhenUnlocked) {
+                        backupCrypto.passphraseFingerprint()
+                    } else {
+                        null
+                    },
                 )
             }.flowOn(dispatchers.default)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
@@ -1302,40 +1290,6 @@ class FolderViewModel
                     _error.value = t.message ?: "ZIP export failed"
                 } finally {
                     runCatching { stageDir.deleteRecursively() }
-                }
-            }
-        }
-
-        private fun warmUnlockedEncryptedThumbs(items: List<FileCacheEntity>) {
-            for (entity in items) {
-                val path = entity.thumbnailPath
-                val isEncThumb = path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true
-                val isEncItem = entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)
-                if (!isEncThumb && !isEncItem) continue
-                val key = entity.chatId to entity.messageId
-                val shouldTry = synchronized(attemptedEncryptedThumbKeys) { attemptedEncryptedThumbKeys.add(key) }
-                if (!shouldTry) continue
-                viewModelScope.launch(dispatchers.io) {
-                    encThumbSemaphore.withPermit {
-                        val effectivePath = when {
-                            isEncThumb && path != null && File(path).isFile -> path
-                            else -> mediaThumbnailCache.restoreEncryptedThumbFromCloud(entity.chatId, entity.messageId)
-                        } ?: return@withPermit
-                        val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
-                        if (bytes != null && bytes.isNotEmpty()) {
-                            _decryptedThumbs.update { cur ->
-                                if (cur.size < MAX_FOLDER_DECRYPTED_THUMBS) {
-                                    cur + (key to bytes)
-                                } else {
-                                    val trimmed = LinkedHashMap<Pair<Long, Long>, ByteArray>(MAX_FOLDER_DECRYPTED_THUMBS)
-                                    val dropCount = cur.size - MAX_FOLDER_DECRYPTED_THUMBS + 1
-                                    cur.entries.drop(dropCount).forEach { (k, v) -> trimmed[k] = v }
-                                    trimmed[key] = bytes
-                                    trimmed
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

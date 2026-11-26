@@ -145,7 +145,9 @@ class PhotosTimelineViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
-    private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+    private val attemptedThumbKeys = java.util.Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
+    private val thumbChannel = kotlinx.coroutines.channels.Channel<FileCacheEntity>(capacity = 64)
+    private val thumbSemaphore = kotlinx.coroutines.sync.Semaphore(2)
     private val attemptedDurationKeys = HashSet<Pair<Long, Long>>()
 
     private val _viewMode = MutableStateFlow(PhotosViewMode.TIMELINE)
@@ -166,13 +168,9 @@ class PhotosTimelineViewModel @Inject constructor(
 
     init {
         viewModelScope.launch(dispatchers.io) {
-            fileCacheDao.observeMediaItems().collect { media ->
-                val toResolve = media
-                    .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
-                    .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
-                    .take(60)
-                for (entity in toResolve) {
-                    launch {
+            for (entity in thumbChannel) {
+                launch {
+                    kotlinx.coroutines.sync.withPermit(thumbSemaphore) {
                         try {
                             mediaThumbnailCache.ensureThumbnail(entity)
                         } catch (e: CancellationException) {
@@ -181,6 +179,13 @@ class PhotosTimelineViewModel @Inject constructor(
                     }
                 }
             }
+        }
+    }
+
+    fun requestThumbnail(entity: FileCacheEntity) {
+        if (!mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)) return
+        if (attemptedThumbKeys.add(entity.chatId to entity.messageId)) {
+            thumbChannel.trySend(entity)
         }
     }
 
@@ -207,16 +212,20 @@ class PhotosTimelineViewModel @Inject constructor(
     )
 
     private val mediaAndAlbumsFlow = combine(
-        combine(
-            fileCacheDao.observeMediaItems(),
-            trashEntryDao.observeAll(),
-        ) { media, trashed ->
-            val trashedKeys = trashed.mapTo(HashSet()) { it.chatId to it.messageId }
-            media.filter { (it.chatId to it.messageId) !in trashedKeys }
-        },
+        fileCacheDao.observeActiveMediaItems(),
         albumDao.observeAll(),
         albumDao.observeAllItems(),
     ) { activeMedia, albums, albumItems ->
+        var queued = 0
+        for (item in activeMedia) {
+            if (queued >= 24) break
+            if (mediaThumbnailCache.needsThumbnailUpgrade(item.thumbnailPath) &&
+                attemptedThumbKeys.add(item.chatId to item.messageId)
+            ) {
+                thumbChannel.trySend(item)
+                queued++
+            }
+        }
         Triple(activeMedia, albums, albumItems)
     }
 

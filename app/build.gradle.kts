@@ -148,6 +148,7 @@ dependencies {
 
     // AndroidX
     implementation(libs.core.ktx)
+    implementation(libs.androidx.profileinstaller)
     implementation(libs.splashscreen)
     implementation(libs.appcompat)
     implementation(libs.material)

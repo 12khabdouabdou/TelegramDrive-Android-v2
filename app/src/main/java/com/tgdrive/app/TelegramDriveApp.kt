@@ -9,11 +9,14 @@ import coil.decode.VideoFrameDecoder
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.tgdrive.app.boot.NotificationChannels
+import com.tgdrive.app.coil.EncryptedThumbFetcher
+import com.tgdrive.app.coil.EncryptedThumbKeyer
 import com.tgdrive.core.common.CrashLogStore
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.BackupSchedule
 import com.tgdrive.core.db.dao.SyncLogDao
+import com.tgdrive.core.download.MediaThumbnailCache
 import com.tgdrive.core.security.KeystoreHelper
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.feature.autobackup.BackupScheduler
@@ -43,6 +46,7 @@ class TelegramDriveApp :
     @Inject lateinit var backupScheduler: dagger.Lazy<BackupScheduler>
     @Inject lateinit var scheduledUploadScheduler: dagger.Lazy<ScheduledUploadScheduler>
     @Inject lateinit var syncLogDao: dagger.Lazy<SyncLogDao>
+    @Inject lateinit var mediaThumbnailCache: dagger.Lazy<MediaThumbnailCache>
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -187,6 +191,8 @@ class TelegramDriveApp :
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
             .components {
+                add(EncryptedThumbKeyer())
+                add(EncryptedThumbFetcher.Factory { mediaThumbnailCache.get() })
                 add(VideoFrameDecoder.Factory())
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
                     add(coil.decode.ImageDecoderDecoder.Factory())

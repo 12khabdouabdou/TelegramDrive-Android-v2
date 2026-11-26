@@ -109,6 +109,9 @@ data class AppPreferencesData(
     val autoSaveDownloadsToPublic: Boolean = false,
     val pinnedFolderChatIds: Set<String> = emptySet(),
     val showEncryptedPreviewsWhenUnlocked: Boolean = false,
+    val lastSyncedMetaMessageId: Long = 0L,
+    val lastSyncedSearchMessageId: Long = 0L,
+    val lastSyncedVaultIndexMessageId: Long = 0L,
 ) {
     fun isFolderPinned(chatId: Long): Boolean = chatId.toString() in pinnedFolderChatIds
 
@@ -248,6 +251,9 @@ class AppPreferences @Inject constructor(
         val AUTO_SAVE_DOWNLOADS_TO_PUBLIC = booleanPreferencesKey("auto_save_downloads_to_public")
         val PINNED_FOLDER_CHAT_IDS = stringSetPreferencesKey("pinned_folder_chat_ids")
         val SHOW_ENCRYPTED_PREVIEWS_UNLOCKED = booleanPreferencesKey("show_encrypted_previews_unlocked")
+        val LAST_SYNCED_META_MSG_ID = longPreferencesKey("last_synced_meta_msg_id")
+        val LAST_SYNCED_SEARCH_MSG_ID = longPreferencesKey("last_synced_search_msg_id")
+        val LAST_SYNCED_VAULT_IDX_MSG_ID = longPreferencesKey("last_synced_vault_idx_msg_id")
     }
 
     /**
@@ -349,6 +355,9 @@ class AppPreferences @Inject constructor(
             autoSaveDownloadsToPublic = get(Keys.AUTO_SAVE_DOWNLOADS_TO_PUBLIC) ?: false,
             pinnedFolderChatIds = get(Keys.PINNED_FOLDER_CHAT_IDS) ?: emptySet(),
             showEncryptedPreviewsWhenUnlocked = get(Keys.SHOW_ENCRYPTED_PREVIEWS_UNLOCKED) ?: false,
+            lastSyncedMetaMessageId = get(Keys.LAST_SYNCED_META_MSG_ID) ?: 0L,
+            lastSyncedSearchMessageId = get(Keys.LAST_SYNCED_SEARCH_MSG_ID) ?: 0L,
+            lastSyncedVaultIndexMessageId = get(Keys.LAST_SYNCED_VAULT_IDX_MSG_ID) ?: 0L,
         )
     }
 
@@ -410,5 +419,8 @@ class AppPreferences @Inject constructor(
         this[Keys.AUTO_SAVE_DOWNLOADS_TO_PUBLIC] = d.autoSaveDownloadsToPublic
         this[Keys.PINNED_FOLDER_CHAT_IDS] = d.pinnedFolderChatIds
         this[Keys.SHOW_ENCRYPTED_PREVIEWS_UNLOCKED] = d.showEncryptedPreviewsWhenUnlocked
+        this[Keys.LAST_SYNCED_META_MSG_ID] = d.lastSyncedMetaMessageId
+        this[Keys.LAST_SYNCED_SEARCH_MSG_ID] = d.lastSyncedSearchMessageId
+        this[Keys.LAST_SYNCED_VAULT_IDX_MSG_ID] = d.lastSyncedVaultIndexMessageId
     }
 }

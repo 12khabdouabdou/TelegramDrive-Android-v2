@@ -164,13 +164,15 @@ class TgDriveDatabaseTest {
         val loaded = db.fileCacheDao().getById(chatId = 77L, messageId = 10L)
         assertThat(loaded).isNotNull()
         assertThat(loaded!!.fileName).isEqualTo("renamed.jpg")
+        assertThat(loaded.isRenamed).isTrue()
+        assertThat(db.fileCacheDao().getRenamedFiles().map { it.messageId }).containsExactly(10L)
         assertThat(loaded.isStarred).isTrue()
         assertThat(loaded.lastAccessed).isEqualTo(5555L)
         assertThat(loaded.isPinnedOffline).isTrue()
         assertThat(loaded.thumbnailPath).isEqualTo("/tmp/thumb.jpg")
         assertThat(loaded.remoteId).isEqualTo("rem1")
         assertThat(loaded.fileSize).isEqualTo(120L)
-        assertThat(loaded.date).isEqualTo(2000L)
+        assertThat(loaded.date).isEqualTo(2000_000L)
     }
 
     @Test
@@ -499,6 +501,20 @@ class TgDriveDatabaseTest {
             assertThat(migrated.fileCacheDao().searchFts("noteToken*").map { it.messageId })
                 .containsExactly(801L)
             assertThat(migrated.fileCacheDao().searchFts("locked*")).isEmpty()
+
+            // Verify v10: epoch-ms normalization, is_renamed default, zip_entries_fts,
+            // column-scoped FTS4 updates, and SQL trash/bucket queries
+            assertThat(legacyMigrated?.date).isEqualTo(50_000L)
+            assertThat(legacyMigrated?.isRenamed).isFalse()
+            assertThat(migrated.zipEntryDao().searchFts("tax*").map { it.entryName })
+                .containsExactly("tax.pdf")
+            migrated.fileCacheDao().updatePlaybackPosition(10L, 77L, 55_000L)
+            assertThat(migrated.fileCacheDao().searchFts("movie*").map { it.messageId })
+                .containsExactly(77L)
+            assertThat(migrated.fileCacheDao().observeActiveMediaItems().first().map { it.messageId })
+                .containsExactly(801L, 77L)
+            assertThat(migrated.fileCacheDao().observeActiveByBuckets(listOf("IMAGES", "VIDEOS"), 0L).first().map { it.messageId })
+                .containsExactly(803L, 801L, 77L)
         } finally {
             migrated.close()
             dbFile.delete()
@@ -597,6 +613,8 @@ class TgDriveDatabaseTest {
             val legacyFile = migrated.fileCacheDao().getById(chatId = 500L, messageId = 1L)
             assertThat(legacyFile?.fileName).isEqualTo("v1_invoice.pdf")
             assertThat(legacyFile?.bucket).isEqualTo("PDF")
+            assertThat(legacyFile?.date).isEqualTo(100_000L)
+            assertThat(legacyFile?.isRenamed).isFalse()
             assertThat(migrated.fileCacheDao().searchFts("v1_invoice*").map { it.chatId })
                 .containsExactly(500L)
 

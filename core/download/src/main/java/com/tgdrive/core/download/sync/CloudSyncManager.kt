@@ -56,6 +56,7 @@ class CloudSyncManager @Inject constructor(
     private val syncedFileDao: SyncedFileDao,
     private val albumDao: AlbumDao,
     private val preferences: AppPreferences,
+    private val backupCrypto: BackupCrypto,
     private val dispatchers: DispatchersProvider,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
@@ -66,6 +67,7 @@ class CloudSyncManager @Inject constructor(
 
     @Volatile private var pushMetaJob: Job? = null
     @Volatile private var pushSearchJob: Job? = null
+    @Volatile private var pushVaultJob: Job? = null
 
     private val localStarTimestamps = ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudStarRecord>()
     private val localRenameTimestamps = ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudRenameRecord>()
@@ -84,6 +86,8 @@ class CloudSyncManager @Inject constructor(
     private val localAlbumItemTimestamps =
         ConcurrentHashMap<Triple<String, Long, Long>, CloudSyncCodec.CloudAlbumItemRecord>()
     private val localAiTimestamps =
+        ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
+    private val localVaultAiTimestamps =
         ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
     private val localEncryptedThumbTimestamps =
         ConcurrentHashMap<Pair<Long, Long>, CloudSyncCodec.CloudEncryptedThumbRecord>()
@@ -212,6 +216,26 @@ class CloudSyncManager @Inject constructor(
         schedulePushSearchIndex()
     }
 
+    /**
+     * Records AI index updates for PassVault/locked items and schedules an AES-256-GCM
+     * encrypted (`tgdrive_vault_index_v1.tgenc`) push when a PassVault passphrase is active.
+     */
+    fun noteVaultAiIndexChanged(
+        chatId: Long,
+        messageId: Long,
+        ocrText: String?,
+        aiTags: String?,
+    ) {
+        localVaultAiTimestamps[chatId to messageId] = CloudSyncCodec.CloudAiIndexRecord(
+            chatId = chatId,
+            messageId = messageId,
+            ocrText = ocrText,
+            aiTags = aiTags,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+        schedulePushVaultIndex()
+    }
+
     fun noteEncryptedThumbChanged(chatId: Long, messageId: Long, thumbRemoteId: String) {
         if (thumbRemoteId.isBlank()) return
         localEncryptedThumbTimestamps[chatId to messageId] = CloudSyncCodec.CloudEncryptedThumbRecord(
@@ -312,10 +336,29 @@ class CloudSyncManager @Inject constructor(
         }
     }
 
+    fun schedulePushVaultIndex() {
+        if (!backupCrypto.hasVaultPassphrase()) return
+        pushVaultJob?.cancel()
+        pushVaultJob = scope.launch {
+            delay(PUSH_DEBOUNCE_MS)
+            runCatching { pushVaultIndexOnly() }
+                .onFailure { t ->
+                    if (t is CancellationException) throw t
+                    Log.w("CloudSyncManager: debounced vault index push failed", t)
+                }
+        }
+    }
+
     suspend fun purgeExpiredTrashNow() = withContext(dispatchers.io) {
         mutex.withLock {
             purgeExpiredTrashLocked()
         }
+    }
+
+    private sealed class SnapshotPull<out T> {
+        data object NoRemote : SnapshotPull<Nothing>()
+        data class Unchanged(val messageId: Long) : SnapshotPull<Nothing>()
+        data class Loaded<T>(val messageId: Long, val value: T) : SnapshotPull<T>()
     }
 
     /**
@@ -327,26 +370,75 @@ class CloudSyncManager @Inject constructor(
             _syncing.value = true
             try {
                 val systemChatId = telegramClient.getOrCreateSystemChannel() ?: return@withLock false
-                val remoteMeta = downloadSnapshot(systemChatId, CloudSyncCodec.META_SNAPSHOT_FILE) { bytes ->
-                    CloudSyncCodec.decodeMetaGzip(bytes)
-                }
-                if (remoteMeta != null) {
-                    val localMeta = buildLocalMetaSnapshot()
-                    val merged = CloudSyncCodec.mergeMeta(localMeta, remoteMeta)
-                    applyMergedMeta(merged)
+                val prefs = preferences.data.first()
+                var newMetaId = prefs.lastSyncedMetaMessageId
+                var newSearchId = prefs.lastSyncedSearchMessageId
+                var newVaultId = prefs.lastSyncedVaultIndexMessageId
+
+                when (
+                    val metaPull = downloadSnapshotIfChanged(
+                        systemChatId = systemChatId,
+                        fileName = CloudSyncCodec.META_SNAPSHOT_FILE,
+                        lastSeenMessageId = prefs.lastSyncedMetaMessageId,
+                    ) { bytes -> CloudSyncCodec.decodeMetaGzip(bytes) }
+                ) {
+                    is SnapshotPull.Loaded -> {
+                        newMetaId = metaPull.messageId
+                        val localMeta = buildLocalMetaSnapshot()
+                        val merged = CloudSyncCodec.mergeMeta(localMeta, metaPull.value)
+                        applyMergedMeta(merged)
+                    }
+                    is SnapshotPull.Unchanged -> newMetaId = metaPull.messageId
+                    SnapshotPull.NoRemote -> {}
                 }
 
-                val remoteSearch = downloadSnapshot(systemChatId, CloudSyncCodec.SEARCH_INDEX_FILE) { bytes ->
-                    CloudSyncCodec.decodeSearchIndexGzip(bytes)
+                when (
+                    val searchPull = downloadSnapshotIfChanged(
+                        systemChatId = systemChatId,
+                        fileName = CloudSyncCodec.SEARCH_INDEX_FILE,
+                        lastSeenMessageId = prefs.lastSyncedSearchMessageId,
+                    ) { bytes -> CloudSyncCodec.decodeSearchIndexGzip(bytes) }
+                ) {
+                    is SnapshotPull.Loaded -> {
+                        newSearchId = searchPull.messageId
+                        val localSearch = buildLocalSearchSnapshot()
+                        val mergedSearch = CloudSyncCodec.mergeSearchIndex(localSearch, searchPull.value)
+                        applyMergedSearchIndex(mergedSearch)
+                    }
+                    is SnapshotPull.Unchanged -> newSearchId = searchPull.messageId
+                    SnapshotPull.NoRemote -> {}
                 }
-                if (remoteSearch != null) {
-                    val localSearch = buildLocalSearchSnapshot()
-                    val mergedSearch = CloudSyncCodec.mergeSearchIndex(localSearch, remoteSearch)
-                    applyMergedSearchIndex(mergedSearch)
+
+                if (backupCrypto.hasVaultPassphrase()) {
+                    when (
+                        val vaultPull = downloadSnapshotIfChanged(
+                            systemChatId = systemChatId,
+                            fileName = CloudSyncCodec.VAULT_INDEX_FILE,
+                            lastSeenMessageId = prefs.lastSyncedVaultIndexMessageId,
+                        ) { encBytes ->
+                            backupCrypto.decryptVaultBlob(encBytes)?.let { CloudSyncCodec.decodeVaultIndexGzip(it) }
+                        }
+                    ) {
+                        is SnapshotPull.Loaded -> {
+                            newVaultId = vaultPull.messageId
+                            val localVault = buildLocalVaultIndexSnapshot()
+                            val mergedVault = CloudSyncCodec.mergeVaultIndex(localVault, vaultPull.value)
+                            applyMergedVaultIndex(mergedVault)
+                        }
+                        is SnapshotPull.Unchanged -> newVaultId = vaultPull.messageId
+                        SnapshotPull.NoRemote -> {}
+                    }
                 }
 
                 purgeExpiredTrashLocked()
-                preferences.update { it.copy(lastCloudSyncMs = System.currentTimeMillis()) }
+                preferences.update {
+                    it.copy(
+                        lastCloudSyncMs = System.currentTimeMillis(),
+                        lastSyncedMetaMessageId = newMetaId,
+                        lastSyncedSearchMessageId = newSearchId,
+                        lastSyncedVaultIndexMessageId = newVaultId,
+                    )
+                }
                 Log.i("CloudSyncManager: syncFromCloud complete")
                 true
             } catch (e: CancellationException) {
@@ -378,7 +470,7 @@ class CloudSyncManager @Inject constructor(
                 )
                 applyMergedMeta(mergedMeta)
                 purgeExpiredTrashLocked()
-                uploadSnapshot(
+                val uploadedMetaId = uploadSnapshot(
                     systemChatId = systemChatId,
                     fileName = CloudSyncCodec.META_SNAPSHOT_FILE,
                     bytes = CloudSyncCodec.encodeMetaGzip(buildLocalMetaSnapshot()),
@@ -392,13 +484,41 @@ class CloudSyncManager @Inject constructor(
                     remoteSearch ?: CloudSyncCodec.CloudSearchIndexSnapshot(),
                 )
                 applyMergedSearchIndex(mergedSearch)
-                uploadSnapshot(
+                val uploadedSearchId = uploadSnapshot(
                     systemChatId = systemChatId,
                     fileName = CloudSyncCodec.SEARCH_INDEX_FILE,
                     bytes = CloudSyncCodec.encodeSearchIndexGzip(mergedSearch),
                 )
 
-                preferences.update { it.copy(lastCloudSyncMs = System.currentTimeMillis()) }
+                var uploadedVaultId: Long? = null
+                if (backupCrypto.hasVaultPassphrase()) {
+                    val remoteVault = downloadSnapshot(systemChatId, CloudSyncCodec.VAULT_INDEX_FILE) { enc ->
+                        backupCrypto.decryptVaultBlob(enc)?.let { CloudSyncCodec.decodeVaultIndexGzip(it) }
+                    }
+                    val mergedVault = CloudSyncCodec.mergeVaultIndex(
+                        buildLocalVaultIndexSnapshot(),
+                        remoteVault ?: CloudSyncCodec.CloudVaultIndexSnapshot(),
+                    )
+                    applyMergedVaultIndex(mergedVault)
+                    val encBytes = backupCrypto.encryptVaultBlob(CloudSyncCodec.encodeVaultIndexGzip(mergedVault))
+                    if (encBytes != null && encBytes.isNotEmpty()) {
+                        uploadedVaultId = uploadSnapshot(
+                            systemChatId = systemChatId,
+                            fileName = CloudSyncCodec.VAULT_INDEX_FILE,
+                            bytes = encBytes,
+                            mimeType = "application/octet-stream",
+                        )
+                    }
+                }
+
+                preferences.update { cur ->
+                    cur.copy(
+                        lastCloudSyncMs = System.currentTimeMillis(),
+                        lastSyncedMetaMessageId = uploadedMetaId ?: cur.lastSyncedMetaMessageId,
+                        lastSyncedSearchMessageId = uploadedSearchId ?: cur.lastSyncedSearchMessageId,
+                        lastSyncedVaultIndexMessageId = uploadedVaultId ?: cur.lastSyncedVaultIndexMessageId,
+                    )
+                }
                 Log.i("CloudSyncManager: full syncNow complete")
                 true
             } catch (e: CancellationException) {
@@ -426,12 +546,17 @@ class CloudSyncManager @Inject constructor(
                 )
                 applyMergedMeta(merged)
                 purgeExpiredTrashLocked()
-                uploadSnapshot(
+                val uploadedMetaId = uploadSnapshot(
                     systemChatId = systemChatId,
                     fileName = CloudSyncCodec.META_SNAPSHOT_FILE,
                     bytes = CloudSyncCodec.encodeMetaGzip(buildLocalMetaSnapshot()),
                 )
-                preferences.update { it.copy(lastCloudSyncMs = System.currentTimeMillis()) }
+                preferences.update { cur ->
+                    cur.copy(
+                        lastCloudSyncMs = System.currentTimeMillis(),
+                        lastSyncedMetaMessageId = uploadedMetaId ?: cur.lastSyncedMetaMessageId,
+                    )
+                }
             } finally {
                 _syncing.value = false
             }
@@ -451,12 +576,51 @@ class CloudSyncManager @Inject constructor(
                     remote ?: CloudSyncCodec.CloudSearchIndexSnapshot(),
                 )
                 applyMergedSearchIndex(merged)
-                uploadSnapshot(
+                val uploadedSearchId = uploadSnapshot(
                     systemChatId = systemChatId,
                     fileName = CloudSyncCodec.SEARCH_INDEX_FILE,
                     bytes = CloudSyncCodec.encodeSearchIndexGzip(merged),
                 )
-                preferences.update { it.copy(lastCloudSyncMs = System.currentTimeMillis()) }
+                preferences.update { cur ->
+                    cur.copy(
+                        lastCloudSyncMs = System.currentTimeMillis(),
+                        lastSyncedSearchMessageId = uploadedSearchId ?: cur.lastSyncedSearchMessageId,
+                    )
+                }
+            } finally {
+                _syncing.value = false
+            }
+        }
+    }
+
+    private suspend fun pushVaultIndexOnly() {
+        if (!backupCrypto.hasVaultPassphrase()) return
+        mutex.withLock {
+            _syncing.value = true
+            try {
+                val systemChatId = telegramClient.getOrCreateSystemChannel() ?: return
+                val remote = downloadSnapshot(systemChatId, CloudSyncCodec.VAULT_INDEX_FILE) { enc ->
+                    backupCrypto.decryptVaultBlob(enc)?.let { CloudSyncCodec.decodeVaultIndexGzip(it) }
+                }
+                val merged = CloudSyncCodec.mergeVaultIndex(
+                    buildLocalVaultIndexSnapshot(),
+                    remote ?: CloudSyncCodec.CloudVaultIndexSnapshot(),
+                )
+                applyMergedVaultIndex(merged)
+                val encBytes = backupCrypto.encryptVaultBlob(CloudSyncCodec.encodeVaultIndexGzip(merged))
+                    ?: return
+                val uploadedVaultId = uploadSnapshot(
+                    systemChatId = systemChatId,
+                    fileName = CloudSyncCodec.VAULT_INDEX_FILE,
+                    bytes = encBytes,
+                    mimeType = "application/octet-stream",
+                )
+                preferences.update { cur ->
+                    cur.copy(
+                        lastCloudSyncMs = System.currentTimeMillis(),
+                        lastSyncedVaultIndexMessageId = uploadedVaultId ?: cur.lastSyncedVaultIndexMessageId,
+                    )
+                }
             } finally {
                 _syncing.value = false
             }
@@ -471,14 +635,14 @@ class CloudSyncManager @Inject constructor(
                 ?: CloudSyncCodec.CloudStarRecord(f.chatId, f.messageId, true, 0L)
         } + localStarTimestamps.values.filter { !it.isStarred || (it.chatId to it.messageId) !in filesByKey }
 
-        val renames = ArrayList<CloudSyncCodec.CloudRenameRecord>()
-        renames.addAll(localRenameTimestamps.values)
-        // Include current DB filenames if we don't have an explicit override yet (low timestamp so explicit overrides win)
-        filesByKey.forEach { (key, entity) ->
-            if (!localRenameTimestamps.containsKey(key)) {
-                renames += CloudSyncCodec.CloudRenameRecord(entity.chatId, entity.messageId, entity.fileName, entity.date)
-            }
+        // Only serialize user-renamed files (80-90% smaller metadata snapshots)
+        val renamesMap = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudRenameRecord>()
+        filterRenamedFilesForSync(files).forEach { entity ->
+            renamesMap[entity.chatId to entity.messageId] =
+                CloudSyncCodec.CloudRenameRecord(entity.chatId, entity.messageId, entity.fileName, entity.date)
         }
+        localRenameTimestamps.forEach { (key, rec) -> renamesMap[key] = rec }
+        val renames = renamesMap.values.toList()
 
         val folders = folderDao.getAll()
         val foldersById = folders.associateBy { it.id }
@@ -892,43 +1056,104 @@ class CloudSyncManager @Inject constructor(
         return matches
     }
 
+    private suspend fun buildLocalVaultIndexSnapshot(): CloudSyncCodec.CloudVaultIndexSnapshot {
+        val entries = LinkedHashMap<Pair<Long, Long>, CloudSyncCodec.CloudAiIndexRecord>()
+        val allFiles = fileCacheDao.getAll()
+        val privateKeys = allFiles
+            .filter { isPrivateOrEncryptedForSync(it) }
+            .mapTo(HashSet()) { it.chatId to it.messageId }
+        allFiles.filter { isPrivateOrEncryptedForSync(it) }.forEach { f ->
+            if (f.ocrText != null || f.aiTags != null) {
+                val key = f.chatId to f.messageId
+                entries[key] = localVaultAiTimestamps[key]
+                    ?: CloudSyncCodec.CloudAiIndexRecord(
+                        chatId = f.chatId,
+                        messageId = f.messageId,
+                        ocrText = f.ocrText,
+                        aiTags = f.aiTags,
+                        updatedAtMs = maxOf(f.date, f.lastAccessed),
+                    )
+            }
+        }
+        localVaultAiTimestamps.forEach { (key, rec) ->
+            if (key in privateKeys || !localAiTimestamps.containsKey(key)) {
+                entries[key] = rec
+            }
+        }
+        return CloudSyncCodec.CloudVaultIndexSnapshot(
+            version = 1,
+            updatedAtMs = System.currentTimeMillis(),
+            entries = entries.values.toList(),
+        )
+    }
+
+    private suspend fun applyMergedVaultIndex(merged: CloudSyncCodec.CloudVaultIndexSnapshot) {
+        if (merged.entries.isEmpty()) return
+        val existingByKey = fileCacheDao.getAll().associateBy { it.chatId to it.messageId }
+        merged.entries.forEach { ai ->
+            localVaultAiTimestamps[ai.chatId to ai.messageId] = ai
+            val local = existingByKey[ai.chatId to ai.messageId]
+            if (local != null && (local.ocrText != ai.ocrText || local.aiTags != ai.aiTags)) {
+                runCatching { fileCacheDao.updateAiIndex(ai.chatId, ai.messageId, ai.ocrText, ai.aiTags) }
+            }
+        }
+    }
+
+    private suspend fun <T> downloadSnapshotIfChanged(
+        systemChatId: Long,
+        fileName: String,
+        lastSeenMessageId: Long,
+        decode: (ByteArray) -> T?,
+    ): SnapshotPull<T> {
+        val match = findSystemMessages(systemChatId, fileName, stopOnFirstPageMatch = true)
+            .filter { it.fileRemoteId.isNotEmpty() }
+            .maxByOrNull { it.date } ?: return SnapshotPull.NoRemote
+        if (lastSeenMessageId != 0L && match.id == lastSeenMessageId) {
+            return SnapshotPull.Unchanged(match.id)
+        }
+        val terminal = telegramClient.downloadFile(match.fileRemoteId, "")
+            .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+            .first()
+        if (terminal !is DownloadUpdate.Done) return SnapshotPull.NoRemote
+        val file = File(terminal.localPath)
+        if (!file.isFile) return SnapshotPull.NoRemote
+        val decoded = decode(file.readBytes()) ?: return SnapshotPull.NoRemote
+        return SnapshotPull.Loaded(match.id, decoded)
+    }
+
     private suspend fun <T> downloadSnapshot(
         systemChatId: Long,
         fileName: String,
         decode: (ByteArray) -> T?,
     ): T? {
-        val match = findSystemMessages(systemChatId, fileName, stopOnFirstPageMatch = true)
-            .filter { it.fileRemoteId.isNotEmpty() }
-            .maxByOrNull { it.date } ?: return null
-        val terminal = telegramClient.downloadFile(match.fileRemoteId, "")
-            .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-            .first()
-        if (terminal !is DownloadUpdate.Done) return null
-        val file = File(terminal.localPath)
-        if (!file.isFile) return null
-        return decode(file.readBytes())
+        return when (val res = downloadSnapshotIfChanged(systemChatId, fileName, 0L, decode)) {
+            is SnapshotPull.Loaded -> res.value
+            else -> null
+        }
     }
 
     private suspend fun uploadSnapshot(
         systemChatId: Long,
         fileName: String,
         bytes: ByteArray,
-    ) {
+        mimeType: String = "application/gzip",
+    ): Long? {
         val oldMsgs = findSystemMessages(systemChatId, fileName, stopOnFirstPageMatch = false)
 
         val outFile = File(syncDir, fileName)
-        try {
+        return try {
             outFile.writeBytes(bytes)
-            telegramClient.uploadFile(
+            val res = telegramClient.uploadFile(
                 chatId = systemChatId,
                 localPath = outFile.absolutePath,
                 fileName = fileName,
-                mimeType = "application/gzip",
+                mimeType = mimeType,
             ) { _, _ -> }
 
             oldMsgs.forEach { old ->
                 runCatching { telegramClient.deleteMessage(systemChatId, old.id) }
             }
+            res.messageId.takeIf { it != 0L }
         } finally {
             runCatching { outFile.delete() }
         }
@@ -939,6 +1164,8 @@ class CloudSyncManager @Inject constructor(
         pushMetaJob = null
         pushSearchJob?.cancel()
         pushSearchJob = null
+        pushVaultJob?.cancel()
+        pushVaultJob = null
         localStarTimestamps.clear()
         localRenameTimestamps.clear()
         localColorTimestamps.clear()
@@ -950,6 +1177,7 @@ class CloudSyncManager @Inject constructor(
         localAlbumTimestamps.clear()
         localAlbumItemTimestamps.clear()
         localAiTimestamps.clear()
+        localVaultAiTimestamps.clear()
         localEncryptedThumbTimestamps.clear()
     }
 
@@ -962,5 +1190,8 @@ class CloudSyncManager @Inject constructor(
 
         internal fun filterPublicAiFiles(files: List<FileCacheEntity>): List<FileCacheEntity> =
             files.filterNot(::isPrivateOrEncryptedForSync)
+
+        internal fun filterRenamedFilesForSync(files: List<FileCacheEntity>): List<FileCacheEntity> =
+            files.filter { it.isRenamed }
     }
 }

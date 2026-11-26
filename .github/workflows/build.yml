@@ -46,13 +46,13 @@ jobs:
         run: ./gradlew ktlintCheck --no-daemon
         continue-on-error: true # ignoreFailures=true in build.gradle.kts for now
 
-      - name: Verify Room v9 schema export
+      - name: Verify Room v10 schema export
         run: |
-          if [ ! -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json ]; then
+          if [ ! -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/10.json ]; then
             ./gradlew :core:db:kspDebugKotlin --rerun-tasks --no-daemon
           fi
-          test -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
-          ls -lh core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
+          test -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/10.json
+          ls -lh core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/10.json
 
       - name: Upload Room schemas
         if: always()

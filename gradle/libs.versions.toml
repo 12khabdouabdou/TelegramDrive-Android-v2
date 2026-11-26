@@ -28,6 +28,7 @@ mockk = "1.13.12"
 robolectric = "4.13"
 coroutinesTest = "1.9.0"
 coreKtx = "1.13.1"
+profileinstaller = "1.4.1"
 splashscreen = "1.0.1"
 appcompat = "1.7.0"
 material = "1.12.0"
@@ -55,6 +56,7 @@ compose-runtime = { group = "androidx.compose.runtime", name = "runtime" }
 
 # AndroidX core
 core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-profileinstaller = { group = "androidx.profileinstaller", name = "profileinstaller", version.ref = "profileinstaller" }
 splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "splashscreen" }
 appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }

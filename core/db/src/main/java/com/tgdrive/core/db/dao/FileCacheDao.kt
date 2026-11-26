@@ -67,7 +67,16 @@ interface FileCacheDao {
             val resolvedBucket = rawEntry.bucket.ifBlank {
                 classifyFile(rawEntry.mimeType, rawEntry.fileName).name
             }
-            val entry = if (rawEntry.bucket == resolvedBucket) rawEntry else rawEntry.copy(bucket = resolvedBucket)
+            val normalizedDate = if (rawEntry.date in 1L..9_999_999_999L) {
+                rawEntry.date * 1000L
+            } else {
+                rawEntry.date
+            }
+            val entry = if (rawEntry.bucket == resolvedBucket && rawEntry.date == normalizedDate) {
+                rawEntry
+            } else {
+                rawEntry.copy(bucket = resolvedBucket, date = normalizedDate)
+            }
             val rowId = insertIgnore(entry)
             if (rowId == -1L) {
                 updateRemoteMetadata(
@@ -345,8 +354,11 @@ interface FileCacheDao {
     @Query("UPDATE file_cache SET message_id = :newId WHERE message_id = :oldId AND chat_id = :chatId")
     suspend fun updateMessageId(chatId: Long, oldId: Long, newId: Long)
 
-    @Query("UPDATE file_cache SET file_name = :newName WHERE message_id = :messageId AND chat_id = :chatId")
+    @Query("UPDATE file_cache SET file_name = :newName, is_renamed = 1 WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun updateFileName(chatId: Long, messageId: Long, newName: String)
+
+    @Query("SELECT * FROM file_cache WHERE is_renamed = 1")
+    suspend fun getRenamedFiles(): List<FileCacheEntity>
 
     @Query("UPDATE file_cache SET thumbnail_path = :thumbnailPath WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun updateThumbnailPath(chatId: Long, messageId: Long, thumbnailPath: String?)
@@ -389,6 +401,51 @@ interface FileCacheDao {
 
     @Query("SELECT * FROM file_cache WHERE is_locked = 0 ORDER BY date DESC")
     suspend fun getAllUnlocked(): List<FileCacheEntity>
+
+    @Query(
+        """
+        SELECT fc.* FROM file_cache fc
+        WHERE fc.is_locked = 0
+          AND fc.chat_id != :excludedChatId
+          AND NOT EXISTS (
+              SELECT 1 FROM trash_entries t
+              WHERE t.chat_id = fc.chat_id AND t.message_id = fc.message_id
+          )
+        ORDER BY fc.date DESC
+        """,
+    )
+    fun observeActiveUnlocked(excludedChatId: Long = 0L): Flow<List<FileCacheEntity>>
+
+    @Query(
+        """
+        SELECT fc.* FROM file_cache fc
+        WHERE fc.is_locked = 0
+          AND fc.chat_id != :excludedChatId
+          AND fc.bucket IN (:buckets)
+          AND NOT EXISTS (
+              SELECT 1 FROM trash_entries t
+              WHERE t.chat_id = fc.chat_id AND t.message_id = fc.message_id
+          )
+        ORDER BY fc.date DESC
+        """,
+    )
+    fun observeActiveByBuckets(buckets: List<String>, excludedChatId: Long = 0L): Flow<List<FileCacheEntity>>
+
+    @Query(
+        """
+        SELECT fc.* FROM file_cache fc
+        WHERE fc.is_locked = 0
+          AND fc.is_encrypted_vault = 0
+          AND fc.bucket IN ('IMAGES', 'VIDEOS')
+          AND lower(fc.file_name) NOT LIKE '%.tgenc'
+          AND NOT EXISTS (
+              SELECT 1 FROM trash_entries t
+              WHERE t.chat_id = fc.chat_id AND t.message_id = fc.message_id
+          )
+        ORDER BY fc.date DESC
+        """,
+    )
+    fun observeActiveMediaItems(): Flow<List<FileCacheEntity>>
 
     @Query(
         "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",

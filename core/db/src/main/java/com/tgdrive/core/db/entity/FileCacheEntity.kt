@@ -8,7 +8,6 @@ import androidx.room.Index
     tableName = "file_cache",
     primaryKeys = ["message_id", "chat_id"],
     indices = [
-        Index("chat_id"),
         Index("date"),
         Index("is_starred"),
         Index(value = ["chat_id", "date"]),
@@ -18,6 +17,7 @@ import androidx.room.Index
         Index("is_locked"),
         Index(value = ["chat_id", "virtual_path"]),
         Index("bucket"),
+        Index(value = ["is_locked", "is_encrypted_vault", "bucket", "date"]),
     ],
 )
 data class FileCacheEntity(
@@ -42,4 +42,5 @@ data class FileCacheEntity(
     @ColumnInfo(name = "exif_lat") val exifLat: Double? = null,
     @ColumnInfo(name = "exif_lng") val exifLng: Double? = null,
     @ColumnInfo(name = "bucket") val bucket: String = "",
+    @ColumnInfo(name = "is_renamed", defaultValue = "0") val isRenamed: Boolean = false,
 )

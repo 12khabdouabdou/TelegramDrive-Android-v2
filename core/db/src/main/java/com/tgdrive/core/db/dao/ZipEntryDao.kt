@@ -24,6 +24,17 @@ interface ZipEntryDao {
     @Query("SELECT * FROM zip_entries ORDER BY indexed_at DESC")
     suspend fun getAll(): List<ZipEntryEntity>
 
+    @Query(
+        """
+        SELECT zip_entries.* FROM zip_entries
+        JOIN zip_entries_fts ON zip_entries.rowid = zip_entries_fts.docid
+        WHERE zip_entries_fts MATCH :ftsQuery
+        ORDER BY zip_entries.indexed_at DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun searchFts(ftsQuery: String, limit: Int = 500): List<ZipEntryEntity>
+
     @Query("SELECT DISTINCT zip_message_id FROM zip_entries")
     suspend fun indexedZipMessageIds(): List<Long>
 

@@ -64,6 +64,32 @@ class CloudSyncPrivacyTest {
     }
 
     @Test
+    fun `filterRenamedFilesForSync omits un-renamed cache entries to keep meta snapshots slim`() {
+        val untouched = FileCacheEntity(
+            messageId = 10L,
+            chatId = 100L,
+            fileName = "IMG_1234.jpg",
+            fileSize = 1000L,
+            mimeType = "image/jpeg",
+            thumbnailPath = null,
+            date = 1000L,
+            isRenamed = false,
+        )
+        val renamed = FileCacheEntity(
+            messageId = 11L,
+            chatId = 100L,
+            fileName = "Tax_2026_Final.pdf",
+            fileSize = 2000L,
+            mimeType = "application/pdf",
+            thumbnailPath = null,
+            date = 1000L,
+            isRenamed = true,
+        )
+        val filtered = CloudSyncManager.filterRenamedFilesForSync(listOf(untouched, renamed))
+        assertThat(filtered.map { it.messageId }).containsExactly(11L)
+    }
+
+    @Test
     fun `mergeAiTags preserves existing tags and deduplicates new visual and location tags`() {
         val merged = MediaAiIndexer.mergeAiTags(
             existingTags = "beach, loc:nice",

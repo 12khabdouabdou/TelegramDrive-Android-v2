@@ -2,9 +2,13 @@ package com.tgdrive.core.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "pending_uploads")
+@Entity(
+    tableName = "pending_uploads",
+    indices = [Index(value = ["status", "created_at_ms"])],
+)
 data class PendingUploadEntity(
     @PrimaryKey val id: String,
     val kind: String,

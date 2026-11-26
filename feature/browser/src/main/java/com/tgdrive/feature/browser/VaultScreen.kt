@@ -104,6 +104,7 @@ import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.EncryptedThumbRequest
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.theme.TgTypography
@@ -475,11 +476,10 @@ fun VaultScreen(
                             modifier = Modifier.fillMaxSize(),
                         ) {
                             items(state.filteredItems, key = { "${it.chatId}_${it.messageId}" }) { item ->
-                                val thumbBytes = state.decryptedThumbs[item.chatId to item.messageId]
                                 val matchHint = state.matchHints[item.chatId to item.messageId]
                                 VaultGridCard(
                                     item = item,
-                                    decryptedThumbBytes = thumbBytes,
+                                    passphraseFingerprint = state.passphraseFingerprint,
                                     matchHint = matchHint,
                                     isSelected = (item.chatId to item.messageId) in state.selectedIds,
                                     onClick = {
@@ -735,7 +735,7 @@ private fun VaultLockGate(
 @Composable
 private fun VaultGridCard(
     item: FileCacheEntity,
-    decryptedThumbBytes: ByteArray?,
+    passphraseFingerprint: String?,
     matchHint: String?,
     isSelected: Boolean,
     onClick: () -> Unit,
@@ -778,22 +778,37 @@ private fun VaultGridCard(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                val plainThumbFile = remember(item.thumbnailPath) {
-                    item.thumbnailPath
-                        ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
-                        ?.let(::File)
-                        ?.takeIf { it.isFile && it.length() > 0L }
+                val isEncryptedItem = remember(item) {
+                    item.isEncryptedVault ||
+                        BackupCrypto.isEncryptedFileName(item.fileName) ||
+                        item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
                 }
-                if (decryptedThumbBytes != null) {
+                val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEncryptedItem, passphraseFingerprint) {
+                    if (isEncryptedItem && passphraseFingerprint != null) {
+                        EncryptedThumbRequest(
+                            chatId = item.chatId,
+                            messageId = item.messageId,
+                            localPath = item.thumbnailPath,
+                            passphraseFingerprint = passphraseFingerprint,
+                        )
+                    } else {
+                        null
+                    }
+                }
+                val plainThumbFile = remember(item.thumbnailPath, isEncryptedItem) {
+                    if (isEncryptedItem) {
+                        null
+                    } else {
+                        item.thumbnailPath
+                            ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
+                            ?.let(::File)
+                            ?.takeIf { it.isFile && it.length() > 0L }
+                    }
+                }
+                val thumbModel: Any? = encThumbRequest ?: plainThumbFile
+                if (thumbModel != null) {
                     AsyncImage(
-                        model = decryptedThumbBytes,
-                        contentDescription = innerName,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else if (plainThumbFile != null) {
-                    AsyncImage(
-                        model = plainThumbFile,
+                        model = thumbModel,
                         contentDescription = innerName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),

@@ -157,6 +157,52 @@ class BackupCrypto @Inject constructor(
         }
     }
 
+    /**
+     * Encrypts an arbitrary byte payload (such as the gzipped PassVault AI index) using the active
+     * cross-device portable PassVault passphrase in `TGE2` format. Returns `null` if no passphrase is saved.
+     */
+    fun encryptVaultBlob(plainBytes: ByteArray): ByteArray? {
+        if (plainBytes.isEmpty()) return null
+        val pass = getVaultPassphrase() ?: return null
+        val passChars = pass.toCharArray()
+        return try {
+            val out = ByteArrayOutputStream()
+            encryptStreamWithPassphrase(
+                passphrase = passChars,
+                input = ByteArrayInputStream(plainBytes),
+                output = out,
+            )
+            out.toByteArray()
+        } catch (_: Throwable) {
+            null
+        } finally {
+            passChars.fill('\u0000')
+        }
+    }
+
+    /**
+     * Decrypts a `TGE2` blob previously produced by [encryptVaultBlob] using the saved PassVault passphrase.
+     * Returns `null` if no passphrase is saved or the passphrase does not match.
+     */
+    fun decryptVaultBlob(encryptedBytes: ByteArray): ByteArray? {
+        if (encryptedBytes.isEmpty()) return null
+        val pass = getVaultPassphrase() ?: return null
+        val passChars = pass.toCharArray()
+        return try {
+            val out = ByteArrayOutputStream()
+            decryptStreamWithPassphrase(
+                passphrase = passChars,
+                input = ByteArrayInputStream(encryptedBytes),
+                output = out,
+            )
+            out.toByteArray()
+        } catch (_: Throwable) {
+            null
+        } finally {
+            passChars.fill('\u0000')
+        }
+    }
+
     /** Creates a zero-knowledge `TGE2` verifier blob containing only a known constant sentinel. */
     fun createPassphraseVerifier(passphrase: String): ByteArray {
         val clean = passphrase.trim()

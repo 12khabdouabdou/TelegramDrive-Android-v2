@@ -343,4 +343,24 @@ class BackupCryptoTest {
         }
         assertThat(cancelledOut.exists()).isFalse()
     }
+
+    @Test
+    fun `encryptVaultBlob and decryptVaultBlob round trip cross-device and fail on wrong passphrase`() {
+        val src = BackupCrypto(inMemoryKeystore())
+        val dst = BackupCrypto(inMemoryKeystore())
+        val payload = "{\"entries\":[{\"chatId\":10,\"ocrText\":\"PASSPORT\"}]}".toByteArray()
+
+        // Fails cleanly when passphrase is not set
+        assertThat(src.encryptVaultBlob(payload)).isNull()
+
+        src.setVaultPassphrase("vault-index-pass")
+        dst.setVaultPassphrase("vault-index-pass")
+        val cipher = src.encryptVaultBlob(payload)
+        assertThat(cipher).isNotNull()
+        assertThat(BackupCrypto.detectMagicFormat(cipher!!)).isEqualTo(EncryptedFileFormat.PASSPHRASE_TGE2)
+        assertThat(dst.decryptVaultBlob(cipher)).isEqualTo(payload)
+
+        dst.setVaultPassphrase("wrong-vault-pass")
+        assertThat(dst.decryptVaultBlob(cipher)).isNull()
+    }
 }

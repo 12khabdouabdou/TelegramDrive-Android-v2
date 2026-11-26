@@ -24,7 +24,6 @@ import androidx.room.PrimaryKey
         )
     ],
     indices = [
-        Index("local_path"),
         Index("folder_id"),
         Index(value = ["local_path", "size"], unique = false),
         Index("sha256"),

@@ -80,7 +80,6 @@ import com.tgdrive.core.datastore.FileSort
 import com.tgdrive.core.datastore.FileViewMode
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
-import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
@@ -92,13 +91,20 @@ import com.tgdrive.designsystem.theme.TgShapes
 import com.tgdrive.designsystem.theme.TgTypography
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
+import java.util.Collections
 import javax.inject.Inject
 
 data class CategoryFilesUiState(
@@ -110,10 +116,10 @@ data class CategoryFilesUiState(
     val viewMode: FileViewMode = FileViewMode.GRID,
 )
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
 class CategoryFilesViewModel @Inject constructor(
     private val fileCacheDao: FileCacheDao,
-    private val trashEntryDao: TrashEntryDao,
     private val folderDao: FolderDao,
     private val telegramClient: TelegramClient,
     private val downloadManager: DownloadManager,
@@ -127,54 +133,70 @@ class CategoryFilesViewModel @Inject constructor(
     private val _sort = MutableStateFlow(FileSort.DATE_DESC)
     private val _systemChatId = MutableStateFlow<Long?>(null)
     private val _savedChatId = MutableStateFlow(0L)
-    private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+    private val attemptedThumbKeys = Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
+    private val thumbChannel = Channel<FileCacheEntity>(capacity = 64)
+    private val thumbSemaphore = Semaphore(2)
 
     init {
         viewModelScope.launch(dispatchers.io) {
             _systemChatId.value = runCatching { telegramClient.getOrCreateSystemChannel() }.getOrNull()
             _savedChatId.value = runCatching { telegramClient.myUserId() }.getOrDefault(0L)
         }
+        viewModelScope.launch(dispatchers.io) {
+            for (item in thumbChannel) {
+                launch {
+                    thumbSemaphore.withPermit {
+                        try {
+                            mediaThumbnailCache.ensureThumbnail(item)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun requestThumbnail(item: FileCacheEntity) {
+        if (!mediaThumbnailCache.needsThumbnailUpgrade(item.thumbnailPath)) return
+        if (attemptedThumbKeys.add(item.chatId to item.messageId)) {
+            thumbChannel.trySend(item)
+        }
+    }
+
+    private val activeCategoryFilesFlow = combine(_filter, _systemChatId) { filter, sysId ->
+        filter to (sysId ?: 0L)
+    }.flatMapLatest { (filter, excludedId) ->
+        when (filter) {
+            FileFilter.ALL -> fileCacheDao.observeActiveUnlocked(excludedId)
+            FileFilter.IMAGES -> fileCacheDao.observeActiveByBuckets(listOf("IMAGES"), excludedId)
+            FileFilter.VIDEOS -> fileCacheDao.observeActiveByBuckets(listOf("VIDEOS"), excludedId)
+            FileFilter.AUDIO -> fileCacheDao.observeActiveByBuckets(listOf("AUDIO"), excludedId)
+            FileFilter.DOCUMENTS -> fileCacheDao.observeActiveByBuckets(listOf("PDF", "DOCUMENTS"), excludedId)
+            FileFilter.ARCHIVES -> fileCacheDao.observeActiveByBuckets(listOf("ARCHIVES"), excludedId)
+        }
     }
 
     val state: StateFlow<CategoryFilesUiState> = combine(
         combine(
-            fileCacheDao.observeAllUnlocked(),
-            trashEntryDao.observeAll(),
+            activeCategoryFilesFlow,
             folderDao.observeAll(),
-        ) { files, trashed, folders -> Triple(files, trashed, folders) },
+        ) { files, folders -> files to folders },
         combine(
             _filter,
             _query,
             _sort,
             preferences.data,
         ) { filter, query, sort, prefs -> CategoryControls(filter, query, sort, prefs.fileViewMode) },
-        combine(_systemChatId, _savedChatId) { sys, saved -> sys to saved },
-    ) { (files, trashed, folders), controls, (sysId, savedId) ->
-        val trashedKeys = trashed.mapTo(HashSet()) { it.chatId to it.messageId }
+        _savedChatId,
+    ) { (files, folders), controls, savedId ->
         val q = controls.query.trim().lowercase()
         val filtered = files
             .asSequence()
-            .filter { it.chatId != sysId }
-            .filterNot { (it.chatId to it.messageId) in trashedKeys }
-            .filter { matchesFilter(it, controls.filter) }
             .filter { q.isEmpty() || it.fileName.lowercase().contains(q) }
             .toList()
             .let { list -> sortCategoryItems(list, controls.sort) }
-
-        val toWarm = filtered
-            .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
-            .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
-            .take(50)
-        for (item in toWarm) {
-            viewModelScope.launch(dispatchers.io) {
-                try {
-                    mediaThumbnailCache.ensureThumbnail(item)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Throwable) {
-                }
-            }
-        }
 
         val names = buildMap {
             if (savedId != 0L) put(savedId, "Saved Messages")
@@ -188,7 +210,8 @@ class CategoryFilesViewModel @Inject constructor(
             sort = controls.sort,
             viewMode = controls.viewMode,
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), CategoryFilesUiState())
+    }.flowOn(dispatchers.default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), CategoryFilesUiState())
 
     fun setFilter(filter: FileFilter) {
         _filter.value = filter
@@ -462,6 +485,7 @@ fun CategoryFilesScreen(
             ) {
                 items(state.items, key = { "${it.chatId}_${it.messageId}" }) { item ->
                     val folderTitle = state.folderNames[item.chatId] ?: savedTitle
+                    LaunchedEffect(item.chatId, item.messageId) { vm.requestThumbnail(item) }
                     CategoryGridItem(
                         item = item,
                         folderTitle = folderTitle,
@@ -491,6 +515,7 @@ fun CategoryFilesScreen(
             ) {
                 items(state.items, key = { "${it.chatId}_${it.messageId}" }) { item ->
                     val folderTitle = state.folderNames[item.chatId] ?: savedTitle
+                    LaunchedEffect(item.chatId, item.messageId) { vm.requestThumbnail(item) }
                     CategoryListItem(
                         item = item,
                         folderTitle = folderTitle,

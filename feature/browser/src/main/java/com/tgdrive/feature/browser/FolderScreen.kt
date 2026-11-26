@@ -145,6 +145,7 @@ import com.tgdrive.core.datastore.FileFilter
 import com.tgdrive.core.datastore.FileSort
 import com.tgdrive.core.datastore.FileViewMode
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.EncryptedThumbRequest
 import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.UploadConflictStrategy
 import com.tgdrive.core.download.UploadEncryptionSpec
@@ -706,7 +707,7 @@ fun FolderScreen(
                         FileViewMode.GRID ->
                             FileGrid(
                                 items = state.items,
-                                decryptedThumbs = state.decryptedThumbs,
+                                encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -739,7 +740,7 @@ fun FolderScreen(
                         FileViewMode.LIST ->
                             FileList(
                                 items = state.items,
-                                decryptedThumbs = state.decryptedThumbs,
+                                encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 selectedIds = state.selectedIds,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -1549,7 +1550,7 @@ private val PART_ZIP_REGEX = Regex("_part(\\d+)\\.zip$", RegexOption.IGNORE_CASE
 @Composable
 private fun FileGrid(
     items: List<FileCacheEntity>,
-    decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
+    encryptedPreviewFingerprint: String? = null,
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -1582,7 +1583,7 @@ private fun FileGrid(
         items(items, key = { it.messageId }) { item ->
             FileGridCell(
                 item = item,
-                decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
+                encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -1612,15 +1613,32 @@ private fun FileGrid(
 @Composable
 private fun FileGridCell(
     item: FileCacheEntity,
-    decryptedThumbBytes: ByteArray? = null,
+    encryptedPreviewFingerprint: String? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath, item.isEncryptedVault) {
-        if (item.isEncryptedVault) {
+    val isEnc = remember(item) {
+        item.isEncryptedVault ||
+            BackupCrypto.isEncryptedFileName(item.fileName) ||
+            item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
+    }
+    val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+        if (isEnc && encryptedPreviewFingerprint != null) {
+            EncryptedThumbRequest(
+                chatId = item.chatId,
+                messageId = item.messageId,
+                localPath = item.thumbnailPath,
+                passphraseFingerprint = encryptedPreviewFingerprint,
+            )
+        } else {
+            null
+        }
+    }
+    val thumbFile = remember(item.thumbnailPath, isEnc) {
+        if (isEnc) {
             null
         } else {
             item.thumbnailPath
@@ -1663,16 +1681,10 @@ private fun FileGridCell(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                if (decryptedThumbBytes != null) {
+                val model: Any? = encThumbRequest ?: thumbFile
+                if (model != null) {
                     AsyncImage(
-                        model = decryptedThumbBytes,
-                        contentDescription = item.fileName,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else if (thumbFile != null) {
-                    AsyncImage(
-                        model = thumbFile,
+                        model = model,
                         contentDescription = item.fileName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
@@ -1807,7 +1819,7 @@ private fun FileGridCell(
 @Composable
 private fun FileList(
     items: List<FileCacheEntity>,
-    decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
+    encryptedPreviewFingerprint: String? = null,
     selectedIds: Set<Long>,
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
@@ -1838,7 +1850,7 @@ private fun FileList(
         items(items, key = { it.messageId }) { item ->
             FileListRow(
                 item = item,
-                decryptedThumbBytes = decryptedThumbs[item.chatId to item.messageId],
+                encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 isSelected = item.messageId in selectedIds,
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
@@ -1868,15 +1880,32 @@ private fun FileList(
 @Composable
 private fun FileListRow(
     item: FileCacheEntity,
-    decryptedThumbBytes: ByteArray? = null,
+    encryptedPreviewFingerprint: String? = null,
     isSelected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
     val tint = tintFor(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath, item.isEncryptedVault) {
-        if (item.isEncryptedVault) {
+    val isEnc = remember(item) {
+        item.isEncryptedVault ||
+            BackupCrypto.isEncryptedFileName(item.fileName) ||
+            item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
+    }
+    val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+        if (isEnc && encryptedPreviewFingerprint != null) {
+            EncryptedThumbRequest(
+                chatId = item.chatId,
+                messageId = item.messageId,
+                localPath = item.thumbnailPath,
+                passphraseFingerprint = encryptedPreviewFingerprint,
+            )
+        } else {
+            null
+        }
+    }
+    val thumbFile = remember(item.thumbnailPath, isEnc) {
+        if (isEnc) {
             null
         } else {
             item.thumbnailPath
@@ -1918,6 +1947,7 @@ private fun FileListRow(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
+            val rowThumbModel: Any? = encThumbRequest ?: thumbFile
             if (isSelected) {
                 Icon(
                     Icons.Filled.CheckCircle,
@@ -1925,18 +1955,9 @@ private fun FileListRow(
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp),
                 )
-            } else if (decryptedThumbBytes != null) {
+            } else if (rowThumbModel != null) {
                 AsyncImage(
-                    model = decryptedThumbBytes,
-                    contentDescription = item.fileName,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(12.dp)),
-                )
-            } else if (thumbFile != null) {
-                AsyncImage(
-                    model = thumbFile,
+                    model = rowThumbModel,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier

@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import coil.annotation.ExperimentalCoilApi
+import coil.imageLoader
 import com.tgdrive.core.audio.AudioPlayerController
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
@@ -38,17 +40,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
-
-private const val MAX_VAULT_DECRYPTED_THUMBS = 60
 
 data class VaultExternalOpenEvent(
     val id: Long,
@@ -68,7 +67,7 @@ data class VaultUiState(
     val biometricRequired: Boolean = false,
     val isUnlocked: Boolean = false,
     val ready: Boolean = false,
-    val decryptedThumbs: Map<Pair<Long, Long>, ByteArray> = emptyMap(),
+    val passphraseFingerprint: String? = null,
     val decryptDialog: DecryptDialogState? = null,
     val hasVaultPassphrase: Boolean = false,
     val hasCloudVerifier: Boolean = false,
@@ -104,7 +103,7 @@ class VaultViewModel @Inject constructor(
     private val _biometricRequired = MutableStateFlow(false)
     private val _isUnlocked = MutableStateFlow(false)
     private val _ready = MutableStateFlow(false)
-    private val _decryptedThumbs = MutableStateFlow<Map<Pair<Long, Long>, ByteArray>>(emptyMap())
+    private val _passphraseFingerprint = MutableStateFlow(backupCrypto.passphraseFingerprint())
     private val _hasVaultPassphrase = MutableStateFlow(backupCrypto.hasVaultPassphrase())
     private val _hasCloudVerifier = MutableStateFlow(false)
     private val _passphraseBusy = MutableStateFlow(false)
@@ -140,14 +139,13 @@ class VaultViewModel @Inject constructor(
     private val _externalOpenEvent = MutableStateFlow<VaultExternalOpenEvent?>(null)
     val externalOpenEvent: StateFlow<VaultExternalOpenEvent?> = _externalOpenEvent.asStateFlow()
 
-    private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
-    private val thumbSemaphore = Semaphore(2)
     private var initialLockEvaluated = false
 
     private data class VaultAiSearchState(
         val searchQuery: String,
         val unindexedAiCount: Int,
         val aiIndexingProgress: Pair<Int, Int>?,
+        val passphraseFingerprint: String?,
     )
 
     val state: StateFlow<VaultUiState> = combine(
@@ -161,18 +159,17 @@ class VaultViewModel @Inject constructor(
             listOf(items, selected, bioReq, unlocked, ready)
         },
         combine(
-            _decryptedThumbs,
             decryptFlow.dialog,
             _batchProgress,
             _error,
             combine(_hasVaultPassphrase, _hasCloudVerifier, _passphraseBusy) { hasPass, hasVer, busy ->
                 Triple(hasPass, hasVer, busy)
             },
-        ) { thumbs, dialog, batch, err, passTuple ->
-            listOf(thumbs, dialog, batch, err, passTuple)
+        ) { dialog, batch, err, passTuple ->
+            listOf(dialog, batch, err, passTuple)
         },
-        combine(_searchQuery, _unindexedAiCount, _aiIndexingProgress) { sq, unindexed, aiProg ->
-            VaultAiSearchState(sq, unindexed, aiProg)
+        combine(_searchQuery, _unindexedAiCount, _aiIndexingProgress, _passphraseFingerprint) { sq, unindexed, aiProg, fp ->
+            VaultAiSearchState(sq, unindexed, aiProg, fp)
         },
     ) { core, aux, aiSearch ->
         @Suppress("UNCHECKED_CAST")
@@ -183,14 +180,12 @@ class VaultViewModel @Inject constructor(
         val unlocked = core[3] as Boolean
         val ready = core[4] as Boolean
 
+        val dialog = aux[0] as DecryptDialogState?
         @Suppress("UNCHECKED_CAST")
-        val thumbs = aux[0] as Map<Pair<Long, Long>, ByteArray>
-        val dialog = aux[1] as DecryptDialogState?
+        val batch = aux[1] as Pair<Int, Int>?
+        val err = aux[2] as String?
         @Suppress("UNCHECKED_CAST")
-        val batch = aux[2] as Pair<Int, Int>?
-        val err = aux[3] as String?
-        @Suppress("UNCHECKED_CAST")
-        val passTuple = aux[4] as Triple<Boolean, Boolean, Boolean>
+        val passTuple = aux[3] as Triple<Boolean, Boolean, Boolean>
 
         val q = aiSearch.searchQuery
         val parsedQuery = if (q.isBlank()) null else SmartSearchEngine.parseQuery(q)
@@ -222,7 +217,7 @@ class VaultViewModel @Inject constructor(
             biometricRequired = bioReq,
             isUnlocked = unlocked,
             ready = ready,
-            decryptedThumbs = if (unlocked) thumbs else emptyMap(),
+            passphraseFingerprint = if (unlocked) aiSearch.passphraseFingerprint else null,
             decryptDialog = dialog,
             hasVaultPassphrase = passTuple.first,
             hasCloudVerifier = passTuple.second,
@@ -230,7 +225,8 @@ class VaultViewModel @Inject constructor(
             batchProgress = batch,
             error = err,
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultUiState())
+    }.flowOn(dispatchers.default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultUiState())
 
     init {
         viewModelScope.launch(dispatchers.io) {
@@ -248,52 +244,6 @@ class VaultViewModel @Inject constructor(
                     _ready.value = true
                 } else if (!required) {
                     _isUnlocked.value = true
-                }
-            }
-        }
-        viewModelScope.launch(dispatchers.io) {
-            combine(fileCacheDao.observeEncryptedVaultFiles(), _isUnlocked) { files, unlocked ->
-                if (unlocked) files else emptyList()
-            }.collect { files ->
-                if (files.isNotEmpty()) {
-                    warmEncryptedThumbnails(files)
-                }
-            }
-        }
-    }
-
-    private fun warmEncryptedThumbnails(files: List<FileCacheEntity>) {
-        files.forEach { entity ->
-            val path = entity.thumbnailPath
-            val isEncryptedThumb = path?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true
-            val hasCloudBackup = cloudSyncManager.getCloudEncryptedThumbRemoteId(entity.chatId, entity.messageId) != null
-            if (!isEncryptedThumb && !hasCloudBackup && mediaThumbnailCache.getEncryptedThumbnailPath(entity.chatId, entity.messageId) == null) {
-                return@forEach
-            }
-            val key = entity.chatId to entity.messageId
-            val shouldAttempt = synchronized(attemptedThumbKeys) { attemptedThumbKeys.add(key) }
-            if (!shouldAttempt) return@forEach
-            viewModelScope.launch(dispatchers.io) {
-                thumbSemaphore.withPermit {
-                    if (!_isUnlocked.value) return@withPermit
-                    val effectivePath = when {
-                        isEncryptedThumb && path != null && File(path).isFile -> path
-                        else -> mediaThumbnailCache.restoreEncryptedThumbFromCloud(entity.chatId, entity.messageId)
-                    } ?: return@withPermit
-                    val bytes = runCatching { mediaThumbnailCache.decryptThumbnailToBytes(effectivePath) }.getOrNull()
-                    if (bytes != null && bytes.isNotEmpty() && _isUnlocked.value) {
-                        _decryptedThumbs.update { cur ->
-                            if (cur.size < MAX_VAULT_DECRYPTED_THUMBS) {
-                                cur + (key to bytes)
-                            } else {
-                                val trimmed = LinkedHashMap<Pair<Long, Long>, ByteArray>(MAX_VAULT_DECRYPTED_THUMBS)
-                                val dropCount = cur.size - MAX_VAULT_DECRYPTED_THUMBS + 1
-                                cur.entries.drop(dropCount).forEach { (k, v) -> trimmed[k] = v }
-                                trimmed[key] = bytes
-                                trimmed
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -320,12 +270,12 @@ class VaultViewModel @Inject constructor(
         )
     }
 
+    @OptIn(ExperimentalCoilApi::class)
     fun lock() {
         _isUnlocked.value = false
         _selected.value = emptySet()
-        _decryptedThumbs.value = emptyMap()
         mediaThumbnailCache.clearDecryptedMemoryCache()
-        synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+        runCatching { appContext.imageLoader.memoryCache?.clear() }
     }
 
     fun toggleSelection(chatId: Long, messageId: Long) {
@@ -495,23 +445,22 @@ class VaultViewModel @Inject constructor(
         return dl?.takeIf { File(it).isFile }
     }
 
+    @OptIn(ExperimentalCoilApi::class)
     fun saveVaultPassphraseQuietly(passphrase: String) {
         val clean = passphrase.trim()
         if (clean.length < 8) return
         viewModelScope.launch(dispatchers.io) {
             backupCrypto.setVaultPassphrase(clean)
             mediaThumbnailCache.clearDecryptedMemoryCache()
+            runCatching { appContext.imageLoader.memoryCache?.clear() }
             _hasVaultPassphrase.value = true
-            _decryptedThumbs.value = emptyMap()
-            synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
+            _passphraseFingerprint.value = backupCrypto.passphraseFingerprint()
             MediaAiIndexWorker.enqueueSoon(appContext)
             refreshUnindexedAiCount()
-            if (_isUnlocked.value && state.value.items.isNotEmpty()) {
-                warmEncryptedThumbnails(state.value.items)
-            }
         }
     }
 
+    @OptIn(ExperimentalCoilApi::class)
     suspend fun setAndVerifyVaultPassphrase(
         passphrase: String,
         forceReplace: Boolean = false,
@@ -531,20 +480,17 @@ class VaultViewModel @Inject constructor(
             }
             backupCrypto.setVaultPassphrase(clean)
             mediaThumbnailCache.clearDecryptedMemoryCache()
+            runCatching { appContext.imageLoader.memoryCache?.clear() }
             _hasVaultPassphrase.value = true
+            _passphraseFingerprint.value = backupCrypto.passphraseFingerprint()
             if (verify == PassVaultCloudVerifier.CloudVerifyResult.NO_CLOUD_VERIFIER || forceReplace) {
                 runCatching { passVaultCloudVerifier.publishVerifier(clean) }
                     .onSuccess { _hasCloudVerifier.value = true }
             } else if (verify == PassVaultCloudVerifier.CloudVerifyResult.MATCHED) {
                 _hasCloudVerifier.value = true
             }
-            _decryptedThumbs.value = emptyMap()
-            synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
             MediaAiIndexWorker.enqueueSoon(appContext)
             refreshUnindexedAiCount()
-            if (_isUnlocked.value && state.value.items.isNotEmpty()) {
-                warmEncryptedThumbnails(state.value.items)
-            }
             Result.success(VaultPassphraseSaveStatus.SAVED)
         } catch (e: CancellationException) {
             throw e
@@ -658,8 +604,6 @@ class VaultViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        _decryptedThumbs.value = emptyMap()
         mediaThumbnailCache.clearDecryptedMemoryCache()
-        synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
     }
 }

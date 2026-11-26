@@ -2,6 +2,7 @@ package com.tgdrive.core.db.di
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.tgdrive.core.db.TgDriveDatabase
@@ -321,6 +322,79 @@ object DatabaseModule {
         }
     }
 
+    internal val MIGRATION_9_10 = object : Migration(9, 10) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE file_cache ADD COLUMN is_renamed INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("UPDATE file_cache SET date = date * 1000 WHERE date > 0 AND date <= 9999999999")
+
+            // Drop redundant prefix indexes covered by composite/PK indexes
+            db.execSQL("DROP INDEX IF EXISTS index_file_cache_chat_id")
+            db.execSQL("DROP INDEX IF EXISTS index_zip_entries_chat_id_zip_message_id")
+            db.execSQL("DROP INDEX IF EXISTS index_synced_files_local_path")
+            db.execSQL("DROP INDEX IF EXISTS index_album_items_album_id")
+
+            // Add high-selectivity composite indexes
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_file_cache_is_locked_is_encrypted_vault_bucket_date " +
+                    "ON file_cache(is_locked, is_encrypted_vault, bucket, date)",
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_pending_uploads_status_created_at_ms " +
+                    "ON pending_uploads(status, created_at_ms)",
+            )
+
+            // ZIP entries FTS4 virtual table + triggers
+            db.execSQL(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS `zip_entries_fts` USING FTS4(" +
+                    "`entry_name` TEXT NOT NULL, " +
+                    "`entry_path` TEXT NOT NULL, " +
+                    "`zip_file_name` TEXT NOT NULL, " +
+                    "content=`zip_entries`)",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_zip_entries_fts_BEFORE_UPDATE` " +
+                    "BEFORE UPDATE ON `zip_entries` BEGIN " +
+                    "DELETE FROM `zip_entries_fts` WHERE `docid`=OLD.`rowid`; END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_zip_entries_fts_BEFORE_DELETE` " +
+                    "BEFORE DELETE ON `zip_entries` BEGIN " +
+                    "DELETE FROM `zip_entries_fts` WHERE `docid`=OLD.`rowid`; END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_zip_entries_fts_AFTER_UPDATE` " +
+                    "AFTER UPDATE ON `zip_entries` BEGIN " +
+                    "INSERT INTO `zip_entries_fts`(`docid`, `entry_name`, `entry_path`, `zip_file_name`) " +
+                    "VALUES (NEW.`rowid`, NEW.`entry_name`, NEW.`entry_path`, NEW.`zip_file_name`); END",
+            )
+            db.execSQL(
+                "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_zip_entries_fts_AFTER_INSERT` " +
+                    "AFTER INSERT ON `zip_entries` BEGIN " +
+                    "INSERT INTO `zip_entries_fts`(`docid`, `entry_name`, `entry_path`, `zip_file_name`) " +
+                    "VALUES (NEW.`rowid`, NEW.`entry_name`, NEW.`entry_path`, NEW.`zip_file_name`); END",
+            )
+            db.execSQL("INSERT INTO `zip_entries_fts`(`zip_entries_fts`) VALUES('rebuild')")
+
+            installColumnScopedFileCacheFtsTriggers(db)
+        }
+    }
+
+    internal fun installColumnScopedFileCacheFtsTriggers(db: SupportSQLiteDatabase) {
+        db.execSQL("DROP TRIGGER IF EXISTS `room_fts_content_sync_file_cache_fts_BEFORE_UPDATE`")
+        db.execSQL("DROP TRIGGER IF EXISTS `room_fts_content_sync_file_cache_fts_AFTER_UPDATE`")
+        db.execSQL(
+            "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_BEFORE_UPDATE` " +
+                "BEFORE UPDATE OF `file_name`, `virtual_path`, `user_note`, `ocr_text`, `ai_tags` ON `file_cache` BEGIN " +
+                "DELETE FROM `file_cache_fts` WHERE `docid`=OLD.`rowid`; END",
+        )
+        db.execSQL(
+            "CREATE TRIGGER IF NOT EXISTS `room_fts_content_sync_file_cache_fts_AFTER_UPDATE` " +
+                "AFTER UPDATE OF `file_name`, `virtual_path`, `user_note`, `ocr_text`, `ai_tags` ON `file_cache` BEGIN " +
+                "INSERT INTO `file_cache_fts`(`docid`, `file_name`, `virtual_path`, `user_note`, `ocr_text`, `ai_tags`) " +
+                "VALUES (NEW.`rowid`, NEW.`file_name`, NEW.`virtual_path`, NEW.`user_note`, NEW.`ocr_text`, NEW.`ai_tags`); END",
+        )
+    }
+
     internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
         MIGRATION_1_2,
         MIGRATION_2_3,
@@ -330,13 +404,35 @@ object DatabaseModule {
         MIGRATION_6_7,
         MIGRATION_7_8,
         MIGRATION_8_9,
+        MIGRATION_9_10,
     )
+
+    internal val OPTIMIZATION_CALLBACK = object : RoomDatabase.Callback() {
+        override fun onOpen(db: SupportSQLiteDatabase) {
+            super.onOpen(db)
+            // Keep FTS4 triggers column-scoped even on fresh schema creation
+            runCatching { installColumnScopedFileCacheFtsTriggers(db) }
+            // SQLite PRAGMA performance tuning (query().close() avoids Android execSQL PRAGMA pitfalls)
+            listOf(
+                "PRAGMA synchronous = NORMAL",
+                "PRAGMA temp_store = MEMORY",
+                "PRAGMA cache_size = -8000",
+                "PRAGMA mmap_size = 67108864",
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA optimize",
+            ).forEach { sql ->
+                runCatching { db.query(sql).close() }
+            }
+        }
+    }
 
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
             .addMigrations(*ALL_MIGRATIONS)
+            .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+            .addCallback(OPTIMIZATION_CALLBACK)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()

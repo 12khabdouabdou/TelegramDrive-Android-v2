@@ -92,6 +92,7 @@ import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.common.toLocalShort
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
+import com.tgdrive.core.download.EncryptedThumbRequest
 import com.tgdrive.designsystem.editorial.EditorialEmptyState
 import com.tgdrive.designsystem.editorial.SectionLabel
 import com.tgdrive.designsystem.theme.TgShapes
@@ -131,7 +132,7 @@ fun GlobalSearchScreen(
     val aiIndexing by vm.aiIndexing.collectAsStateWithLifecycle()
     val decryptDialog by vm.decryptDialog.collectAsStateWithLifecycle()
     val hasSavedBackupPassphrase by vm.hasSavedBackupPassphrase.collectAsStateWithLifecycle()
-    val decryptedThumbs by vm.decryptedThumbs.collectAsStateWithLifecycle()
+    val passphraseFingerprint by vm.passphraseFingerprint.collectAsStateWithLifecycle()
     val decryptedOpenEvent by vm.decryptedOpenEvent.collectAsStateWithLifecycle()
     val snackbarMessage by vm.snackbar.collectAsStateWithLifecycle()
 
@@ -588,7 +589,7 @@ fun GlobalSearchScreen(
                                         CloudFileResultRow(
                                             msg = msg,
                                             folderTitle = folderTitle,
-                                            decryptedThumbBytes = decryptedThumbs[msg.chatId to msg.messageId],
+                                            passphraseFingerprint = passphraseFingerprint,
                                             matchHint = hit.matchHint,
                                             highlightTokens = highlightTokens,
                                             onClick = {
@@ -894,7 +895,7 @@ private fun rememberHighlightedText(
 private fun CloudFileResultRow(
     msg: FileCacheEntity,
     folderTitle: String,
-    decryptedThumbBytes: ByteArray?,
+    passphraseFingerprint: String?,
     matchHint: String?,
     highlightTokens: List<String>,
     onClick: () -> Unit,
@@ -905,6 +906,18 @@ private fun CloudFileResultRow(
         if (isEncrypted) null else msg.mimeType,
         SmartSearchEngine.effectiveFileName(msg.fileName),
     )
+    val encThumbRequest = remember(msg.chatId, msg.messageId, msg.thumbnailPath, isEncrypted, passphraseFingerprint) {
+        if (isEncrypted && passphraseFingerprint != null) {
+            EncryptedThumbRequest(
+                chatId = msg.chatId,
+                messageId = msg.messageId,
+                localPath = msg.thumbnailPath,
+                passphraseFingerprint = passphraseFingerprint,
+            )
+        } else {
+            null
+        }
+    }
     val plainThumbFile = remember(msg.thumbnailPath) {
         msg.thumbnailPath
             ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
@@ -927,16 +940,10 @@ private fun CloudFileResultRow(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            if (decryptedThumbBytes != null) {
+            val imageModel: Any? = encThumbRequest ?: plainThumbFile
+            if (imageModel != null) {
                 AsyncImage(
-                    model = decryptedThumbBytes,
-                    contentDescription = msg.fileName,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else if (plainThumbFile != null) {
-                AsyncImage(
-                    model = plainThumbFile,
+                    model = imageModel,
                     contentDescription = msg.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),

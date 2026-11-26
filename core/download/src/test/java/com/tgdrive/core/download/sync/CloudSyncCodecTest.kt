@@ -172,5 +172,24 @@ class CloudSyncCodecTest {
         val updatedAi = mergedSearch.aiEntries.first { it.messageId == 1L }
         assertThat(updatedAi.ocrText).contains("$99")
         assertThat(updatedAi.exifLat).isWithin(0.001).of(36.75)
+
+        val vLocal = CloudSyncCodec.CloudVaultIndexSnapshot(
+            updatedAtMs = 100L,
+            entries = listOf(
+                CloudSyncCodec.CloudAiIndexRecord(9L, 1L, "PASSPORT OLD", "document", updatedAtMs = 100L),
+            ),
+        )
+        val vRemote = CloudSyncCodec.CloudVaultIndexSnapshot(
+            updatedAtMs = 200L,
+            entries = listOf(
+                CloudSyncCodec.CloudAiIndexRecord(9L, 1L, "PASSPORT 2026", "document, id", updatedAtMs = 300L),
+                CloudSyncCodec.CloudAiIndexRecord(9L, 2L, "BANK IBAN", "bank", updatedAtMs = 200L),
+            ),
+        )
+        val decodedVault = CloudSyncCodec.decodeVaultIndexGzip(CloudSyncCodec.encodeVaultIndexGzip(vRemote))
+        assertThat(decodedVault?.entries).hasSize(2)
+        val mergedVault = CloudSyncCodec.mergeVaultIndex(vLocal, vRemote)
+        assertThat(mergedVault.entries).hasSize(2)
+        assertThat(mergedVault.entries.first { it.messageId == 1L }.ocrText).isEqualTo("PASSPORT 2026")
     }
 }

@@ -28,7 +28,6 @@ data class AlbumEntity(
         ),
     ],
     indices = [
-        Index("album_id"),
         Index(value = ["chat_id", "message_id"]),
     ],
 )

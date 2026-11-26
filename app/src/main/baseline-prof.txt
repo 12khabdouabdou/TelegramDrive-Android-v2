@@ -1,0 +1,16 @@
+Lcom/tgdrive/app/TelegramDriveApp;
+Lcom/tgdrive/app/MainActivity;
+Lcom/tgdrive/app/RootViewModel;
+Lcom/tgdrive/app/coil/EncryptedThumbFetcher;
+Lcom/tgdrive/app/coil/EncryptedThumbKeyer;
+Lcom/tgdrive/core/db/TgDriveDatabase;
+Lcom/tgdrive/core/security/BackupCrypto;
+Lcom/tgdrive/core/download/MediaThumbnailCache;
+Lcom/tgdrive/core/download/sync/CloudSyncManager;
+Lcom/tgdrive/feature/browser/HomeViewModel;
+Lcom/tgdrive/feature/browser/FolderViewModel;
+Lcom/tgdrive/feature/browser/PhotosTimelineViewModel;
+Lcom/tgdrive/feature/browser/VaultViewModel;
+Lcom/tgdrive/feature/browser/GlobalSearchViewModel;
+Lcom/tgdrive/feature/browser/search/SmartSearchEngine;
+Lcom/tgdrive/feature/browser/search/NaturalLanguageQueryParser;

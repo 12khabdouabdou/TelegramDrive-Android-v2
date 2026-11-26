@@ -226,7 +226,16 @@ class MediaAiIndexer @Inject constructor(
 
             val mergedTags = mergeAiTags(entity.aiTags, visualTags, placeTags)
             fileCacheDao.updateAiIndex(entity.chatId, entity.messageId, ocrClean, mergedTags)
-            if (!privateItem) {
+            if (privateItem) {
+                if (backupCrypto.hasVaultPassphrase()) {
+                    cloudSyncManager.noteVaultAiIndexChanged(
+                        chatId = entity.chatId,
+                        messageId = entity.messageId,
+                        ocrText = ocrClean,
+                        aiTags = mergedTags,
+                    )
+                }
+            } else {
                 cloudSyncManager.noteAiIndexChanged(
                     chatId = entity.chatId,
                     messageId = entity.messageId,

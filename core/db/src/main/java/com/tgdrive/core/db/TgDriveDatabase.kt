@@ -20,6 +20,7 @@ import com.tgdrive.core.db.entity.SyncedFileEntity
 import com.tgdrive.core.db.entity.SyncLogEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
 import com.tgdrive.core.db.entity.ZipEntryEntity
+import com.tgdrive.core.db.entity.ZipEntryFtsEntity
 
 @Database(
     entities = [
@@ -29,12 +30,13 @@ import com.tgdrive.core.db.entity.ZipEntryEntity
         FileCacheEntity::class,
         FileCacheFtsEntity::class,
         ZipEntryEntity::class,
+        ZipEntryFtsEntity::class,
         TrashEntryEntity::class,
         AlbumEntity::class,
         AlbumItemEntity::class,
         PendingUploadEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class TgDriveDatabase : RoomDatabase() {

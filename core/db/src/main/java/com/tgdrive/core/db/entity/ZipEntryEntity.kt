@@ -8,7 +8,6 @@ import androidx.room.PrimaryKey
 @Entity(
     tableName = "zip_entries",
     indices = [
-        Index(value = ["chat_id", "zip_message_id"]),
         Index("entry_name"),
         Index(value = ["chat_id", "zip_message_id", "entry_path"], unique = true),
     ],
