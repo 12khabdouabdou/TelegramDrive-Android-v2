@@ -242,11 +242,6 @@ class VaultViewModel @Inject constructor(
         synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
     }
 
-    override fun onCleared() {
-        super.onCleared()
-        mediaThumbnailCache.clearDecryptedMemoryCache()
-    }
-
     fun toggleSelection(chatId: Long, messageId: Long) {
         val key = chatId to messageId
         _selected.update { cur -> if (key in cur) cur - key else cur + key }
@@ -573,6 +568,7 @@ class VaultViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         _decryptedThumbs.value = emptyMap()
+        mediaThumbnailCache.clearDecryptedMemoryCache()
         synchronized(attemptedThumbKeys) { attemptedThumbKeys.clear() }
     }
 }
