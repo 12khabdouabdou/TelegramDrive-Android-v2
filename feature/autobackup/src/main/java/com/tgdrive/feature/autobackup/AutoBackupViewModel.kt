@@ -427,7 +427,7 @@ class AutoBackupViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             try {
                 backupCrypto.setVaultPassphrase(passphrase)
-                mediaThumbnailCache.clearDecryptedThumbMemoryCache()
+                mediaThumbnailCache.clearDecryptedMemoryCache()
                 val configured = backupCrypto.hasVaultPassphrase()
                 _hasVaultPassphrase.value = configured
                 val clean = passphrase?.trim()
