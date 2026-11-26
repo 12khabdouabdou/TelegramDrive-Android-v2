@@ -124,17 +124,32 @@ class GlobalSearchViewModel
         private val _aiIndexing = MutableStateFlow(AiIndexingProgress())
         val aiIndexing: StateFlow<AiIndexingProgress> = _aiIndexing.asStateFlow()
 
-        private val _decryptDialog = MutableStateFlow<DecryptDialogState?>(null)
-        val decryptDialog: StateFlow<DecryptDialogState?> = _decryptDialog.asStateFlow()
-
         private val _hasSavedBackupPassphrase = MutableStateFlow(false)
         val hasSavedBackupPassphrase: StateFlow<Boolean> = _hasSavedBackupPassphrase.asStateFlow()
 
-        private val _decryptedOpenEvent = MutableStateFlow<DecryptedOpenEvent?>(null)
-        val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = _decryptedOpenEvent.asStateFlow()
-
         private val _snackbar = MutableStateFlow<String?>(null)
         val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
+
+        private val decryptFlow = DecryptFlowCoordinator(
+            scope = viewModelScope,
+            ioDispatcher = dispatchers.io,
+            downloadState = downloadManager.state,
+            detectFormat = { file -> uploadManager.detectEncryptedFormat(file) },
+            decryptFile = { encryptedFile, originalDisplayName, passphrase, saveToDownloads, chatId, messageId ->
+                uploadManager.decryptLocalFile(
+                    encryptedFile = encryptedFile,
+                    originalDisplayName = originalDisplayName,
+                    passphrase = passphrase,
+                    saveToDownloads = saveToDownloads,
+                    chatId = chatId,
+                    messageId = messageId,
+                )
+            },
+            onSavedMessage = { msg -> _snackbar.value = msg },
+            onMissingRemoteId = { _snackbar.value = "File has no remote ID" },
+        )
+        val decryptDialog: StateFlow<DecryptDialogState?> = decryptFlow.dialog
+        val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = decryptFlow.openEvent
 
         @Volatile private var systemChannelId: Long? = null
         @Volatile private var cachedFiles: List<FileCacheEntity> = emptyList()
@@ -144,7 +159,6 @@ class GlobalSearchViewModel
 
         private var searchJob: Job? = null
         private var audioWaitJob: Job? = null
-        private var decryptWaitJob: Job? = null
         private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
 
         init {
@@ -593,119 +607,33 @@ class GlobalSearchViewModel
         }
 
         private fun startDecryptFlow(item: FileCacheEntity) {
-            decryptWaitJob?.cancel()
-            val localFile = resolveLocalPath(item)?.let(::File)
-            if (localFile != null) {
-                val fmt = uploadManager.detectEncryptedFormat(localFile)
-                _decryptDialog.value = DecryptDialogState(
-                    item = item,
-                    localFile = localFile,
-                    format = fmt,
-                )
-                return
-            }
-            if (item.remoteId.isBlank()) {
-                _snackbar.value = "File has no remote ID"
-                return
-            }
-            _decryptDialog.value = DecryptDialogState(item = item, downloading = true)
-            downloadManager.enqueue(
-                DownloadItem(
-                    id = item.messageId,
-                    chatId = item.chatId,
-                    remoteId = item.remoteId,
-                    fileName = item.fileName,
-                    totalBytes = item.fileSize,
-                ),
+            decryptFlow.start(
+                item = item,
+                resolveLocalFile = { resolveLocalPath(item)?.let(::File) },
+                enqueueDownload = {
+                    downloadManager.enqueue(
+                        DownloadItem(
+                            id = item.messageId,
+                            chatId = item.chatId,
+                            remoteId = item.remoteId,
+                            fileName = item.fileName,
+                            totalBytes = item.fileSize,
+                        ),
+                    )
+                },
             )
-            decryptWaitJob = viewModelScope.launch(dispatchers.io) {
-                val terminal = downloadManager.state
-                    .map { st ->
-                        st.items.find { it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId) }
-                    }
-                    .first { dl ->
-                        dl == null ||
-                            dl.status == DownloadStatus.DONE ||
-                            dl.status == DownloadStatus.FAILED ||
-                            dl.status == DownloadStatus.PAUSED ||
-                            dl.status == DownloadStatus.CANCELLED
-                    }
-                when (terminal?.status) {
-                    DownloadStatus.DONE -> {
-                        val f = terminal.localPath?.let(::File)?.takeIf { it.isFile }
-                        if (f != null) {
-                            val fmt = uploadManager.detectEncryptedFormat(f)
-                            _decryptDialog.update { cur ->
-                                cur?.copy(localFile = f, format = fmt, downloading = false, error = null)
-                            }
-                        } else {
-                            _decryptDialog.update { cur ->
-                                cur?.copy(downloading = false, error = "Downloaded file could not be opened")
-                            }
-                        }
-                    }
-                    DownloadStatus.FAILED -> {
-                        _decryptDialog.update { cur ->
-                            cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
-                        }
-                    }
-                    DownloadStatus.PAUSED -> {
-                        _decryptDialog.update { cur ->
-                            cur?.copy(
-                                downloading = false,
-                                error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
-                            )
-                        }
-                    }
-                    else -> _decryptDialog.value = null
-                }
-            }
         }
 
         fun decryptTarget(passphrase: String?, saveToDownloads: Boolean) {
-            val current = _decryptDialog.value ?: return
-            val localFile = current.localFile
-            if (localFile == null || !localFile.isFile) {
-                _decryptDialog.update { it?.copy(error = "Waiting for download to complete…") }
-                return
-            }
-            viewModelScope.launch(dispatchers.io) {
-                _decryptDialog.update { it?.copy(decrypting = true, error = null) }
-                when (
-                    val outcome = uploadManager.decryptLocalFile(
-                        encryptedFile = localFile,
-                        originalDisplayName = current.item.fileName,
-                        passphrase = passphrase,
-                        saveToDownloads = saveToDownloads,
-                        chatId = current.item.chatId,
-                        messageId = current.item.messageId,
-                    )
-                ) {
-                    is DecryptOutcome.Success -> {
-                        _decryptDialog.value = null
-                        if (saveToDownloads) {
-                            _snackbar.value = "Saved decrypted file: ${outcome.displayName}"
-                        } else {
-                            _decryptedOpenEvent.value = DecryptedOpenEvent(System.nanoTime(), outcome)
-                        }
-                    }
-                    is DecryptOutcome.WrongPassphrase -> {
-                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
-                    }
-                    is DecryptOutcome.Failed -> {
-                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
-                    }
-                }
-            }
+            decryptFlow.decrypt(passphrase, saveToDownloads)
         }
 
         fun dismissDecryptDialog() {
-            decryptWaitJob?.cancel()
-            _decryptDialog.value = null
+            decryptFlow.dismiss()
         }
 
         fun clearDecryptedOpenEvent() {
-            _decryptedOpenEvent.value = null
+            decryptFlow.clearOpenEvent()
         }
 
         fun clearSnackbar() {

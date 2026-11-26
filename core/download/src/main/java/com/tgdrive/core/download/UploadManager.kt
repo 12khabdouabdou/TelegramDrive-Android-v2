@@ -1,14 +1,11 @@
 package com.tgdrive.core.download
 
-import android.content.ContentValues
 import android.content.Context
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.os.StatFs
 import android.provider.DocumentsContract
-import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
@@ -16,6 +13,7 @@ import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.NetworkMonitor
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
@@ -1659,41 +1657,8 @@ class UploadManager @Inject constructor(
         return if (mod > 946_684_800_000L) mod else System.currentTimeMillis()
     }
 
-    private fun writeDecryptedToDownloads(source: File, fileName: String, mimeType: String): File? {
-        return runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = ctx.contentResolver
-                val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching null
-                try {
-                    resolver.openOutputStream(itemUri)?.use { out ->
-                        FileInputStream(source).use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
-                    }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(itemUri, values, null, null)
-                } catch (t: Throwable) {
-                    runCatching { resolver.delete(itemUri, null, null) }
-                    throw t
-                }
-                source
-            } else {
-                @Suppress("DEPRECATION")
-                val dlDir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "TelegramDrive",
-                ).apply { mkdirs() }
-                val dest = File(dlDir, fileName)
-                source.copyTo(dest, overwrite = true)
-                dest
-            }
-        }.getOrNull()
-    }
+    private fun writeDecryptedToDownloads(source: File, fileName: String, mimeType: String): File? =
+        PublicDownloadsExporter.saveToPublicDownloads(ctx, source, fileName, mimeType)
 
     private suspend fun shouldDeferForWifi(specWifiOnly: Boolean): Boolean {
         val globalWifiOnly = runCatching { appPreferences.data.first().manualUploadWifiOnly }.getOrDefault(false)

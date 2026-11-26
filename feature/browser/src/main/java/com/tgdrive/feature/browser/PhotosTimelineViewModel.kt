@@ -1,17 +1,14 @@
 package com.tgdrive.feature.browser
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.AlbumDao
@@ -993,24 +990,11 @@ class PhotosTimelineViewModel @Inject constructor(
             ?.takeIf { File(it).isFile }
     }
 
-    private fun copyFileToDownloads(source: File, fileName: String, mimeType: String?): Boolean = runCatching {
-        if (Build.VERSION.SDK_INT >= 29) {
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                put(MediaStore.Downloads.MIME_TYPE, mimeType ?: "application/octet-stream")
-                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-            }
-            val uri = appContext.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: return false
-            appContext.contentResolver.openOutputStream(uri)?.use { out ->
-                source.inputStream().use { it.copyTo(out) }
-            } ?: return false
-        } else {
-            @Suppress("DEPRECATION")
-            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
-            source.copyTo(File(dir, safeName), overwrite = true)
-        }
-        true
-    }.getOrDefault(false)
+    private fun copyFileToDownloads(source: File, fileName: String, mimeType: String?): Boolean =
+        PublicDownloadsExporter.saveToPublicDownloads(
+            ctx = appContext,
+            source = source,
+            displayName = fileName,
+            mimeType = mimeType,
+        ) != null
 }

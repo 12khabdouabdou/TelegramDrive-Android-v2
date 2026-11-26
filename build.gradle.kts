@@ -19,8 +19,8 @@ subprojects {
         configure<org.jlleitschuh.gradle.ktlint.KtlintExtension> {
             version.set("1.3.1")
             android.set(true)
-            // Don't fail builds on first run — there's existing style drift.
-            // Flip to true once the codebase is clean.
+            // Baseline audit recorded 6,035 style findings across legacy files;
+            // run `./gradlew ktlintFormat` cleanly before flipping to false.
             ignoreFailures.set(true)
         }
     }

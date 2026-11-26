@@ -46,6 +46,32 @@ jobs:
         run: ./gradlew ktlintCheck --no-daemon
         continue-on-error: true # ignoreFailures=true in build.gradle.kts for now
 
+      - name: Verify Room v9 schema export
+        run: |
+          test -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
+          ls -lh core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
+
+      - name: Upload Room schemas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: room-schemas
+          path: core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/*.json
+          retention-days: 7
+
+      - name: Run Android Lint
+        run: ./gradlew :app:lintDebug --no-daemon
+        continue-on-error: true
+
+      - name: Upload Android Lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Build debug APKs (arm64-v8a + universal)
         run: |
           ./gradlew :app:assembleDebug --no-daemon

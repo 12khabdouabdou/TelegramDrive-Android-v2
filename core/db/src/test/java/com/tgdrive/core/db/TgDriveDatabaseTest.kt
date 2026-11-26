@@ -272,14 +272,7 @@ class TgDriveDatabaseTest {
         raw.close()
 
         val migrated = Room.databaseBuilder(ctx, TgDriveDatabase::class.java, dbFile.absolutePath)
-            .addMigrations(
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_3_4,
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_4_5,
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_5_6,
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_6_7,
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_7_8,
-                com.tgdrive.core.db.di.DatabaseModule.MIGRATION_8_9,
-            )
+            .addMigrations(*com.tgdrive.core.db.di.DatabaseModule.ALL_MIGRATIONS)
             .allowMainThreadQueries()
             .build()
         try {
@@ -506,6 +499,125 @@ class TgDriveDatabaseTest {
             assertThat(migrated.fileCacheDao().searchFts("noteToken*").map { it.messageId })
                 .containsExactly(801L)
             assertThat(migrated.fileCacheDao().searchFts("locked*")).isEmpty()
+        } finally {
+            migrated.close()
+            dbFile.delete()
+        }
+    }
+
+    @Test
+    fun `migration 1 to 9 full chain preserves legacy data and enables FTS4 and buckets`() = runTest {
+        val ctx: Context = ApplicationProvider.getApplicationContext()
+        val dbFile = ctx.getDatabasePath("migration_1_9_test.db")
+        dbFile.parentFile?.mkdirs()
+        if (dbFile.exists()) dbFile.delete()
+
+        val raw = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(dbFile, null)
+        raw.execSQL(
+            """
+            CREATE TABLE folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        raw.execSQL("CREATE UNIQUE INDEX index_folders_channel_id ON folders(channel_id)")
+        raw.execSQL(
+            """
+            CREATE TABLE synced_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                local_path TEXT NOT NULL,
+                telegram_message_id INTEGER NOT NULL,
+                sha256 TEXT,
+                size INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                folder_id INTEGER,
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON UPDATE NO ACTION ON DELETE CASCADE
+            )
+            """.trimIndent(),
+        )
+        raw.execSQL("CREATE INDEX index_synced_files_local_path ON synced_files(local_path)")
+        raw.execSQL("CREATE INDEX index_synced_files_folder_id ON synced_files(folder_id)")
+        raw.execSQL("CREATE INDEX index_synced_files_local_path_size ON synced_files(local_path, size)")
+        raw.execSQL(
+            """
+            CREATE TABLE sync_log (
+                job_id TEXT NOT NULL PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                files_scanned INTEGER NOT NULL,
+                files_uploaded INTEGER NOT NULL,
+                files_skipped INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT
+            )
+            """.trimIndent(),
+        )
+        raw.execSQL(
+            """
+            CREATE TABLE file_cache (
+                message_id INTEGER NOT NULL PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                mime_type TEXT,
+                thumbnail_path TEXT,
+                remote_id TEXT NOT NULL,
+                date INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
+        raw.execSQL("CREATE INDEX index_file_cache_chat_id ON file_cache(chat_id)")
+        raw.execSQL("CREATE INDEX index_file_cache_date ON file_cache(date)")
+        raw.execSQL(
+            "INSERT INTO folders (channel_id, title, created_at) VALUES (500, 'V1 Archive', 100)",
+        )
+        raw.execSQL(
+            """
+            INSERT INTO file_cache (
+                message_id, chat_id, file_name, file_size, mime_type, thumbnail_path, remote_id, date
+            ) VALUES (1, 500, 'v1_invoice.pdf', 2048, 'application/pdf', NULL, 'rem_v1', 100)
+            """.trimIndent(),
+        )
+        raw.version = 1
+        raw.close()
+
+        val migrated = Room.databaseBuilder(ctx, TgDriveDatabase::class.java, dbFile.absolutePath)
+            .addMigrations(*com.tgdrive.core.db.di.DatabaseModule.ALL_MIGRATIONS)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val folder = migrated.folderDao().getByChannelId(500L)
+            assertThat(folder?.title).isEqualTo("V1 Archive")
+            assertThat(folder?.isPinnedOffline).isFalse()
+            assertThat(folder?.isVault).isFalse()
+
+            val legacyFile = migrated.fileCacheDao().getById(chatId = 500L, messageId = 1L)
+            assertThat(legacyFile?.fileName).isEqualTo("v1_invoice.pdf")
+            assertThat(legacyFile?.bucket).isEqualTo("PDF")
+            assertThat(migrated.fileCacheDao().searchFts("v1_invoice*").map { it.chatId })
+                .containsExactly(500L)
+
+            // Prove v1->v2 composite PK recreation allows same messageId in another chat
+            migrated.fileCacheDao().upsertAll(
+                listOf(
+                    FileCacheEntity(
+                        messageId = 1L,
+                        chatId = 600L,
+                        fileName = "chat600.jpg",
+                        fileSize = 512L,
+                        mimeType = "image/jpeg",
+                        thumbnailPath = null,
+                        date = 200L,
+                    ),
+                ),
+            )
+            assertThat(migrated.fileCacheDao().getById(chatId = 500L, messageId = 1L)?.fileName)
+                .isEqualTo("v1_invoice.pdf")
+            assertThat(migrated.fileCacheDao().getById(chatId = 600L, messageId = 1L)?.fileName)
+                .isEqualTo("chat600.jpg")
         } finally {
             migrated.close()
             dbFile.delete()

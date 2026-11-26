@@ -1,7 +1,6 @@
 package com.tgdrive.feature.player
 
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Bitmap
@@ -12,10 +11,8 @@ import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.WindowManager
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -324,38 +321,14 @@ class VideoPlayerViewModel @Inject constructor(
     }
 
     suspend fun saveBitmapToPublicDownloads(bitmap: Bitmap, displayName: String): Boolean = withContext(dispatchers.io) {
-        val safeName = displayName.replace(Regex("[^A-Za-z0-9._ -]"), "_").ifBlank { "frame.jpg" }
-        runCatching {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
-                    put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = appContext.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return@runCatching false
-                try {
-                    val ok = resolver.openOutputStream(uri)?.use { out ->
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                    } ?: false
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                    ok
-                } catch (t: Throwable) {
-                    runCatching { resolver.delete(uri, null, null) }
-                    throw t
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TelegramDrive")
-                    .apply { mkdirs() }
-                File(dir, safeName).outputStream().use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                }
-            }
-        }.getOrDefault(false)
+        val safeName = PublicDownloadsExporter.sanitizeFileName(displayName, fallback = "frame.jpg")
+        PublicDownloadsExporter.saveStreamToPublicDownloads(
+            ctx = appContext,
+            displayName = safeName,
+            mimeType = "image/jpeg",
+        ) { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+        }
     }
 
     suspend fun updateUserNote(chatId: Long, messageId: Long, rawNote: String): String =

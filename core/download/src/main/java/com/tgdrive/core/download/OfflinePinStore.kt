@@ -3,6 +3,7 @@ package com.tgdrive.core.download
 import android.content.Context
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.db.dao.FileCacheDao
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.withContext
@@ -25,12 +26,8 @@ class OfflinePinStore @Inject constructor(
 
     private fun prefixFor(chatId: Long, messageId: Long): String = "${chatId}_${messageId}_"
 
-    private fun sanitizeFileName(raw: String): String {
-        val leaf = raw.substringAfterLast('/').substringAfterLast('\\')
-        return leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .take(120)
-            .ifBlank { "file" }
-    }
+    private fun sanitizeFileName(raw: String): String =
+        PublicDownloadsExporter.sanitizeFileName(raw, fallback = "file").take(120)
 
     /** Fast synchronous lookup for an existing offline-pinned copy on disk. */
     fun getPinnedFilePathSync(chatId: Long, messageId: Long): String? {

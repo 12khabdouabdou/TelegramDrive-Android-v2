@@ -173,10 +173,27 @@ class FolderViewModel
         private val _pendingZipFolder = MutableStateFlow<Pair<Uri?, String?>>(null to null)
         private val _zipPreviewSummary = MutableStateFlow<ZipSelectionSummary?>(null)
         private val _zipPreviewLoading = MutableStateFlow(false)
-        private val _decryptDialog = MutableStateFlow<DecryptDialogState?>(null)
         private val _batchDecryptProgress = MutableStateFlow<Pair<Int, Int>?>(null)
-        private val _decryptedOpenEvent = MutableStateFlow<DecryptedOpenEvent?>(null)
-        val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = _decryptedOpenEvent.asStateFlow()
+
+        private val decryptFlow = DecryptFlowCoordinator(
+            scope = viewModelScope,
+            ioDispatcher = dispatchers.io,
+            downloadState = downloadManager.state,
+            detectFormat = { file -> uploadManager.detectEncryptedFormat(file) },
+            decryptFile = { encryptedFile, originalDisplayName, passphrase, saveToDownloads, chatId, messageId ->
+                uploadManager.decryptLocalFile(
+                    encryptedFile = encryptedFile,
+                    originalDisplayName = originalDisplayName,
+                    passphrase = passphrase,
+                    saveToDownloads = saveToDownloads,
+                    chatId = chatId,
+                    messageId = messageId,
+                )
+            },
+            onSavedMessage = { msg -> showSnackbar(msg) },
+            onMissingRemoteId = { msg -> _error.value = msg },
+        )
+        val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = decryptFlow.openEvent
 
         private var currentChatId: Long? = null
         private var bindResolveJob: Job? = null
@@ -186,7 +203,6 @@ class FolderViewModel
         private var searchJob: Job? = null
         private var audioPlayWaitJob: Job? = null
         private var zipInspectJob: Job? = null
-        private var decryptWaitJob: Job? = null
         private var lastTrashedBatch: List<TrashEntryEntity> = emptyList()
 
         private val _items = MutableStateFlow<List<FileCacheEntity>>(emptyList())
@@ -249,7 +265,7 @@ class FolderViewModel
                     _pendingZipFolder,
                     _zipPreviewSummary,
                     _zipPreviewLoading,
-                    _decryptDialog,
+                    decryptFlow.dialog,
                 ) { review, zipFolder, summary, summaryLoading, decrypt ->
                     FolderOverlayState(review, zipFolder, summary, summaryLoading, decrypt)
                 },
@@ -635,7 +651,7 @@ class FolderViewModel
         }
 
         fun clearDecryptedOpenEvent() {
-            _decryptedOpenEvent.value = null
+            decryptFlow.clearOpenEvent()
         }
 
         fun toggleStar(messageId: Long) {
@@ -1049,116 +1065,22 @@ class FolderViewModel
         // ---- Decryption Workflow (.tgenc) ----
 
         fun startDecryptFlow(item: FileCacheEntity) {
-            decryptWaitJob?.cancel()
-            val localPath = getLocalPath(item.messageId)
-            val localFile = localPath?.let(::File)?.takeIf { it.isFile }
-            if (localFile != null) {
-                val fmt = uploadManager.detectEncryptedFormat(localFile)
-                _decryptDialog.value = DecryptDialogState(
-                    item = item,
-                    localFile = localFile,
-                    format = fmt,
-                )
-                return
-            }
-            if (item.remoteId.isBlank()) {
-                _error.value = "File has no remote ID — can't download"
-                return
-            }
-            _decryptDialog.value = DecryptDialogState(
+            decryptFlow.start(
                 item = item,
-                downloading = true,
+                resolveLocalFile = { getLocalPath(item.messageId)?.let(::File) },
+                enqueueDownload = { downloadFile(item) },
             )
-            downloadFile(item)
-            decryptWaitJob = viewModelScope.launch(dispatchers.io) {
-                val terminal = downloadManager.state
-                    .map { st ->
-                        st.items.find { it.id == item.messageId && (it.chatId == 0L || it.chatId == item.chatId) }
-                    }
-                    .first { dl ->
-                        dl == null ||
-                            dl.status == DownloadStatus.DONE ||
-                            dl.status == DownloadStatus.FAILED ||
-                            dl.status == DownloadStatus.PAUSED ||
-                            dl.status == DownloadStatus.CANCELLED
-                    }
-                when (terminal?.status) {
-                    DownloadStatus.DONE -> {
-                        val f = terminal.localPath?.let(::File)?.takeIf { it.isFile }
-                        if (f != null) {
-                            val fmt = uploadManager.detectEncryptedFormat(f)
-                            _decryptDialog.update { cur ->
-                                cur?.copy(localFile = f, format = fmt, downloading = false, error = null)
-                            }
-                        } else {
-                            _decryptDialog.update { cur ->
-                                cur?.copy(downloading = false, error = "Downloaded file could not be opened")
-                            }
-                        }
-                    }
-                    DownloadStatus.FAILED -> {
-                        _decryptDialog.update { cur ->
-                            cur?.copy(downloading = false, error = terminal.errorMessage ?: "Download failed")
-                        }
-                    }
-                    DownloadStatus.PAUSED -> {
-                        _decryptDialog.update { cur ->
-                            cur?.copy(
-                                downloading = false,
-                                error = terminal.errorMessage ?: "Download paused (waiting for Wi-Fi)",
-                            )
-                        }
-                    }
-                    else -> {
-                        _decryptDialog.value = null
-                    }
-                }
-            }
         }
 
         fun decryptTarget(
             passphrase: String?,
             saveToDownloads: Boolean,
         ) {
-            val current = _decryptDialog.value ?: return
-            val localFile = current.localFile
-            if (localFile == null || !localFile.isFile) {
-                _decryptDialog.update { it?.copy(error = "Waiting for download to complete…") }
-                return
-            }
-            viewModelScope.launch(dispatchers.io) {
-                _decryptDialog.update { it?.copy(decrypting = true, error = null) }
-                when (
-                    val outcome = uploadManager.decryptLocalFile(
-                        encryptedFile = localFile,
-                        originalDisplayName = current.item.fileName,
-                        passphrase = passphrase,
-                        saveToDownloads = saveToDownloads,
-                        chatId = current.item.chatId,
-                        messageId = current.item.messageId,
-                    )
-                ) {
-                    is DecryptOutcome.Success -> {
-                        _decryptDialog.value = null
-                        if (saveToDownloads) {
-                            showSnackbar("Saved decrypted file: ${outcome.displayName}")
-                        } else {
-                            _decryptedOpenEvent.value = DecryptedOpenEvent(System.nanoTime(), outcome)
-                        }
-                    }
-                    is DecryptOutcome.WrongPassphrase -> {
-                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
-                    }
-                    is DecryptOutcome.Failed -> {
-                        _decryptDialog.update { it?.copy(decrypting = false, error = outcome.message) }
-                    }
-                }
-            }
+            decryptFlow.decrypt(passphrase, saveToDownloads)
         }
 
         fun dismissDecryptDialog() {
-            decryptWaitJob?.cancel()
-            _decryptDialog.value = null
+            decryptFlow.dismiss()
         }
 
         fun batchDecryptSelected(passphrase: String? = null) {
@@ -1356,42 +1278,12 @@ class FolderViewModel
                     net.lingala.zip4j.ZipFile(tempZip).use { zf ->
                         zf.addFiles(readyFiles)
                     }
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                        val values = android.content.ContentValues().apply {
-                            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, zipName)
-                            put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/zip")
-                            put(
-                                android.provider.MediaStore.Downloads.RELATIVE_PATH,
-                                "${android.os.Environment.DIRECTORY_DOWNLOADS}/TelegramDrive",
-                            )
-                            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
-                        }
-                        val resolver = appContext.contentResolver
-                        val uri = resolver.insert(
-                            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                            values,
-                        ) ?: throw IllegalStateException("Could not create Downloads entry")
-                        try {
-                            resolver.openOutputStream(uri)?.use { out ->
-                                tempZip.inputStream().use { it.copyTo(out) }
-                            }
-                            values.clear()
-                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
-                            resolver.update(uri, values, null, null)
-                        } catch (t: Throwable) {
-                            runCatching { resolver.delete(uri, null, null) }
-                            throw t
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        val dlDir = File(
-                            android.os.Environment.getExternalStoragePublicDirectory(
-                                android.os.Environment.DIRECTORY_DOWNLOADS,
-                            ),
-                            "TelegramDrive",
-                        ).apply { mkdirs() }
-                        tempZip.copyTo(File(dlDir, zipName), overwrite = true)
-                    }
+                    PublicDownloadsExporter.saveToPublicDownloads(
+                        ctx = appContext,
+                        source = tempZip,
+                        displayName = zipName,
+                        mimeType = "application/zip",
+                    ) ?: throw IllegalStateException("Could not create Downloads entry")
                     _selected.value = emptySet()
                     showSnackbar("Saved $zipName (${readyFiles.size} file(s)) to Downloads/TelegramDrive")
                 } catch (e: CancellationException) {

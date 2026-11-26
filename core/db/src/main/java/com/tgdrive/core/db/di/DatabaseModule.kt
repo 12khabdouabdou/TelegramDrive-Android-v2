@@ -31,7 +31,7 @@ object DatabaseModule {
      *
      * SQLite doesn't support ALTER TABLE PRIMARY KEY, so we recreate the table.
      */
-    private val MIGRATION_1_2 = object : Migration(1, 2) {
+    internal val MIGRATION_1_2 = object : Migration(1, 2) {
         override fun migrate(db: SupportSQLiteDatabase) {
             // Create new table with composite PK
             db.execSQL("""
@@ -60,7 +60,7 @@ object DatabaseModule {
         }
     }
 
-    private val MIGRATION_2_3 = object : Migration(2, 3) {
+    internal val MIGRATION_2_3 = object : Migration(2, 3) {
         override fun migrate(db: SupportSQLiteDatabase) {
             // Add new columns to file_cache
             db.execSQL("ALTER TABLE file_cache ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0")
@@ -321,20 +321,22 @@ object DatabaseModule {
         }
     }
 
+    internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
+        MIGRATION_1_2,
+        MIGRATION_2_3,
+        MIGRATION_3_4,
+        MIGRATION_4_5,
+        MIGRATION_5_6,
+        MIGRATION_6_7,
+        MIGRATION_7_8,
+        MIGRATION_8_9,
+    )
+
     @Provides
     @Singleton
     fun provideDatabase(@ApplicationContext ctx: Context): TgDriveDatabase =
         Room.databaseBuilder(ctx, TgDriveDatabase::class.java, TgDriveDatabase.NAME)
-            .addMigrations(
-                MIGRATION_1_2,
-                MIGRATION_2_3,
-                MIGRATION_3_4,
-                MIGRATION_4_5,
-                MIGRATION_5_6,
-                MIGRATION_6_7,
-                MIGRATION_7_8,
-                MIGRATION_8_9,
-            )
+            .addMigrations(*ALL_MIGRATIONS)
             .build()
 
     @Provides fun provideFolderDao(db: TgDriveDatabase): FolderDao = db.folderDao()

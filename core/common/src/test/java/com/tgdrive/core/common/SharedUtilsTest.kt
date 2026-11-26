@@ -39,4 +39,14 @@ class SharedUtilsTest {
         assertThat(PublicDownloadsExporter.resolveMimeType("blob.unknownext", null))
             .isEqualTo("application/octet-stream")
     }
+
+    @Test
+    fun `sanitizeSubDirectory strips traversal backslashes and illegal segments`() {
+        assertThat(PublicDownloadsExporter.sanitizeSubDirectory(null)).isEmpty()
+        assertThat(PublicDownloadsExporter.sanitizeSubDirectory("   ")).isEmpty()
+        assertThat(PublicDownloadsExporter.sanitizeSubDirectory("../../etc/passwd")).isEqualTo("etc/passwd")
+        assertThat(PublicDownloadsExporter.sanitizeSubDirectory("Archive\\sub:dir/./nested*folder/"))
+            .isEqualTo("Archive/sub_dir/nested_folder")
+        assertThat(PublicDownloadsExporter.sanitizeSubDirectory("./../..")).isEmpty()
+    }
 }

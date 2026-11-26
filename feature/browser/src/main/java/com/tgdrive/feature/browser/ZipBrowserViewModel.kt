@@ -1,14 +1,11 @@
 package com.tgdrive.feature.browser
 
-import android.content.ContentValues
 import android.content.Context
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.PublicDownloadsExporter
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DownloadItem
@@ -33,7 +30,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileInputStream
 import javax.inject.Inject
 
 /**
@@ -783,50 +779,15 @@ class ZipBrowserViewModel
             archiveFolder: String,
             relativePath: String,
         ): Boolean {
-            return runCatching {
-                val leafName = source.name
-                val subDir = relativePath.substringBeforeLast('/', "").trim('/')
-                val relDir = if (subDir.isNotEmpty()) {
-                    "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive/$archiveFolder/$subDir"
-                } else {
-                    "${Environment.DIRECTORY_DOWNLOADS}/TelegramDrive/$archiveFolder"
-                }
-                val mime = UploadManager.guessMimeType(leafName)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, leafName)
-                        put(MediaStore.Downloads.MIME_TYPE, mime)
-                        put(MediaStore.Downloads.RELATIVE_PATH, relDir)
-                        put(MediaStore.Downloads.IS_PENDING, 1)
-                    }
-                    val uri = appContext.contentResolver.insert(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                        values,
-                    ) ?: return@runCatching false
-                    try {
-                        appContext.contentResolver.openOutputStream(uri)?.use { out ->
-                            FileInputStream(source).use { input -> input.copyTo(out, 64 * 1024) }
-                        }
-                        values.clear()
-                        values.put(MediaStore.Downloads.IS_PENDING, 0)
-                        appContext.contentResolver.update(uri, values, null, null)
-                    } catch (t: Throwable) {
-                        runCatching { appContext.contentResolver.delete(uri, null, null) }
-                        throw t
-                    }
-                    true
-                } else {
-                    @Suppress("DEPRECATION")
-                    val rootDir = File(
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                        "TelegramDrive/$archiveFolder",
-                    )
-                    val target = File(rootDir, relativePath)
-                    target.parentFile?.mkdirs()
-                    source.copyTo(target, overwrite = true)
-                    true
-                }
-            }.getOrDefault(false)
+            val subDir = relativePath.substringBeforeLast('/', "").trim('/')
+            val combinedSubDir = if (subDir.isNotEmpty()) "$archiveFolder/$subDir" else archiveFolder
+            return PublicDownloadsExporter.saveToPublicDownloads(
+                ctx = appContext,
+                source = source,
+                displayName = source.name,
+                mimeType = UploadManager.guessMimeType(source.name),
+                subDirectory = combinedSubDir,
+            ) != null
         }
 
         /** Reset state for a fresh ZIP. */
