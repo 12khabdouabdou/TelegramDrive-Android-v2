@@ -93,6 +93,7 @@ class BackupOrchestratorTest {
         }
 
         every { preferences.data } returns prefsFlow
+        every { backupCrypto.hasVaultPassphrase() } returns true
         coEvery { telegramClient.myUserId() } returns 999L
         coEvery { telegramClient.maxUploadSizeBytes() } returns 2_000_000_000L
         coEvery { syncLogDao.get(any()) } returns null
@@ -307,5 +308,27 @@ class BackupOrchestratorTest {
         coVerify { fileCacheDao.upsertAll(capture(cacheEntries)) }
         assertThat(cacheEntries.single().single().isEncryptedVault).isTrue()
         assertThat(cacheEntries.single().single().fileName).isEqualTo("tax.pdf.tgenc")
+    }
+
+    @Test
+    fun `encrypted backup fails fast when PassVault passphrase is not configured`() = runTest(testDispatcher) {
+        val folderUri = "content://com.android.externalstorage.documents/tree/primary%3ADocs"
+        prefsFlow.value = prefsFlow.value.copy(
+            backupFolderUris = setOf(folderUri),
+            backupEncryptAll = true,
+        )
+        every { backupCrypto.hasVaultPassphrase() } returns false
+        val doc = LocalFile("content://doc/tax", "tax.pdf", 200L, 2_000L, "application/pdf")
+        coEvery { folderScanner.scanDetailed(folderUri, any(), any()) } returns FolderScanResult(
+            files = listOf(doc),
+            folderName = "Docs",
+        )
+
+        val outcome = orchestrator.runBackup(jobId = "job_no_passphrase", isManual = true)
+
+        assertThat(outcome).isInstanceOf(BackupOrchestrator.RunOutcome.Failed::class.java)
+        coVerify(exactly = 0) {
+            stagingManager.stageForUpload(any(), any(), any(), any(), any(), any())
+        }
     }
 }
