@@ -48,6 +48,9 @@ jobs:
 
       - name: Verify Room v9 schema export
         run: |
+          if [ ! -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json ]; then
+            ./gradlew :core:db:kspDebugKotlin --rerun-tasks --no-daemon
+          fi
           test -s core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
           ls -lh core/db/schemas/com.tgdrive.core.db.TgDriveDatabase/9.json
 
