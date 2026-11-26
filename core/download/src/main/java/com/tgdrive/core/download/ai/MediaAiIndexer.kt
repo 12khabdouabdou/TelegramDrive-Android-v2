@@ -404,70 +404,74 @@ class MediaAiIndexer @Inject constructor(
         return decodeBoundedBitmap(imageSourcePath, 1024)
     }
 
-    private suspend fun runPdfMultiPageOcr(localPath: String): String? = try {
-        val file = File(localPath)
-        if (!file.isFile || file.length() < 5L) return null
-        val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val sb = StringBuilder()
-        try {
-            pfd.use { fd ->
-                PdfRenderer(fd).use { renderer ->
-                    val pagesToScan = renderer.pageCount.coerceAtMost(MAX_PDF_OCR_PAGES)
-                    for (pageIndex in 0 until pagesToScan) {
-                        if (sb.length >= MAX_OCR_CHARS) break
-                        val bmp = renderer.openPage(pageIndex).use { page ->
-                            val scale = minOf(1024f / page.width.coerceAtLeast(1), 1024f / page.height.coerceAtLeast(1), 2f)
-                            val w = (page.width * scale).toInt().coerceIn(64, 1024)
-                            val h = (page.height * scale).toInt().coerceIn(64, 1024)
-                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { canvasBmp ->
-                                Canvas(canvasBmp).drawColor(Color.WHITE)
-                                page.render(canvasBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+    private suspend fun runPdfMultiPageOcr(localPath: String): String? {
+        return try {
+            val file = File(localPath)
+            if (!file.isFile || file.length() < 5L) return null
+            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val sb = StringBuilder()
+            try {
+                pfd.use { fd ->
+                    PdfRenderer(fd).use { renderer ->
+                        val pagesToScan = renderer.pageCount.coerceAtMost(MAX_PDF_OCR_PAGES)
+                        for (pageIndex in 0 until pagesToScan) {
+                            if (sb.length >= MAX_OCR_CHARS) break
+                            val bmp = renderer.openPage(pageIndex).use { page ->
+                                val scale = minOf(1024f / page.width.coerceAtLeast(1), 1024f / page.height.coerceAtLeast(1), 2f)
+                                val w = (page.width * scale).toInt().coerceIn(64, 1024)
+                                val h = (page.height * scale).toInt().coerceIn(64, 1024)
+                                Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { canvasBmp ->
+                                    Canvas(canvasBmp).drawColor(Color.WHITE)
+                                    page.render(canvasBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                                }
                             }
-                        }
-                        try {
-                            val pageText = runCatching {
-                                recognizer.process(InputImage.fromBitmap(bmp, 0)).awaitResult().text
-                            }.getOrElse { t ->
-                                if (t is CancellationException) throw t
-                                ""
+                            try {
+                                val pageText = runCatching {
+                                    recognizer.process(InputImage.fromBitmap(bmp, 0)).awaitResult().text
+                                }.getOrElse { t ->
+                                    if (t is CancellationException) throw t
+                                    ""
+                                }
+                                val cleaned = pageText.replace(WHITESPACE_REGEX, " ").trim()
+                                if (cleaned.isNotEmpty()) {
+                                    if (sb.isNotEmpty()) sb.append(' ')
+                                    sb.append(cleaned)
+                                }
+                            } finally {
+                                if (!bmp.isRecycled) bmp.recycle()
                             }
-                            val cleaned = pageText.replace(WHITESPACE_REGEX, " ").trim()
-                            if (cleaned.isNotEmpty()) {
-                                if (sb.isNotEmpty()) sb.append(' ')
-                                sb.append(cleaned)
-                            }
-                        } finally {
-                            if (!bmp.isRecycled) bmp.recycle()
                         }
                     }
                 }
+                sb.toString().trim().take(MAX_OCR_CHARS)
+            } finally {
+                runCatching { recognizer.close() }
             }
-            sb.toString().trim().take(MAX_OCR_CHARS)
-        } finally {
-            runCatching { recognizer.close() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
         }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (_: Throwable) {
-        null
     }
 
-    private fun extractTextSnippet(localPath: String): String = runCatching {
-        val file = File(localPath)
-        if (!file.isFile || file.length() == 0L) return ""
-        val toRead = file.length().coerceAtMost(MAX_TEXT_READ_BYTES).toInt()
-        val buf = ByteArray(toRead)
-        val actual = RandomAccessFile(file, "r").use { raf ->
-            raf.read(buf, 0, toRead)
-        }
-        if (actual <= 0) return ""
-        String(buf, 0, actual, Charsets.UTF_8)
-            .replace('\u0000', ' ')
-            .replace(WHITESPACE_REGEX, " ")
-            .trim()
-            .take(MAX_OCR_CHARS)
-    }.getOrDefault("")
+    private fun extractTextSnippet(localPath: String): String {
+        return runCatching {
+            val file = File(localPath)
+            if (!file.isFile || file.length() == 0L) return@runCatching ""
+            val toRead = file.length().coerceAtMost(MAX_TEXT_READ_BYTES).toInt()
+            val buf = ByteArray(toRead)
+            val actual = RandomAccessFile(file, "r").use { raf ->
+                raf.read(buf, 0, toRead)
+            }
+            if (actual <= 0) return@runCatching ""
+            String(buf, 0, actual, Charsets.UTF_8)
+                .replace('\u0000', ' ')
+                .replace(WHITESPACE_REGEX, " ")
+                .trim()
+                .take(MAX_OCR_CHARS)
+        }.getOrDefault("")
+    }
 
     private fun extractAudioTags(localPath: String): List<String> = runCatching {
         val retriever = MediaMetadataRetriever()
