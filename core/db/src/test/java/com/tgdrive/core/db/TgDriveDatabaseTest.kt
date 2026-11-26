@@ -536,6 +536,8 @@ class TgDriveDatabaseTest {
                     kind = "FILE",
                     chatId = 10L,
                     displayName = "doc.pdf",
+                    totalBytes = 1024L,
+                    status = "QUEUED",
                     payloadJson = "{}",
                     createdAtMs = 100L,
                 ),
