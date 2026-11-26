@@ -62,8 +62,12 @@ class BackupScheduler @Inject constructor(
             BackupSchedule.WEEKLY -> 7L * 24 * 60
             BackupSchedule.ON_CHANGE -> {
                 cancelPeriodic()
-                armContentUriTriggerIfEnabled()
-                folderWatcher.start()
+                val armed = armContentUriTriggerIfEnabled()
+                if (armed) {
+                    folderWatcher.stop()
+                } else {
+                    folderWatcher.start()
+                }
                 return
             }
             BackupSchedule.MANUAL -> {
@@ -197,11 +201,11 @@ class BackupScheduler @Inject constructor(
      * Arms a WorkManager ContentUriTrigger worker for background ON_CHANGE detection
      * across selected SAF trees and MediaStore even when the app process is terminated.
      */
-    suspend fun armContentUriTriggerIfEnabled() {
+    suspend fun armContentUriTriggerIfEnabled(): Boolean {
         val prefs = preferences.data.first()
         if (!prefs.backupEnabled || prefs.backupPaused || prefs.backupSchedule != BackupSchedule.ON_CHANGE) {
             cancelContentTrigger()
-            return
+            return false
         }
         val builder = Constraints.Builder()
             .setRequiredNetworkType(
@@ -209,8 +213,8 @@ class BackupScheduler @Inject constructor(
             )
             .setRequiresBatteryNotLow(true)
             .setRequiresCharging(prefs.backupChargingOnly)
-            .setTriggerContentUpdateDelay(15, TimeUnit.SECONDS)
-            .setTriggerContentMaxDelay(2, TimeUnit.MINUTES)
+            .setTriggerContentUpdateDelay(30, TimeUnit.SECONDS)
+            .setTriggerContentMaxDelay(5, TimeUnit.MINUTES)
 
         var triggerCount = 0
         for (raw in prefs.backupFolderUris) {
@@ -223,10 +227,18 @@ class BackupScheduler @Inject constructor(
             }
         }
         runCatching {
+            builder.addContentUriTrigger(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true)
+            triggerCount++
+        }
+        runCatching {
+            builder.addContentUriTrigger(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true)
+            triggerCount++
+        }
+        runCatching {
             builder.addContentUriTrigger(MediaStore.Files.getContentUri("external"), true)
             triggerCount++
         }
-        if (triggerCount == 0) return
+        if (triggerCount == 0) return false
 
         val req = OneTimeWorkRequestBuilder<BackupWorker>()
             .addTag(TAG)
@@ -246,6 +258,7 @@ class BackupScheduler @Inject constructor(
             req,
         )
         Log.i("BackupScheduler: armed ContentUriTrigger ($triggerCount URIs)")
+        return true
     }
 
     fun cancelContentTrigger() {

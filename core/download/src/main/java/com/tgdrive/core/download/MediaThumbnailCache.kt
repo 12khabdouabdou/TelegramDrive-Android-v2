@@ -324,7 +324,7 @@ class MediaThumbnailCache @Inject constructor(
         }.getOrNull()
     }
 
-    suspend fun ensureThumbnail(entity: FileCacheEntity): String? {
+    suspend fun ensureThumbnail(entity: FileCacheEntity, force: Boolean = false): String? {
         if (entity.thumbnailPath != null &&
             !entity.thumbnailPath!!.contains("/minithumbs/") &&
             isValidThumbnailPath(entity.thumbnailPath)
@@ -340,6 +340,9 @@ class MediaThumbnailCache @Inject constructor(
         }
 
         val key = entity.chatId to entity.messageId
+        if (force) {
+            failedAtMs.remove(key)
+        }
         val now = System.currentTimeMillis()
         val prevFail = failedAtMs[key]
         if (prevFail != null && now - prevFail < FAIL_COOLDOWN_MS) {
@@ -400,13 +403,41 @@ class MediaThumbnailCache @Inject constructor(
         if (entity.remoteId.isEmpty()) return@withContext null
 
         val bucket = classifyFile(entity.mimeType, entity.fileName)
+        if ((bucket == FileBucket.IMAGES ||
+                bucket == FileBucket.VIDEOS ||
+                bucket == FileBucket.PDF ||
+                bucket == FileBucket.DOCUMENTS) &&
+            entity.chatId != 0L &&
+            entity.messageId != 0L
+        ) {
+            val serverThumb = runCatching {
+                telegramClient.requestMessageThumbnail(entity.chatId, entity.messageId)
+            }.getOrNull()
+            if (serverThumb != null && isValidThumbnailPath(serverThumb)) {
+                runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, serverThumb) }
+                if (!serverThumb.contains("/minithumbs/")) {
+                    return@withContext serverThumb
+                }
+            }
+        }
+
         return@withContext when (bucket) {
             FileBucket.IMAGES -> {
                 if (entity.fileSize > MAX_REMOTE_IMAGE_BYTES) return@withContext null
                 semaphore.withPermit {
-                    val terminal = telegramClient.downloadFile(entity.remoteId, "")
+                    var activeRemoteId = entity.remoteId
+                    var terminal = telegramClient.downloadFile(activeRemoteId, "")
                         .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
                         .first()
+                    if (terminal !is DownloadUpdate.Done && entity.chatId != 0L && entity.messageId != 0L) {
+                        val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
+                        if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
+                            activeRemoteId = refreshed
+                            terminal = telegramClient.downloadFile(activeRemoteId, "")
+                                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                                .first()
+                        }
+                    }
                     if (terminal !is DownloadUpdate.Done) return@withPermit null
                     generateFromLocalFile(
                         entity.chatId,
@@ -419,12 +450,24 @@ class MediaThumbnailCache @Inject constructor(
             }
             FileBucket.VIDEOS -> {
                 semaphore.withPermit {
-                    val bytes = telegramClient.downloadFileRangeBytes(
-                        remoteId = entity.remoteId,
+                    var activeRemoteId = entity.remoteId
+                    var bytes = telegramClient.downloadFileRangeBytes(
+                        remoteId = activeRemoteId,
                         offset = 0L,
                         length = VIDEO_PEEK_BYTES,
-                    ) ?: return@withPermit null
-                    if (bytes.isEmpty()) return@withPermit null
+                    )
+                    if ((bytes == null || bytes.isEmpty()) && entity.chatId != 0L && entity.messageId != 0L) {
+                        val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
+                        if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
+                            activeRemoteId = refreshed
+                            bytes = telegramClient.downloadFileRangeBytes(
+                                remoteId = activeRemoteId,
+                                offset = 0L,
+                                length = VIDEO_PEEK_BYTES,
+                            )
+                        }
+                    }
+                    if (bytes == null || bytes.isEmpty()) return@withPermit null
 
                     val ext = entity.fileName.substringAfterLast('.', "mp4")
                         .lowercase()
@@ -581,7 +624,7 @@ class MediaThumbnailCache @Inject constructor(
     companion object {
         const val ENCRYPTED_THUMB_EXT = ".tgethumb"
         private const val TARGET_MAX_PX = 360
-        private const val MAX_REMOTE_IMAGE_BYTES = 15L * 1024 * 1024
+        private const val MAX_REMOTE_IMAGE_BYTES = 25L * 1024 * 1024
         private const val MAX_REMOTE_PDF_BYTES = 25L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024
         private const val FAIL_COOLDOWN_MS = 5L * 60 * 1000L

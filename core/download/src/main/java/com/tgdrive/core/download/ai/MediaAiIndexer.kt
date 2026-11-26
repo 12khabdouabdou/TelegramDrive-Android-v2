@@ -12,13 +12,16 @@ import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.label.ImageLabeler
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
+import com.tgdrive.core.common.ThermalGuard
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.db.dao.FileCacheDao
@@ -70,37 +73,68 @@ class MediaAiIndexer @Inject constructor(
     suspend fun countUnindexed(
         excludedChatIds: Set<Long> = emptySet(),
         includeLocked: Boolean = false,
+        vaultOnly: Boolean = false,
     ): Int = withContext(dispatchers.io) {
-        findIndexableCandidates(excludedChatIds, includeLocked).size
+        findIndexableCandidates(excludedChatIds, includeLocked, vaultOnly).size
     }
 
     suspend fun indexUnindexedBatch(
         excludedChatIds: Set<Long> = emptySet(),
         maxCount: Int = 30,
         includeLocked: Boolean = false,
+        vaultOnly: Boolean = false,
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
     ): Int = withContext(dispatchers.io) {
-        val candidates = findIndexableCandidates(excludedChatIds, includeLocked).take(maxCount)
+        if (ThermalGuard.isThermalThrottling(ctx)) {
+            Log.i("MediaAiIndexer: skipping batch due to device thermal state")
+            return@withContext 0
+        }
+        val candidates = findIndexableCandidates(excludedChatIds, includeLocked, vaultOnly).take(maxCount)
         if (candidates.isEmpty()) return@withContext 0
         val total = candidates.size
         val doneCounter = AtomicInteger(0)
         val successCounter = AtomicInteger(0)
-        for (entity in candidates) {
-            semaphore.withPermit {
-                val ok = runCatching { indexFile(entity) }
-                    .onFailure { t ->
-                        if (t is CancellationException) throw t
-                        Log.w("MediaAiIndexer: failed indexing ${entity.fileName}", t)
-                    }.getOrDefault(false)
-                if (ok) successCounter.incrementAndGet()
-                val done = doneCounter.incrementAndGet()
-                onProgress(done, total)
+        val sharedRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val sharedLabeler = ImageLabeling.getClient(
+            ImageLabelerOptions.Builder()
+                .setConfidenceThreshold(0.65f)
+                .build(),
+        )
+        try {
+            for (entity in candidates) {
+                if (ThermalGuard.isThermalThrottling(ctx)) {
+                    Log.i("MediaAiIndexer: stopping batch early due to thermal state")
+                    break
+                }
+                semaphore.withPermit {
+                    val ok = runCatching {
+                        indexFile(
+                            entity = entity,
+                            sharedRecognizer = sharedRecognizer,
+                            sharedLabeler = sharedLabeler,
+                        )
+                    }
+                        .onFailure { t ->
+                            if (t is CancellationException) throw t
+                            Log.w("MediaAiIndexer: failed indexing ${entity.fileName}", t)
+                        }.getOrDefault(false)
+                    if (ok) successCounter.incrementAndGet()
+                    val done = doneCounter.incrementAndGet()
+                    onProgress(done, total)
+                }
             }
+        } finally {
+            runCatching { sharedRecognizer.close() }
+            runCatching { sharedLabeler.close() }
         }
         successCounter.get()
     }
 
-    suspend fun indexFile(entity: FileCacheEntity): Boolean = withContext(dispatchers.io) {
+    suspend fun indexFile(
+        entity: FileCacheEntity,
+        sharedRecognizer: TextRecognizer? = null,
+        sharedLabeler: ImageLabeler? = null,
+    ): Boolean = withContext(dispatchers.io) {
         val privateItem = isEncryptedOrLocked(entity)
         val encryptedFile = isEncryptedItem(entity)
         val effName = effectiveFileName(entity.fileName)
@@ -176,10 +210,12 @@ class MediaAiIndexer @Inject constructor(
         }
 
         val bmp = decodeBitmapForEntity(entity, bucket, encryptedFile, localFull) ?: return@withContext false
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val ownsRecognizer = sharedRecognizer == null
+        val recognizer = sharedRecognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val shouldLabel = bucket == FileBucket.IMAGES || bucket == FileBucket.VIDEOS || (encryptedFile && bucket == FileBucket.ARCHIVES)
+        val ownsLabeler = shouldLabel && sharedLabeler == null
         val labeler = if (shouldLabel) {
-            ImageLabeling.getClient(
+            sharedLabeler ?: ImageLabeling.getClient(
                 ImageLabelerOptions.Builder()
                     .setConfidenceThreshold(0.65f)
                     .build(),
@@ -247,8 +283,8 @@ class MediaAiIndexer @Inject constructor(
             }
             true
         } finally {
-            runCatching { recognizer.close() }
-            runCatching { labeler?.close() }
+            if (ownsRecognizer) runCatching { recognizer.close() }
+            if (ownsLabeler) runCatching { labeler?.close() }
             if (!bmp.isRecycled) bmp.recycle()
         }
     }
@@ -321,11 +357,12 @@ class MediaAiIndexer @Inject constructor(
     private suspend fun findIndexableCandidates(
         excludedChatIds: Set<Long>,
         includeLocked: Boolean,
+        vaultOnly: Boolean = false,
     ): List<FileCacheEntity> {
-        val files = if (includeLocked) {
-            runCatching { fileCacheDao.getAll() }.getOrDefault(emptyList())
-        } else {
-            runCatching { fileCacheDao.getAllUnlocked() }.getOrDefault(emptyList())
+        val files = when {
+            vaultOnly -> runCatching { fileCacheDao.getEncryptedVaultFiles() }.getOrDefault(emptyList())
+            includeLocked -> runCatching { fileCacheDao.getAll() }.getOrDefault(emptyList())
+            else -> runCatching { fileCacheDao.getAllUnlocked() }.getOrDefault(emptyList())
         }
         val hasPassphrase = backupCrypto.hasVaultPassphrase()
         return files.filter { entity ->

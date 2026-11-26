@@ -1,6 +1,7 @@
 package com.tgdrive.feature.browser
 
 import android.content.Context
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import coil.annotation.ExperimentalCoilApi
@@ -61,6 +62,7 @@ internal fun buildFtsPrefixQuery(raw: String): String? {
     return if (tokens.isEmpty()) null else tokens.joinToString(" ")
 }
 
+@Immutable
 sealed class GlobalSearchUiState {
     data object Idle : GlobalSearchUiState()
     data object Searching : GlobalSearchUiState()
@@ -160,6 +162,7 @@ class GlobalSearchViewModel
         val decryptedOpenEvent: StateFlow<DecryptedOpenEvent?> = decryptFlow.openEvent
 
         @Volatile private var systemChannelId: Long? = null
+        @Volatile private var lockedFolderIds: Set<Long> = emptySet()
         @Volatile private var cachedFiles: List<FileCacheEntity> = emptyList()
         @Volatile private var cachedZipEntries: List<ZipEntryEntity> = emptyList()
         @Volatile private var cachedTrashedKeys: Set<Pair<Long, Long>> = emptySet()
@@ -191,6 +194,7 @@ class GlobalSearchViewModel
             viewModelScope.launch(dispatchers.io) {
                 preferences.data.collect { prefs ->
                     _recentQueries.value = prefs.recentSearches()
+                    lockedFolderIds = prefs.lockedFolderIdsAsLong()
                 }
             }
         }
@@ -386,7 +390,7 @@ class GlobalSearchViewModel
             searchJob = viewModelScope.launch(dispatchers.io) {
                 if (!immediate) delay(220L)
                 val trimmed = query.trim()
-                val excludedIds = systemChannelId?.let { setOf(it) } ?: emptySet()
+                val excludedIds = (systemChannelId?.let { setOf(it) } ?: emptySet()) + lockedFolderIds
                 val hasConceptExpansion = SmartSearchEngine.tokenize(parsed.textQuery)
                     .any { SearchConcepts.expandConcepts(it).isNotEmpty() }
                 val canTryFts = parsed.textQuery.isNotBlank() &&

@@ -104,6 +104,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -135,6 +136,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
@@ -213,6 +216,46 @@ fun FolderScreen(
     var renameFileTarget by remember { mutableStateOf<FileCacheEntity?>(null) }
     var showMoveChoiceDialog by remember { mutableStateOf(false) }
     var showSubfolderMovePicker by remember { mutableStateOf(false) }
+    var showSetFolderLockDialog by remember { mutableStateOf(false) }
+    var showRemoveFolderLockDialog by remember { mutableStateOf(false) }
+    var removeFolderLockError by remember { mutableStateOf<String?>(null) }
+    var lockPromptFired by remember(chatId) { mutableStateOf(false) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val folderLockTitle = stringResource(R.string.folders_lock_gate_title)
+    val folderLockSubtitle = stringResource(R.string.folders_lock_gate_subtitle, title.ifBlank { stringResource(R.string.browser_folders) })
+
+    DisposableEffect(context, state.isFolderLockedByPref) {
+        val window = context.findFolderActivity()?.window
+        val hadSecure = ((window?.attributes?.flags ?: 0) and android.view.WindowManager.LayoutParams.FLAG_SECURE) != 0
+        if (state.isFolderLockedByPref && !hadSecure) {
+            window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        onDispose {
+            if (state.isFolderLockedByPref && !hadSecure) {
+                window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, state.isFolderLockRequired) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP && state.isFolderLockRequired) {
+                lockPromptFired = false
+                vm.lockFolderView()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(state.folderLockReady, state.isFolderLockRequired, state.isFolderUnlocked, state.canUseBiometricLock) {
+        if (state.folderLockReady && state.isFolderLockRequired && !state.isFolderUnlocked && state.canUseBiometricLock && !lockPromptFired) {
+            lockPromptFired = true
+            context.findFolderFragmentActivity()?.let { activity ->
+                vm.authenticateFolder(activity, folderLockTitle, folderLockSubtitle)
+            }
+        }
+    }
 
     LaunchedEffect(snackbarEvent?.id) {
         val ev = snackbarEvent ?: return@LaunchedEffect
@@ -511,6 +554,32 @@ fun FolderScreen(
                                 ),
                             )
                         }
+                        if (state.folderLockReady) {
+                            IconButton(
+                                onClick = {
+                                    if (state.isFolderLockedByPref) {
+                                        removeFolderLockError = null
+                                        showRemoveFolderLockDialog = true
+                                    } else if (state.hasAccessPassword || (state.accessLockBiometricEnabled && state.biometricAvailable)) {
+                                        vm.setCurrentFolderLocked(true)
+                                    } else {
+                                        showSetFolderLockDialog = true
+                                    }
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = if (state.isFolderLockedByPref) Icons.Filled.Lock else Icons.Filled.LockOpen,
+                                    contentDescription = stringResource(
+                                        if (state.isFolderLockedByPref) R.string.folders_unlock_remove else R.string.folders_lock,
+                                    ),
+                                    tint = if (state.isFolderLockedByPref) {
+                                        MaterialTheme.colorScheme.tertiary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                )
+                            }
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -522,7 +591,7 @@ fun FolderScreen(
             )
         },
         floatingActionButton = {
-            if (!selectionMode) {
+            if (!selectionMode && (!state.isFolderLockRequired || state.isFolderUnlocked)) {
                 Box {
                     FloatingActionButton(
                         onClick = { showUploadMenu = true },
@@ -577,6 +646,29 @@ fun FolderScreen(
             }
         },
     ) { padding ->
+        if (state.isFolderLockRequired && !state.isFolderUnlocked) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .background(MaterialTheme.colorScheme.background),
+            ) {
+                AccessLockGate(
+                    title = folderLockTitle,
+                    subtitle = folderLockSubtitle,
+                    hasPassword = state.hasAccessPassword,
+                    canUseBiometric = state.canUseBiometricLock,
+                    error = state.lockError,
+                    onVerifyPassword = vm::unlockFolderWithPassword,
+                    onUseBiometric = {
+                        vm.clearLockError()
+                        context.findFolderFragmentActivity()?.let { activity ->
+                            vm.authenticateFolder(activity, folderLockTitle, folderLockSubtitle)
+                        }
+                    },
+                )
+            }
+        } else {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -709,6 +801,7 @@ fun FolderScreen(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 selectedIds = state.selectedIds,
+                                onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                     vm.toggleSelection(id)
@@ -742,6 +835,7 @@ fun FolderScreen(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 selectedIds = state.selectedIds,
+                                onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                     vm.toggleSelection(id)
@@ -773,6 +867,7 @@ fun FolderScreen(
                     }
                 }
             }
+        }
         }
     }
 
@@ -1127,6 +1222,77 @@ fun FolderScreen(
             },
         )
     }
+
+    if (showSetFolderLockDialog) {
+        SetAccessPasswordDialog(
+            title = stringResource(R.string.access_lock_setup_title),
+            subtitle = stringResource(R.string.access_lock_setup_subtitle),
+            hasExistingPassword = state.hasAccessPassword,
+            biometricAvailable = state.biometricAvailable,
+            biometricEnabled = state.accessLockBiometricEnabled,
+            onSave = { newPass, bioEnabled ->
+                vm.configureFolderAccessLock(
+                    newPassword = newPass,
+                    biometricEnabled = bioEnabled,
+                    lockCurrentFolder = true,
+                )
+                showSetFolderLockDialog = false
+            },
+            onDismiss = { showSetFolderLockDialog = false },
+        )
+    }
+
+    if (showRemoveFolderLockDialog) {
+        val folderDisplayTitle = title.ifBlank { stringResource(R.string.browser_folders) }
+        val wrongPwdMsg = stringResource(R.string.access_lock_wrong_password)
+        ConfirmAccessUnlockDialog(
+            title = stringResource(R.string.folders_lock_remove_title),
+            subtitle = stringResource(R.string.folders_lock_remove_subtitle, folderDisplayTitle),
+            hasPassword = state.hasAccessPassword,
+            canUseBiometric = state.canUseBiometricLock,
+            error = removeFolderLockError,
+            onVerifyPassword = { candidate ->
+                if (vm.verifyAccessPasswordSync(candidate)) {
+                    vm.setCurrentFolderLocked(false)
+                    showRemoveFolderLockDialog = false
+                    removeFolderLockError = null
+                } else {
+                    removeFolderLockError = wrongPwdMsg
+                }
+            },
+            onUseBiometric = {
+                context.findFolderFragmentActivity()?.let { act ->
+                    vm.authenticateRemoveLock(
+                        activity = act,
+                        title = context.getString(R.string.folders_lock_remove_title),
+                        subtitle = context.getString(R.string.folders_lock_remove_subtitle, folderDisplayTitle),
+                        onSuccess = {
+                            vm.setCurrentFolderLocked(false)
+                            showRemoveFolderLockDialog = false
+                            removeFolderLockError = null
+                        },
+                        onError = { msg -> removeFolderLockError = msg },
+                    )
+                }
+            },
+            onDismiss = {
+                showRemoveFolderLockDialog = false
+                removeFolderLockError = null
+            },
+        )
+    }
+}
+
+private tailrec fun Context.findFolderActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is android.content.ContextWrapper -> baseContext.findFolderActivity()
+    else -> null
+}
+
+private tailrec fun Context.findFolderFragmentActivity(): androidx.fragment.app.FragmentActivity? = when (this) {
+    is androidx.fragment.app.FragmentActivity -> this
+    is android.content.ContextWrapper -> baseContext.findFolderFragmentActivity()
+    else -> null
 }
 
 @Composable
@@ -1552,6 +1718,7 @@ private fun FileGrid(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
     selectedIds: Set<Long>,
+    onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
     onMoreClick: ((Long) -> Unit)? = null,
@@ -1580,18 +1747,19 @@ private fun FileGrid(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        items(items, key = { it.messageId }) { item ->
+        items(items, key = { it.messageId }, contentType = { "file_grid_cell" }) { item ->
             FileGridCell(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 isSelected = item.messageId in selectedIds,
+                onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
                 onMoreClick = onMoreClick?.let { { it(item.messageId) } },
             )
         }
         if (isLoadingMore) {
-            item(span = { GridItemSpan(2) }) {
+            item(span = { GridItemSpan(2) }, contentType = "loading_footer") {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1615,16 +1783,22 @@ private fun FileGridCell(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
     isSelected: Boolean,
+    onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
+    val context = LocalContext.current
     val tint = tintFor(item.mimeType, item.fileName)
     val isEnc = remember(item) {
         item.isEncryptedVault ||
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
+    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath) {
+        onRequestThumbnail(false)
+    }
+    var loadFailed by remember(item.chatId, item.messageId, item.thumbnailPath) { mutableStateOf(false) }
     val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
         if (isEnc && encryptedPreviewFingerprint != null) {
             EncryptedThumbRequest(
@@ -1637,16 +1811,22 @@ private fun FileGridCell(
             null
         }
     }
-    val thumbFile = remember(item.thumbnailPath, isEnc) {
+    val thumbRequest = remember(item.thumbnailPath, isEnc, context) {
         if (isEnc) {
             null
         } else {
             item.thumbnailPath
-                ?.takeUnless { it.endsWith(".tgethumb", ignoreCase = true) }
-                ?.let(::File)
-                ?.takeIf { it.isFile && it.length() > 0L }
+                ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+                ?.let { path ->
+                    ImageRequest.Builder(context)
+                        .data(File(path))
+                        .size(Size(360, 360))
+                        .crossfade(false)
+                        .build()
+                }
         }
     }
+    val hasImage = !loadFailed && (encThumbRequest != null || thumbRequest != null)
     val partBadge = remember(item.fileName) {
         PART_ZIP_REGEX.find(item.fileName)?.groupValues?.getOrNull(1)?.let { "P$it" }
     }
@@ -1681,12 +1861,16 @@ private fun FileGridCell(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
-                val model: Any? = encThumbRequest ?: thumbFile
+                val model: Any? = if (loadFailed) null else (encThumbRequest ?: thumbRequest)
                 if (model != null) {
                     AsyncImage(
                         model = model,
                         contentDescription = item.fileName,
                         contentScale = ContentScale.Crop,
+                        onError = {
+                            loadFailed = true
+                            onRequestThumbnail(true)
+                        },
                         modifier = Modifier.fillMaxSize(),
                     )
                 } else {
@@ -1790,7 +1974,7 @@ private fun FileGridCell(
                         Icon(
                             Icons.Filled.MoreVert,
                             contentDescription = stringResource(R.string.browser_more),
-                            tint = if (thumbFile != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (hasImage) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(18.dp),
                         )
                     }
@@ -1821,6 +2005,7 @@ private fun FileList(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
     selectedIds: Set<Long>,
+    onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
     onLongClick: (Long) -> Unit,
     onMoreClick: ((Long) -> Unit)? = null,
@@ -1847,18 +2032,19 @@ private fun FileList(
         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        items(items, key = { it.messageId }) { item ->
+        items(items, key = { it.messageId }, contentType = { "file_list_row" }) { item ->
             FileListRow(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 isSelected = item.messageId in selectedIds,
+                onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
                 onLongClick = { onLongClick(item.messageId) },
                 onMoreClick = onMoreClick?.let { { it(item.messageId) } },
             )
         }
         if (isLoadingMore) {
-            item {
+            item(contentType = "loading_footer") {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1882,16 +2068,22 @@ private fun FileListRow(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
     isSelected: Boolean,
+    onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
 ) {
+    val context = LocalContext.current
     val tint = tintFor(item.mimeType, item.fileName)
     val isEnc = remember(item) {
         item.isEncryptedVault ||
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
+    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath) {
+        onRequestThumbnail(false)
+    }
+    var loadFailed by remember(item.chatId, item.messageId, item.thumbnailPath) { mutableStateOf(false) }
     val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
         if (isEnc && encryptedPreviewFingerprint != null) {
             EncryptedThumbRequest(
@@ -1904,14 +2096,19 @@ private fun FileListRow(
             null
         }
     }
-    val thumbFile = remember(item.thumbnailPath, isEnc) {
+    val thumbRequest = remember(item.thumbnailPath, isEnc, context) {
         if (isEnc) {
             null
         } else {
             item.thumbnailPath
-                ?.takeUnless { it.endsWith(".tgethumb", ignoreCase = true) }
-                ?.let(::File)
-                ?.takeIf { it.isFile && it.length() > 0L }
+                ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+                ?.let { path ->
+                    ImageRequest.Builder(context)
+                        .data(File(path))
+                        .size(Size(160, 160))
+                        .crossfade(false)
+                        .build()
+                }
         }
     }
     val partBadge = remember(item.fileName) {
@@ -1947,7 +2144,7 @@ private fun FileListRow(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            val rowThumbModel: Any? = encThumbRequest ?: thumbFile
+            val rowThumbModel: Any? = if (loadFailed) null else (encThumbRequest ?: thumbRequest)
             if (isSelected) {
                 Icon(
                     Icons.Filled.CheckCircle,
@@ -1960,6 +2157,10 @@ private fun FileListRow(
                     model = rowThumbModel,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
+                    onError = {
+                        loadFailed = true
+                        onRequestThumbnail(true)
+                    },
                     modifier = Modifier
                         .fillMaxSize()
                         .clip(RoundedCornerShape(12.dp)),

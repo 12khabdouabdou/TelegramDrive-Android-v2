@@ -114,6 +114,7 @@ fun SettingsScreen(
     var showApiDialog by remember { mutableStateOf(false) }
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPassphraseDialog by remember { mutableStateOf(false) }
+    var showAccessPasswordDialog by remember { mutableStateOf(false) }
     var pendingEnableEncrypt by remember { mutableStateOf(false) }
     var passvaultNotice by remember { mutableStateOf<String?>(null) }
     var bioAvail by remember { mutableStateOf(vm.biometricAvailability()) }
@@ -433,6 +434,102 @@ fun SettingsScreen(
                             showPassphraseDialog = false
                         },
                     ) {
+                        Text(stringResource(R.string.settings_api_cancel))
+                    }
+                }
+            },
+        )
+    }
+
+    if (showAccessPasswordDialog) {
+        var pwdInput by remember { mutableStateOf("") }
+        var pwdConfirm by remember { mutableStateOf("") }
+        var showPwd by remember { mutableStateOf(false) }
+        var pwdErr by remember { mutableStateOf<String?>(null) }
+        val shortErr = stringResource(R.string.settings_access_lock_password_short)
+        val mismatchErr = stringResource(R.string.settings_access_lock_password_mismatch)
+
+        AlertDialog(
+            onDismissRequest = { showAccessPasswordDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    stringResource(R.string.settings_access_lock_password_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.settings_access_lock_password_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = pwdInput,
+                        onValueChange = { pwdInput = it; pwdErr = null },
+                        label = { Text(stringResource(R.string.settings_access_lock_password_label)) },
+                        singleLine = true,
+                        visualTransformation = if (showPwd) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPwd = !showPwd }) {
+                                Icon(
+                                    if (showPwd) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                    contentDescription = null,
+                                )
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = pwdConfirm,
+                        onValueChange = { pwdConfirm = it; pwdErr = null },
+                        label = { Text(stringResource(R.string.settings_access_lock_password_confirm)) },
+                        singleLine = true,
+                        visualTransformation = if (showPwd) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    pwdErr?.let {
+                        Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = pwdInput.trim()
+                        when {
+                            trimmed.length < 4 -> pwdErr = shortErr
+                            trimmed != pwdConfirm.trim() -> pwdErr = mismatchErr
+                            else -> {
+                                vm.setAccessPassword(trimmed)
+                                showAccessPasswordDialog = false
+                            }
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_api_save))
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (state.hasAccessPassword) {
+                        TextButton(
+                            onClick = {
+                                vm.clearAccessPassword()
+                                showAccessPasswordDialog = false
+                            },
+                        ) {
+                            Text(
+                                stringResource(R.string.settings_access_lock_password_remove),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                    TextButton(onClick = { showAccessPasswordDialog = false }) {
                         Text(stringResource(R.string.settings_api_cancel))
                     }
                 }
@@ -830,6 +927,120 @@ fun SettingsScreen(
                 Switch(
                     checked = state.showEncryptedPreviewsWhenUnlocked,
                     onCheckedChange = null,
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.vaultAccessLockEnabled,
+                        role = Role.Switch,
+                        onValueChange = { enabled ->
+                            val bioOk = bioAvail == BiometricHelper.Availability.AVAILABLE && state.accessLockBiometricEnabled
+                            if (enabled && !state.hasAccessPassword && !bioOk) {
+                                showAccessPasswordDialog = true
+                            } else {
+                                vm.setVaultAccessLockEnabled(enabled)
+                            }
+                        },
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_access_lock_vault),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_access_lock_vault_desc, state.lockedFolderCount),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = state.vaultAccessLockEnabled,
+                    onCheckedChange = null,
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .toggleable(
+                        value = state.accessLockBiometricEnabled,
+                        enabled = bioAvail == BiometricHelper.Availability.AVAILABLE,
+                        role = Role.Switch,
+                        onValueChange = vm::setAccessLockBiometricEnabled,
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_access_lock_fingerprint),
+                        style = TgTypography.Display.bodyMedium,
+                        color = if (bioAvail == BiometricHelper.Availability.AVAILABLE) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_access_lock_fingerprint_desc),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = state.accessLockBiometricEnabled,
+                    enabled = bioAvail == BiometricHelper.Availability.AVAILABLE,
+                    onCheckedChange = null,
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { showAccessPasswordDialog = true }
+                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text(
+                        text = stringResource(R.string.settings_access_lock_password_row),
+                        style = TgTypography.Display.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        text = stringResource(
+                            if (state.hasAccessPassword) {
+                                R.string.settings_access_lock_password_set
+                            } else {
+                                R.string.settings_access_lock_password_unset
+                            },
+                        ),
+                        style = TgTypography.Display.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Icon(
+                    Icons.Filled.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

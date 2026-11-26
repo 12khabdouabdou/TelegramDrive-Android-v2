@@ -89,6 +89,7 @@ interface TelegramClient : TelegramAuthObserver {
     suspend fun findAllSystemChannelIds(): List<Long> = emptyList()
     suspend fun downloadFileRangeBytes(remoteId: String, offset: Long, length: Long): ByteArray? = null
     suspend fun refreshMessageRemoteId(chatId: Long, messageId: Long): String? = null
+    suspend fun requestMessageThumbnail(chatId: Long, messageId: Long): String? = null
     val thumbnailUpdates: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate>
         get() = EMPTY_THUMBNAIL_UPDATES
     suspend fun close()

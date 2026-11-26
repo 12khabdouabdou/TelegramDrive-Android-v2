@@ -297,6 +297,7 @@ object SmartSearchEngine {
                         effectiveBeforeMs = effectiveBeforeMs,
                         effectiveMinSize = effectiveMinSize,
                         effectiveMaxSize = effectiveMaxSize,
+                        includeLocked = includeLocked,
                     )
                 ) {
                     continue
@@ -315,6 +316,56 @@ object SmartSearchEngine {
                 )
                 if (scored != null) {
                     hits += SmartSearchHit.CloudFileHit(file, scored.first, scored.second)
+                }
+            }
+        }
+
+        // Fallback: if NL keyword extraction (e.g. "big", "small", "private", "new") over-filtered
+        // and yielded zero matches, retry matching the raw literal query tokens without NL filters.
+        if (hits.isEmpty() && parsed.hasNaturalIntents && !parsed.hasOperators && query.isNotBlank()) {
+            val rawTokens = tokenize(query)
+            if (rawTokens.isNotEmpty()) {
+                val rawMeta = buildQueryTokenMeta(rawTokens)
+                val rawNorm = normalizeForSearch(query)
+                val parsedRawOnly = parsed.copy(
+                    extensions = emptySet(),
+                    folderFilter = null,
+                    afterEpochMs = null,
+                    beforeEpochMs = null,
+                    minSizeBytes = null,
+                    maxSizeBytes = null,
+                    requireStarred = false,
+                    requireOffline = false,
+                    requireEncrypted = false,
+                    inferredScope = null,
+                )
+                for (file in files) {
+                    if (file.chatId in excludedChatIds) continue
+                    if (!includeLocked && file.isLocked) continue
+                    if (file.fileName.endsWith(TGETHUMB_SUFFIX, ignoreCase = true)) continue
+                    if (!matchesScope(file, scope)) continue
+                    if (!matchesStructuredFilters(
+                            file = file,
+                            parsed = parsedRawOnly,
+                            criteria = criteria,
+                            effectiveAfterMs = criteria.afterEpochMs,
+                            effectiveBeforeMs = criteria.beforeEpochMs,
+                            effectiveMinSize = criteria.minSizeBytes,
+                            effectiveMaxSize = criteria.maxSizeBytes,
+                            includeLocked = includeLocked,
+                        )
+                    ) {
+                        continue
+                    }
+                    val scored = scoreCloudFileCrossField(
+                        file = file,
+                        normFullQuery = rawNorm,
+                        queryMeta = rawMeta,
+                        criteria = criteria,
+                    )
+                    if (scored != null) {
+                        hits += SmartSearchHit.CloudFileHit(file, scored.first, scored.second)
+                    }
                 }
             }
         }
@@ -402,7 +453,10 @@ object SmartSearchEngine {
     ): Pair<Int, String?>? {
         val fields = ArrayList<CandidateField>(8)
         val effName = effectiveFileName(file.fileName)
-        fields += buildField(MatchField.FILENAME, effName)
+        fields += buildField(
+            MatchField.FILENAME,
+            if (effName != file.fileName) "$effName ${file.fileName}" else effName,
+        )
         if (!file.userNote.isNullOrBlank()) {
             fields += buildField(MatchField.NOTE, file.userNote!!)
         }
@@ -635,11 +689,15 @@ object SmartSearchEngine {
         effectiveBeforeMs: Long?,
         effectiveMinSize: Long?,
         effectiveMaxSize: Long?,
+        includeLocked: Boolean,
     ): Boolean {
         if (criteria.folderChatId != null && file.chatId != criteria.folderChatId) return false
         if (parsed.requireStarred && !file.isStarred) return false
         if (parsed.requireOffline && !file.isPinnedOffline) return false
-        if (parsed.requireEncrypted && !isEncrypted(file)) return false
+        if (parsed.requireEncrypted) {
+            val matchesVault = if (includeLocked) (isEncrypted(file) || file.isLocked) else isEncrypted(file)
+            if (!matchesVault) return false
+        }
 
         if (parsed.extensions.isNotEmpty()) {
             val ext = effectiveExtension(file.fileName)
@@ -676,7 +734,9 @@ object SmartSearchEngine {
     fun effectiveBucket(file: FileCacheEntity): FileBucket {
         val name = effectiveFileName(file.fileName)
         val mime = if (isEncrypted(file)) null else file.mimeType
-        return classifyFile(mime, name)
+        val classified = classifyFile(mime, name)
+        if (classified != FileBucket.OTHER) return classified
+        return runCatching { FileBucket.valueOf(file.bucket) }.getOrDefault(FileBucket.OTHER)
     }
 
     private fun effectiveExtension(fileName: String): String {

@@ -37,7 +37,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.InsertDriveFile
@@ -47,6 +46,7 @@ import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -98,6 +98,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
@@ -140,6 +142,7 @@ fun VaultScreen(
     var decryptedImageViewerPath by remember { mutableStateOf<String?>(null) }
     var showBatchDecryptDialog by remember { mutableStateOf(false) }
     var showPassphraseDialog by remember { mutableStateOf(false) }
+    var showVaultLockDialog by remember { mutableStateOf(false) }
     var promptFired by remember { mutableStateOf(false) }
 
     val bioTitle = stringResource(R.string.vault_biometric_title)
@@ -188,8 +191,8 @@ fun VaultScreen(
         }
     }
 
-    LaunchedEffect(state.ready, state.biometricRequired, state.isUnlocked) {
-        if (state.ready && state.biometricRequired && !state.isUnlocked && !promptFired) {
+    LaunchedEffect(state.ready, state.biometricRequired, state.isUnlocked, state.canUseBiometricLock) {
+        if (state.ready && state.biometricRequired && !state.isUnlocked && state.canUseBiometricLock && !promptFired) {
             promptFired = true
             context.findFragmentActivity()?.let { activity ->
                 vm.authenticate(activity, bioTitle, bioSubtitle)
@@ -322,13 +325,26 @@ fun VaultScreen(
                                     )
                                 }
                             }
-                        } else if (state.biometricRequired) {
-                            IconButton(onClick = { vm.lock() }) {
+                        } else {
+                            IconButton(onClick = { showVaultLockDialog = true }) {
                                 Icon(
-                                    Icons.Filled.Lock,
-                                    contentDescription = stringResource(R.string.vault_lock),
-                                    tint = MaterialTheme.colorScheme.primary,
+                                    Icons.Filled.Security,
+                                    contentDescription = stringResource(R.string.vault_lock_settings),
+                                    tint = if (state.vaultAccessLockEnabled || state.biometricRequired) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
                                 )
+                            }
+                            if (state.biometricRequired) {
+                                IconButton(onClick = { vm.lock() }) {
+                                    Icon(
+                                        Icons.Filled.Lock,
+                                        contentDescription = stringResource(R.string.vault_lock),
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
                             }
                         }
                     }
@@ -370,9 +386,14 @@ fun VaultScreen(
                     }
                 }
                 state.biometricRequired && !state.isUnlocked -> {
-                    VaultLockGate(
+                    AccessLockGate(
+                        title = stringResource(R.string.vault_locked_title),
+                        subtitle = stringResource(R.string.vault_lock_subtitle),
+                        hasPassword = state.hasAccessPassword,
+                        canUseBiometric = state.canUseBiometricLock,
                         error = state.error,
-                        onUnlock = {
+                        onVerifyPassword = vm::unlockWithPassword,
+                        onUseBiometric = {
                             vm.clearError()
                             context.findFragmentActivity()?.let { activity ->
                                 vm.authenticate(activity, bioTitle, bioSubtitle)
@@ -475,7 +496,11 @@ fun VaultScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxSize(),
                         ) {
-                            items(state.filteredItems, key = { "${it.chatId}_${it.messageId}" }) { item ->
+                            items(
+                                items = state.filteredItems,
+                                key = { "${it.chatId}_${it.messageId}" },
+                                contentType = { "vault_grid_card" },
+                            ) { item ->
                                 val matchHint = state.matchHints[item.chatId to item.messageId]
                                 VaultGridCard(
                                     item = item,
@@ -677,56 +702,113 @@ fun VaultScreen(
             onDismiss = { decryptedImageViewerPath = null },
         )
     }
-}
 
-@Composable
-private fun VaultLockGate(
-    error: String?,
-    onUnlock: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(72.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.Filled.Fingerprint,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(38.dp),
+    if (showVaultLockDialog) {
+        var enableVaultLock by remember(state.vaultAccessLockEnabled) {
+            mutableStateOf(state.vaultAccessLockEnabled)
+        }
+        var showPasswordEditor by remember { mutableStateOf(false) }
+
+        if (showPasswordEditor) {
+            SetAccessPasswordDialog(
+                title = stringResource(R.string.access_lock_setup_title),
+                subtitle = stringResource(R.string.access_lock_setup_subtitle),
+                hasExistingPassword = state.hasAccessPassword,
+                biometricAvailable = state.biometricAvailable,
+                biometricEnabled = state.accessLockBiometricEnabled,
+                onSave = { newPass, bioEnabled ->
+                    vm.configureVaultLock(
+                        enableVaultLock = true,
+                        newPassword = newPass,
+                        biometricEnabled = bioEnabled,
+                    )
+                    showPasswordEditor = false
+                    showVaultLockDialog = false
+                },
+                onRemovePassword = if (state.hasAccessPassword) {
+                    {
+                        val keepLock = state.accessLockBiometricEnabled && state.biometricAvailable
+                        vm.configureVaultLock(
+                            enableVaultLock = keepLock && enableVaultLock,
+                            newPassword = null,
+                            biometricEnabled = state.accessLockBiometricEnabled,
+                            removePassword = true,
+                        )
+                        showPasswordEditor = false
+                        showVaultLockDialog = false
+                    }
+                } else {
+                    null
+                },
+                onDismiss = { showPasswordEditor = false },
             )
-        }
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = stringResource(R.string.vault_locked_title),
-            style = TgTypography.Display.headlineSmall,
-            color = MaterialTheme.colorScheme.onBackground,
-            fontWeight = FontWeight.Bold,
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = stringResource(R.string.vault_locked_desc),
-            style = TgTypography.Display.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        error?.let {
-            Spacer(Modifier.height(8.dp))
-            Text(it, style = TgTypography.Caption, color = MaterialTheme.colorScheme.error)
-        }
-        Spacer(Modifier.height(18.dp))
-        Button(onClick = onUnlock) {
-            Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(stringResource(R.string.vault_unlock))
+        } else {
+            AlertDialog(
+                onDismissRequest = { showVaultLockDialog = false },
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                title = {
+                    Text(
+                        stringResource(R.string.vault_lock_settings),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.Bold,
+                    )
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = stringResource(R.string.vault_lock_toggle_label),
+                                style = TgTypography.Display.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                            )
+                            androidx.compose.material3.Switch(
+                                checked = enableVaultLock,
+                                onCheckedChange = { next ->
+                                    if (next && !state.hasAccessPassword && !(state.accessLockBiometricEnabled && state.biometricAvailable)) {
+                                        showPasswordEditor = true
+                                    } else {
+                                        enableVaultLock = next
+                                    }
+                                },
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { showPasswordEditor = true },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(stringResource(R.string.access_lock_setup_title))
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (enableVaultLock && !state.hasAccessPassword && !(state.accessLockBiometricEnabled && state.biometricAvailable)) {
+                                showPasswordEditor = true
+                            } else {
+                                vm.configureVaultLock(
+                                    enableVaultLock = enableVaultLock,
+                                    newPassword = null,
+                                    biometricEnabled = state.accessLockBiometricEnabled,
+                                )
+                                showVaultLockDialog = false
+                            }
+                        },
+                    ) {
+                        Text(stringResource(R.string.access_lock_save))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showVaultLockDialog = false }) {
+                        Text(stringResource(R.string.browser_cancel))
+                    }
+                },
+            )
         }
     }
 }
@@ -778,6 +860,8 @@ private fun VaultGridCard(
                     .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 contentAlignment = Alignment.Center,
             ) {
+                val context = LocalContext.current
+                var loadFailed by remember(item.chatId, item.messageId, item.thumbnailPath) { mutableStateOf(false) }
                 val isEncryptedItem = remember(item) {
                     item.isEncryptedVault ||
                         BackupCrypto.isEncryptedFileName(item.fileName) ||
@@ -795,22 +879,28 @@ private fun VaultGridCard(
                         null
                     }
                 }
-                val plainThumbFile = remember(item.thumbnailPath, isEncryptedItem) {
+                val plainThumbRequest = remember(item.thumbnailPath, isEncryptedItem, context) {
                     if (isEncryptedItem) {
                         null
                     } else {
                         item.thumbnailPath
-                            ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
-                            ?.let(::File)
-                            ?.takeIf { it.isFile && it.length() > 0L }
+                            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+                            ?.let { path ->
+                                ImageRequest.Builder(context)
+                                    .data(File(path))
+                                    .size(Size(360, 360))
+                                    .crossfade(false)
+                                    .build()
+                            }
                     }
                 }
-                val thumbModel: Any? = encThumbRequest ?: plainThumbFile
+                val thumbModel: Any? = if (loadFailed) null else (encThumbRequest ?: plainThumbRequest)
                 if (thumbModel != null) {
                     AsyncImage(
                         model = thumbModel,
                         contentDescription = innerName,
                         contentScale = ContentScale.Crop,
+                        onError = { loadFailed = true },
                         modifier = Modifier.fillMaxSize(),
                     )
                 } else {

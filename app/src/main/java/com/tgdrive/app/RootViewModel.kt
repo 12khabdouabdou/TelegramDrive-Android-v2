@@ -10,7 +10,10 @@ import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.ThemeMode
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
+import com.tgdrive.core.db.dao.PendingUploadDao
 import com.tgdrive.core.download.DecryptedTempSweeper
+import com.tgdrive.core.download.DownloadManager
+import com.tgdrive.core.download.DownloadStatus
 import com.tgdrive.core.download.NormalUploadOptions
 import com.tgdrive.core.download.UploadConflictStrategy
 import com.tgdrive.core.download.UploadEncryptionSpec
@@ -25,11 +28,17 @@ import com.tgdrive.core.zip.ZipCompressionMode
 import com.tgdrive.core.zip.ZipUploader
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 
 /**
@@ -84,6 +93,7 @@ data class RootState(
     val decryptedTempTtlMinutes: Int = 30,
     val blockScreenshotsEverywhere: Boolean = false,
     val pendingShortcutRoute: String? = null,
+    val queuedOfflineOps: Int = 0,
 )
 
 @HiltViewModel
@@ -96,6 +106,8 @@ class RootViewModel @Inject constructor(
     private val cloudSyncManager: CloudSyncManager,
     private val fileCacheDao: FileCacheDao,
     private val folderDao: FolderDao,
+    private val pendingUploadDao: PendingUploadDao,
+    private val downloadManager: DownloadManager,
     private val uploadManager: UploadManager,
     private val decryptedTempSweeper: DecryptedTempSweeper,
     private val audioPlayerController: AudioPlayerController,
@@ -121,9 +133,30 @@ class RootViewModel @Inject constructor(
         observePrefs()
         observeShareFolders()
         observeNetwork()
+        observeOfflineQueueCount()
         startSplashTimer()
         checkStoredCreds()
         sweepExpiredTempFiles()
+    }
+
+    private fun observeOfflineQueueCount() {
+        viewModelScope.launch(dispatchers.io) {
+            combine(
+                pendingUploadDao.observeCount(),
+                downloadManager.state,
+            ) { pendingUploads, dlState ->
+                val activeDownloads = dlState.items.count {
+                    it.status == DownloadStatus.QUEUED ||
+                        it.status == DownloadStatus.DOWNLOADING ||
+                        it.status == DownloadStatus.PAUSED
+                }
+                pendingUploads + activeDownloads
+            }
+                .distinctUntilChanged()
+                .collect { count ->
+                    _state.update { it.copy(queuedOfflineOps = count) }
+                }
+        }
     }
 
     private fun observeShareFolders() {
@@ -141,13 +174,43 @@ class RootViewModel @Inject constructor(
 
     private fun observeThumbnailUpdates() {
         viewModelScope.launch(dispatchers.io) {
+            val mutex = Mutex()
+            val pending = LinkedHashMap<Pair<Long, Long>, String>()
+
+            suspend fun flushPending() {
+                val batch = mutex.withLock {
+                    if (pending.isEmpty()) return@withLock emptyList()
+                    val list = pending.entries.map { (k, path) ->
+                        FileCacheDao.ThumbnailPathUpdate(k.first, k.second, path)
+                    }
+                    pending.clear()
+                    list
+                }
+                if (batch.isNotEmpty()) {
+                    try {
+                        fileCacheDao.updateThumbnailPaths(batch)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w("RootViewModel: updateThumbnailPaths batch failed", t)
+                    }
+                }
+            }
+
+            launch {
+                while (isActive) {
+                    delay(250L)
+                    flushPending()
+                }
+            }
+
             telegramClient.thumbnailUpdates.collect { upd ->
-                try {
-                    fileCacheDao.updateThumbnailPath(upd.chatId, upd.messageId, upd.localPath)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (t: Throwable) {
-                    Log.w("RootViewModel: updateThumbnailPath failed", t)
+                val flushNow = mutex.withLock {
+                    pending[upd.chatId to upd.messageId] = upd.localPath
+                    pending.size >= 25
+                }
+                if (flushNow) {
+                    flushPending()
                 }
             }
         }

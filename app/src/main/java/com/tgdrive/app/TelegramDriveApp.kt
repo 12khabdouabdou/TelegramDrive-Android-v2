@@ -1,12 +1,15 @@
 package com.tgdrive.app
 
 import android.app.Application
+import android.content.ComponentCallbacks2
 import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
 import coil.ImageLoader
 import coil.ImageLoaderFactory
+import coil.annotation.ExperimentalCoilApi
 import coil.decode.VideoFrameDecoder
 import coil.disk.DiskCache
+import coil.imageLoader
 import coil.memory.MemoryCache
 import com.tgdrive.app.boot.NotificationChannels
 import com.tgdrive.app.coil.EncryptedThumbFetcher
@@ -27,6 +30,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -119,6 +123,7 @@ class TelegramDriveApp :
                           "user will see auth screen; TDLib may finish initializing in the background")
                 } else {
                     launch {
+                        delay(2_500L)
                         runCatching {
                             val limit = preferences.get().data.first().cacheLimitBytes
                             telegramClient.get().optimizeStorage(limit)
@@ -145,8 +150,9 @@ class TelegramDriveApp :
             }
         }
 
-        // Task 3: Register FolderWatcher callback + reschedule periodic & on-change work off main thread.
+        // Task 3: Defer non-critical WorkManager rescheduling so cold start UI & TDLib run uncontested.
         appScope.launch {
+            delay(2_500L)
             try {
                 registerFolderWatcherCallback()
                 backupScheduler.get().rescheduleIfEnabled()
@@ -164,6 +170,17 @@ class TelegramDriveApp :
             }
             com.tgdrive.core.download.TrashPurgeWorker.scheduleDaily(this@TelegramDriveApp)
             com.tgdrive.core.download.ai.MediaAiIndexWorker.schedulePeriodic(this@TelegramDriveApp)
+        }
+    }
+
+    @OptIn(ExperimentalCoilApi::class)
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN || level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            runCatching { mediaThumbnailCache.get().clearDecryptedMemoryCache() }
+        }
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND || level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            runCatching { applicationContext.imageLoader.memoryCache?.clear() }
         }
     }
 
@@ -201,6 +218,7 @@ class TelegramDriveApp :
                     add(coil.decode.GifDecoder.Factory())
                 }
             }
+            .allowRgb565(true)
             .memoryCache {
                 MemoryCache.Builder(this)
                     .maxSizePercent(0.25)
@@ -209,10 +227,9 @@ class TelegramDriveApp :
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDir.resolve("image_cache"))
-                    .maxSizeBytes(50L * 1024 * 1024)
+                    .maxSizeBytes(100L * 1024 * 1024)
                     .build()
             }
-            .crossfade(true)
             .build()
 
     companion object {

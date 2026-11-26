@@ -2,6 +2,7 @@ package com.tgdrive.feature.browser
 
 import android.content.Context
 import android.content.Intent
+import androidx.compose.runtime.Immutable
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -103,6 +104,7 @@ data class PlaceCluster(
     val items: List<FileCacheEntity>,
 )
 
+@Immutable
 data class PhotosTimelineUiState(
     val viewMode: PhotosViewMode = PhotosViewMode.TIMELINE,
     val sections: List<MediaDateSection> = emptyList(),
@@ -219,7 +221,13 @@ class PhotosTimelineViewModel @Inject constructor(
         fileCacheDao.observeActiveMediaItems(),
         albumDao.observeAll(),
         albumDao.observeAllItems(),
-    ) { activeMedia, albums, albumItems ->
+        preferences.data.map { it.lockedFolderIdsAsLong() }.distinctUntilChanged(),
+    ) { activeMediaRaw, albums, albumItems, lockedFolders ->
+        val activeMedia = if (lockedFolders.isEmpty()) {
+            activeMediaRaw
+        } else {
+            activeMediaRaw.filterNot { it.chatId in lockedFolders }
+        }
         var queued = 0
         for (item in activeMedia) {
             if (queued >= 24) break

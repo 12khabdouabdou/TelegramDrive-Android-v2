@@ -99,7 +99,7 @@ android {
             pickFirsts += "**/libtdjni.so"
         }
         jniLibs {
-            useLegacyPackaging = true
+            useLegacyPackaging = false
         }
     }
 

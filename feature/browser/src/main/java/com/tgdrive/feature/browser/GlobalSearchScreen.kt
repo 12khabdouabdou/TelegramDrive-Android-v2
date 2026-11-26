@@ -84,6 +84,8 @@ import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.common.classifyFile
@@ -580,6 +582,12 @@ fun GlobalSearchScreen(
                                             "z_${hit.entry.chatId}_${hit.entry.zipMessageId}_${hit.entry.entryPath}"
                                     }
                                 },
+                                contentType = { hit ->
+                                    when (hit) {
+                                        is SmartSearchHit.CloudFileHit -> "search_cloud_hit"
+                                        is SmartSearchHit.ZipMemberHit -> "search_zip_hit"
+                                    }
+                                },
                             ) { hit ->
                                 when (hit) {
                                     is SmartSearchHit.CloudFileHit -> {
@@ -918,11 +926,18 @@ private fun CloudFileResultRow(
             null
         }
     }
-    val plainThumbFile = remember(msg.thumbnailPath) {
+    val context = LocalContext.current
+    var loadFailed by remember(msg.thumbnailPath) { mutableStateOf(false) }
+    val plainThumbRequest = remember(msg.thumbnailPath, context) {
         msg.thumbnailPath
-            ?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
-            ?.let(::File)
-            ?.takeIf { it.isFile && it.length() > 0L }
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(160, 160))
+                    .crossfade(false)
+                    .build()
+            }
     }
     Row(
         modifier = Modifier
@@ -940,12 +955,13 @@ private fun CloudFileResultRow(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            val imageModel: Any? = encThumbRequest ?: plainThumbFile
+            val imageModel: Any? = if (loadFailed) null else (encThumbRequest ?: plainThumbRequest)
             if (imageModel != null) {
                 AsyncImage(
                     model = imageModel,
                     contentDescription = msg.fileName,
                     contentScale = ContentScale.Crop,
+                    onError = { loadFailed = true },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {

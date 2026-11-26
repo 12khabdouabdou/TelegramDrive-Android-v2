@@ -107,6 +107,8 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.db.entity.FileCacheEntity
@@ -719,6 +721,7 @@ fun PhotosTimelineScreen(
                                         items(
                                             items = section.items,
                                             key = { "media_${it.chatId}_${it.messageId}" },
+                                            contentType = { "timeline_media_tile" },
                                         ) { item ->
                                             val key = item.chatId to item.messageId
                                             val isSelected = key in state.selectedIds
@@ -1095,9 +1098,19 @@ private fun MediaGridTile(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
+    val context = LocalContext.current
     val isVideo = classifyFile(item.mimeType, item.fileName) == FileBucket.VIDEOS
-    val thumbFile = remember(item.thumbnailPath) {
-        item.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    var loadFailed by remember(item.thumbnailPath) { mutableStateOf(false) }
+    val thumbRequest = remember(item.thumbnailPath, context) {
+        item.thumbnailPath
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(360, 360))
+                    .crossfade(false)
+                    .build()
+            }
     }
     Box(
         modifier = Modifier
@@ -1113,11 +1126,12 @@ private fun MediaGridTile(
             )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
-        if (thumbFile != null) {
+        if (!loadFailed && thumbRequest != null) {
             AsyncImage(
-                model = thumbFile,
+                model = thumbRequest,
                 contentDescription = item.fileName,
                 contentScale = ContentScale.Crop,
+                onError = { loadFailed = true },
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(if (isSelected) 4.dp else 0.dp),

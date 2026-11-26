@@ -84,6 +84,7 @@ import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.toHumanSize
@@ -236,6 +237,7 @@ fun ImagePlayerScreen(
     ) {
         HorizontalPager(
             state = pagerState,
+            beyondViewportPageCount = 1,
             userScrollEnabled = !isCurrentZoomed && pages.size > 1,
             modifier = Modifier
                 .fillMaxSize()
@@ -256,7 +258,7 @@ fun ImagePlayerScreen(
                     downloadItem?.status == DownloadStatus.QUEUED
             val isFailed = downloadItem?.status == DownloadStatus.FAILED
             val downloadProgress = downloadItem?.progress?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
-            val fileReady = pagePath != null && runCatching { File(pagePath).exists() }.getOrDefault(false)
+            val fileReady = pagePath != null
 
             when {
                 isVideoPage -> {
@@ -329,32 +331,63 @@ fun ImagePlayerScreen(
                     }
                 }
                 isDownloading || ref.entity != null -> {
-                    Column(
-                        modifier = Modifier.fillMaxSize().padding(32.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
+                    val previewPath = ref.entity?.thumbnailPath?.takeIf {
+                        it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable { showChrome = !showChrome },
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            Icons.Filled.Image,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(48.dp),
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.height(12.dp))
-                        Text(
-                            text = stringResource(R.string.player_downloading_pct, (downloadProgress * 100).toInt()),
-                            color = Color.White,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        LinearProgressIndicator(
-                            progress = { downloadProgress },
-                            color = MaterialTheme.colorScheme.primary,
-                            trackColor = Color.White.copy(alpha = 0.2f),
-                            modifier = Modifier.fillMaxWidth(0.7f).clip(RoundedCornerShape(4.dp)),
-                        )
+                        if (previewPath != null) {
+                            AsyncImage(
+                                model = remember(previewPath, context) {
+                                    ImageRequest.Builder(context)
+                                        .data(File(previewPath))
+                                        .crossfade(true)
+                                        .build()
+                                },
+                                contentDescription = ref.entity?.fileName,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.68f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.padding(24.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                if (previewPath == null) {
+                                    Icon(
+                                        Icons.Filled.Image,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(40.dp),
+                                    )
+                                }
+                                CircularProgressIndicator(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(28.dp),
+                                )
+                                Text(
+                                    text = stringResource(R.string.player_downloading_pct, (downloadProgress * 100).toInt()),
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                LinearProgressIndicator(
+                                    progress = { downloadProgress },
+                                    color = MaterialTheme.colorScheme.primary,
+                                    trackColor = Color.White.copy(alpha = 0.25f),
+                                    modifier = Modifier.fillMaxWidth(0.55f).clip(RoundedCornerShape(4.dp)),
+                                )
+                            }
+                        }
                     }
                 }
                 else -> {

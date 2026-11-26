@@ -419,4 +419,27 @@
     <string name="folders_sort_size">Largest size</string>
     <string name="folders_sort_files">Most files</string>
     <string name="folders_create_action">Create</string>
+    <string name="folders_lock">Lock folder</string>
+    <string name="folders_unlock_remove">Remove folder lock</string>
+    <string name="folders_lock_gate_title">Locked Folder</string>
+    <string name="folders_lock_gate_subtitle">Authenticate to view files in %1$s</string>
+    <string name="folders_lock_remove_title">Remove folder lock</string>
+    <string name="folders_lock_remove_subtitle">Verify your identity to remove the lock on %1$s</string>
+    <string name="folders_locked_badge">Locked</string>
+    <string name="access_lock_setup_title">Lock with password or fingerprint</string>
+    <string name="access_lock_setup_subtitle">Protect Private Vault and chosen folders on this device</string>
+    <string name="access_lock_password_label">Password or PIN</string>
+    <string name="access_lock_new_password_optional">New password (leave empty to keep current)</string>
+    <string name="access_lock_password_confirm">Confirm password</string>
+    <string name="access_lock_password_short">Use at least %1$d characters</string>
+    <string name="access_lock_password_mismatch">Passwords do not match</string>
+    <string name="access_lock_wrong_password">Incorrect password</string>
+    <string name="access_lock_need_method">Set a password or enable fingerprint unlock</string>
+    <string name="access_lock_enable_fingerprint">Allow fingerprint / device unlock</string>
+    <string name="access_lock_use_fingerprint">Use fingerprint</string>
+    <string name="access_lock_save">Save lock</string>
+    <string name="access_lock_remove_password">Remove password</string>
+    <string name="vault_lock_settings">Vault lock settings</string>
+    <string name="vault_lock_toggle_label">Require lock to open Private Vault</string>
+    <string name="vault_lock_subtitle">Enter password or verify fingerprint to open Private Vault</string>
 </resources>

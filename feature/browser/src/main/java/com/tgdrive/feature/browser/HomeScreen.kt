@@ -94,6 +94,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.toHumanSize
@@ -388,7 +390,11 @@ fun HomeScreen(
                         contentPadding = PaddingValues(horizontal = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        items(state.starredFiles.take(10), key = { "star_${it.messageId}_${it.chatId}" }) { file ->
+                        items(
+                            items = state.starredFiles.take(10),
+                            key = { "star_${it.messageId}_${it.chatId}" },
+                            contentType = { "home_starred_card" },
+                        ) { file ->
                             StarredCard(file) {
                                 vm.openOrPreviewFile(
                                     file = file,
@@ -408,7 +414,11 @@ fun HomeScreen(
             // Recent files
             if (state.recentFiles.isNotEmpty()) {
                 item { SectionHeader(title = stringResource(R.string.browser_recent_files)) }
-                items(state.recentFiles.take(5), key = { "recent_${it.messageId}_${it.chatId}" }) { file ->
+                items(
+                    items = state.recentFiles.take(5),
+                    key = { "recent_${it.messageId}_${it.chatId}" },
+                    contentType = { "home_recent_row" },
+                ) { file ->
                     FileRow(file) {
                         vm.openOrPreviewFile(
                             file = file,
@@ -426,7 +436,7 @@ fun HomeScreen(
             // Folders
             item { SectionHeader(title = stringResource(R.string.browser_folders)) }
             if (state.folders.isNotEmpty()) {
-                items(state.folders, key = { it.id }) { folder ->
+                items(state.folders, key = { it.id }, contentType = { "home_folder" }) { folder ->
                     val size = state.folderSizes[folder.channelId] ?: 0L
                     FolderRow(
                         title = folder.title,
@@ -437,6 +447,7 @@ fun HomeScreen(
                         },
                         icon = Icons.Filled.Folder,
                         tint = Color(folder.color),
+                        isLocked = folder.channelId in state.lockedFolderChatIds,
                         onClick = { onOpenFolder(folder.channelId, folder.title) },
                     )
                 }
@@ -455,6 +466,7 @@ fun HomeScreen(
                     },
                     icon = Icons.Filled.Bookmark,
                     tint = MaterialTheme.colorScheme.primary,
+                    isLocked = ready && state.savedMessagesChatId in state.lockedFolderChatIds,
                     enabled = ready,
                     onClick = { onOpenFolder(state.savedMessagesChatId, savedTitle) },
                 )
@@ -859,9 +871,19 @@ private fun StarredCard(
     file: FileCacheEntity,
     onClick: () -> Unit,
 ) {
+    val context = LocalContext.current
     val (icon, tint) = fileTypeVisual(file)
-    val thumbFile = remember(file.thumbnailPath) {
-        file.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    var loadFailed by remember(file.thumbnailPath) { mutableStateOf(false) }
+    val thumbRequest = remember(file.thumbnailPath, context) {
+        file.thumbnailPath
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(360, 360))
+                    .crossfade(false)
+                    .build()
+            }
     }
     GlassPanel(
         modifier = Modifier
@@ -870,7 +892,7 @@ private fun StarredCard(
             .clickable(onClick = onClick),
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
-            if (thumbFile != null) {
+            if (!loadFailed && thumbRequest != null) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -879,9 +901,10 @@ private fun StarredCard(
                         .background(MaterialTheme.colorScheme.surfaceContainerLow),
                 ) {
                     AsyncImage(
-                        model = thumbFile,
+                        model = thumbRequest,
                         contentDescription = file.fileName,
                         contentScale = ContentScale.Crop,
+                        onError = { loadFailed = true },
                         modifier = Modifier.fillMaxSize(),
                     )
                     Box(
@@ -959,9 +982,19 @@ private fun FileRow(
     file: FileCacheEntity,
     onClick: () -> Unit,
 ) {
+    val context = LocalContext.current
     val (icon, tint) = fileTypeVisual(file)
-    val thumbFile = remember(file.thumbnailPath) {
-        file.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    var loadFailed by remember(file.thumbnailPath) { mutableStateOf(false) }
+    val thumbRequest = remember(file.thumbnailPath, context) {
+        file.thumbnailPath
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(160, 160))
+                    .crossfade(false)
+                    .build()
+            }
     }
     GlassPanel(
         modifier = Modifier
@@ -981,11 +1014,12 @@ private fun FileRow(
                     .background(tint.copy(alpha = 0.15f)),
                 contentAlignment = Alignment.Center,
             ) {
-                if (thumbFile != null) {
+                if (!loadFailed && thumbRequest != null) {
                     AsyncImage(
-                        model = thumbFile,
+                        model = thumbRequest,
                         contentDescription = file.fileName,
                         contentScale = ContentScale.Crop,
+                        onError = { loadFailed = true },
                         modifier = Modifier.fillMaxSize(),
                     )
                 } else {
@@ -1029,6 +1063,7 @@ private fun FolderRow(
     subtitle: String,
     icon: ImageVector,
     tint: Color,
+    isLocked: Boolean = false,
     enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
@@ -1071,6 +1106,16 @@ private fun FolderRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (isLocked) {
+                Icon(
+                    Icons.Filled.Lock,
+                    contentDescription = stringResource(R.string.folders_locked_badge),
+                    tint = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier
+                        .padding(end = 6.dp)
+                        .size(16.dp),
                 )
             }
             Icon(

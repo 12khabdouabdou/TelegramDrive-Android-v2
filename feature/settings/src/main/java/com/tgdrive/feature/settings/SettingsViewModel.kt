@@ -25,6 +25,7 @@ import com.tgdrive.core.download.OfflinePinStore
 import com.tgdrive.core.download.PassVaultCloudVerifier
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.AccessLockManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.security.KeystoreHelper
@@ -78,6 +79,10 @@ data class SettingsUiState(
     val autoSaveDownloadsToPublic: Boolean = false,
     val tempDecryptedCount: Int = 0,
     val tempDecryptedBytes: Long = 0L,
+    val vaultAccessLockEnabled: Boolean = false,
+    val accessLockBiometricEnabled: Boolean = true,
+    val hasAccessPassword: Boolean = false,
+    val lockedFolderCount: Int = 0,
 )
 
 @HiltViewModel
@@ -85,6 +90,7 @@ class SettingsViewModel @Inject constructor(
     private val preferences: AppPreferences,
     private val keystore: KeystoreHelper,
     private val backupCrypto: BackupCrypto,
+    private val accessLockManager: AccessLockManager,
     private val biometricHelper: BiometricHelper,
     private val telegramClient: TelegramClient,
     private val downloadManager: DownloadManager,
@@ -156,6 +162,10 @@ class SettingsViewModel @Inject constructor(
             autoSaveDownloadsToPublic = p.autoSaveDownloadsToPublic,
             tempDecryptedCount = tempCount,
             tempDecryptedBytes = tempBytes,
+            vaultAccessLockEnabled = p.vaultAccessLockEnabled,
+            accessLockBiometricEnabled = p.accessLockBiometricEnabled,
+            hasAccessPassword = accessLockManager.hasPassword(),
+            lockedFolderCount = p.lockedFolderChatIds.size,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
@@ -297,6 +307,29 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             preferences.update { it.copy(showEncryptedPreviewsWhenUnlocked = enabled) }
         }
+    }
+
+    fun setVaultAccessLockEnabled(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(vaultAccessLockEnabled = enabled) }
+        }
+    }
+
+    fun setAccessLockBiometricEnabled(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            preferences.update { it.copy(accessLockBiometricEnabled = enabled) }
+        }
+    }
+
+    fun setAccessPassword(password: String): Boolean {
+        val ok = accessLockManager.setPassword(password)
+        if (ok) _vaultVersion.value += 1
+        return ok
+    }
+
+    fun clearAccessPassword() {
+        accessLockManager.clearPassword()
+        _vaultVersion.value += 1
     }
 
     fun setDownloadConcurrency(concurrency: Int) {

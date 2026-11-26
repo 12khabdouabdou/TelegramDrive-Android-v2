@@ -1,6 +1,9 @@
 package com.tgdrive.app.nav
 
 import android.net.Uri
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -98,7 +101,14 @@ fun RootNavHost(
         val playLocalAudio: (String, String) -> Unit = { path, name ->
             rootVm.playLocalAudio(path, name)
         }
-        NavHost(navController = nav, startDestination = initialRoute) {
+        NavHost(
+            navController = nav,
+            startDestination = initialRoute,
+            enterTransition = { fadeIn(animationSpec = tween(200)) },
+            exitTransition = { fadeOut(animationSpec = tween(180)) },
+            popEnterTransition = { fadeIn(animationSpec = tween(200)) },
+            popExitTransition = { fadeOut(animationSpec = tween(180)) },
+        ) {
             composable("onboarding") {
                 OnboardingScreen(
                     onDone = {

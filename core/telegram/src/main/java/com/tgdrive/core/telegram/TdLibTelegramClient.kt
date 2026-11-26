@@ -1109,6 +1109,59 @@ class TdLibTelegramClient(
         }
     }
 
+    override suspend fun requestMessageThumbnail(chatId: Long, messageId: Long): String? = withContext(dispatchers.io) {
+        if (chatId == 0L || messageId == 0L || client == null) return@withContext null
+        try {
+            runCatching { send<TdApi.Chat>(TdApi.GetChat(chatId)) }
+            val tdMsg = send<TdApi.Message>(TdApi.GetMessage(chatId, messageId))
+            val thumbFileId = tdMsg.extractThumbnailFileId()
+            if (thumbFileId != null && thumbFileId != 0) {
+                if (tdMsg.isThumbnailDownloaded()) {
+                    val existing = tdMsg.toDomainFile()?.thumbnailPath
+                    if (!existing.isNullOrBlank()) {
+                        val f = File(existing)
+                        if (f.isFile && f.length() > 0L) return@withContext existing
+                    }
+                }
+                val dl = withTimeoutOrNull(8_000L) {
+                    send<TdApi.File>(TdApi.DownloadFile(thumbFileId, 24, 0, 0, true))
+                }
+                val path = dl?.local?.path.orEmpty()
+                if (dl?.local?.isDownloadingCompleted == true && path.isNotEmpty()) {
+                    val f = File(path)
+                    if (f.isFile && f.length() > 0L) {
+                        _thumbnailUpdates.tryEmit(ThumbnailUpdate(chatId, messageId, path))
+                        return@withContext path
+                    }
+                }
+            }
+            val domain = tdMsg.toDomainFile()
+            val miniBytes = domain?.minithumbnailBytes
+            if (miniBytes != null && miniBytes.isNotEmpty()) {
+                val miniDir = File(appContext.cacheDir, "minithumbs").apply { mkdirs() }
+                val miniFile = File(miniDir, "${chatId}_${messageId}.jpg")
+                if (!miniFile.isFile || miniFile.length() <= 0L) {
+                    val tmp = File(miniDir, "${chatId}_${messageId}.tmp")
+                    tmp.writeBytes(miniBytes)
+                    if (miniFile.exists()) miniFile.delete()
+                    if (!tmp.renameTo(miniFile)) {
+                        tmp.copyTo(miniFile, overwrite = true)
+                        tmp.delete()
+                    }
+                }
+                if (miniFile.isFile && miniFile.length() > 0L) {
+                    return@withContext miniFile.absolutePath
+                }
+            }
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.w("requestMessageThumbnail failed for chat=$chatId msg=$messageId", t)
+            null
+        }
+    }
+
     override fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate> = flow {
         if (remoteId.isEmpty()) {
             emit(DownloadUpdate.Failed("File has no remote ID"))

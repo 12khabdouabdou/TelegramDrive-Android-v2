@@ -2,6 +2,7 @@ package com.tgdrive.feature.browser
 
 import android.content.Context
 import android.net.Uri
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.CrashLogStore
@@ -27,7 +28,9 @@ import com.tgdrive.core.download.UploadFileItem
 import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.AccessLockManager
 import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.zip.ZipExcludeMatcher
 import com.tgdrive.core.zip.ZipSelectionSummary
@@ -44,6 +47,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -53,6 +57,7 @@ import javax.inject.Inject
 
 enum class FolderListSort { DEFAULT, NAME_ASC, SIZE_DESC, FILES_DESC }
 
+@Immutable
 data class HomeUiState(
     val folders: List<FolderEntity> = emptyList(),
     val pinnedFolderChatIds: Set<Long> = emptySet(),
@@ -75,6 +80,10 @@ data class HomeUiState(
     val hasSavedPassphrase: Boolean = false,
     val cloudSyncing: Boolean = false,
     val lastCloudSyncMs: Long = 0L,
+    val lockedFolderChatIds: Set<Long> = emptySet(),
+    val hasAccessPassword: Boolean = false,
+    val accessLockBiometricEnabled: Boolean = true,
+    val biometricAvailable: Boolean = false,
 )
 
 private data class HomeDashboardStats(
@@ -107,10 +116,13 @@ class HomeViewModel
         private val uploadManager: UploadManager,
         private val mediaThumbnailCache: MediaThumbnailCache,
         private val backupCrypto: BackupCrypto,
+        private val accessLockManager: AccessLockManager,
+        private val biometricHelper: BiometricHelper,
         private val preferences: AppPreferences,
         private val dispatchers: DispatchersProvider,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
+        private val _lockConfigVersion = MutableStateFlow(0)
         private val _loading = MutableStateFlow(false)
         private val _error = MutableStateFlow<String?>(null)
         private val _snackbar = MutableStateFlow<String?>(null)
@@ -132,7 +144,9 @@ class HomeViewModel
 
         val state: StateFlow<HomeUiState> =
             combine(
-                combine(folderDao.observeAll(), preferences.data) { folders, prefs -> folders to prefs },
+                combine(folderDao.observeAll(), preferences.data, _lockConfigVersion) { folders, prefs, _ ->
+                    folders to prefs
+                },
                 combine(_loading, _error, _savedChatId, _dashboard, _folderSort) { loading, error, savedId, dash, sort ->
                     listOf(loading, error, savedId, dash, sort)
                 },
@@ -148,6 +162,7 @@ class HomeViewModel
                 val dash = mid[3] as HomeDashboardStats
                 val sort = mid[4] as FolderListSort
                 val pinned = prefs.pinnedFolderChatIds.mapNotNull { it.toLongOrNull() }.toSet()
+                val lockedFolders = prefs.lockedFolderIdsAsLong()
                 val sortedFolders = folders.sortedWith(
                     Comparator { a, b ->
                         val pinCmp = (if (b.channelId in pinned) 1 else 0)
@@ -177,14 +192,18 @@ class HomeViewModel
                     totalFiles = dash.totalFiles,
                     categoryCounts = dash.categoryCounts,
                     categoryTargets = dash.categoryTargets,
-                    recentFiles = dash.recentFiles,
-                    starredFiles = dash.starredFiles,
+                    recentFiles = dash.recentFiles.filterNot { it.chatId in lockedFolders },
+                    starredFiles = dash.starredFiles.filterNot { it.chatId in lockedFolders },
                     trashCount = trashCount,
                     encryptedVaultCount = vaultCount,
                     manualUploadWifiOnly = prefs.manualUploadWifiOnly,
                     hasSavedPassphrase = backupCrypto.hasVaultPassphrase(),
                     cloudSyncing = syncing,
                     lastCloudSyncMs = prefs.lastCloudSyncMs,
+                    lockedFolderChatIds = lockedFolders,
+                    hasAccessPassword = accessLockManager.hasPassword(),
+                    accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
+                    biometricAvailable = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE,
                 )
             }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUiState())
 
@@ -212,6 +231,7 @@ class HomeViewModel
                     val folderSizes = aggregates.associate { it.chatId to it.totalBytes }
                     val folderFileCounts = aggregates.associate { it.chatId to it.fileCount }
                     val grand = fileCacheDao.grandTotal()
+                    val lockedIds = preferences.data.first().lockedFolderIdsAsLong()
                     val recent = fileCacheDao.getRecent()
                     val starred = fileCacheDao.getStarred()
                     val foldersByChat = folderDao.getAll().associateBy { it.channelId }
@@ -220,6 +240,7 @@ class HomeViewModel
                     val counts = mutableMapOf<FileFilter, Int>()
                     val perChatFilterCounts = mutableMapOf<FileFilter, MutableMap<Long, Int>>()
                     for (row in fileCacheDao.chatBucketCounts()) {
+                        if (row.chatId in lockedIds) continue
                         val bucket = runCatching { FileBucket.valueOf(row.bucket) }.getOrNull() ?: continue
                         val filter = when (bucket) {
                             FileBucket.IMAGES -> FileFilter.IMAGES
@@ -476,6 +497,51 @@ class HomeViewModel
             viewModelScope.launch(dispatchers.io) {
                 preferences.update { it.withToggledPinnedFolder(channelId) }
             }
+        }
+
+        fun setFolderLocked(channelId: Long, locked: Boolean) {
+            viewModelScope.launch(dispatchers.io) {
+                preferences.update { it.withFolderLocked(channelId, locked) }
+                _lockConfigVersion.value += 1
+            }
+        }
+
+        fun configureAccessLock(
+            newPassword: String?,
+            biometricEnabled: Boolean,
+            removePassword: Boolean = false,
+            alsoLockChatId: Long? = null,
+        ) {
+            viewModelScope.launch(dispatchers.io) {
+                if (removePassword) {
+                    accessLockManager.clearPassword()
+                } else if (!newPassword.isNullOrBlank()) {
+                    accessLockManager.setPassword(newPassword)
+                }
+                preferences.update { prefs ->
+                    val updated = prefs.copy(accessLockBiometricEnabled = biometricEnabled)
+                    if (alsoLockChatId != null) updated.withFolderLocked(alsoLockChatId, true) else updated
+                }
+                _lockConfigVersion.value += 1
+            }
+        }
+
+        fun verifyAccessPassword(candidate: String): Boolean = accessLockManager.verifyPassword(candidate)
+
+        fun authenticateBiometric(
+            activity: androidx.fragment.app.FragmentActivity,
+            title: String,
+            subtitle: String,
+            onSuccess: () -> Unit,
+            onError: (String) -> Unit,
+        ) {
+            biometricHelper.authenticate(
+                activity = activity,
+                title = title,
+                subtitle = subtitle,
+                onSuccess = onSuccess,
+                onError = onError,
+            )
         }
 
         fun setFolderSort(sort: FolderListSort) {

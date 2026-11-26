@@ -8,7 +8,12 @@ import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSpec
 import com.tgdrive.core.telegram.StreamFileState
 import com.tgdrive.core.telegram.TelegramClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -34,6 +39,9 @@ class TdLibVideoDataSource(
     private var closed: Boolean = false
     @Volatile
     private var activeJob: Job? = null
+    @Volatile
+    private var lastLookaheadOffset: Long = -1L
+    private val lookaheadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var totalSize: Long = 0L
     private var position: Long = 0L
     private var bytesRemaining: Long = 0L
@@ -179,6 +187,22 @@ class TdLibVideoDataSource(
                 )
         ) {
             cachedState = refreshed
+            if (!refreshed.isCompleted && !closed) {
+                val nextOffset = targetOffset + chunkLen
+                if ((totalSize <= 0L || nextOffset < totalSize) && lastLookaheadOffset != nextOffset) {
+                    lastLookaheadOffset = nextOffset
+                    val nextLen = if (totalSize > 0L) {
+                        minOf(PREFETCH_CHUNK_BYTES, (totalSize - nextOffset).coerceAtLeast(1L))
+                    } else {
+                        PREFETCH_CHUNK_BYTES
+                    }
+                    lookaheadScope.launch {
+                        runCatching {
+                            telegramClient.ensureFileRangeDownloaded(fileId, nextOffset, nextLen)
+                        }
+                    }
+                }
+            }
             return refreshed
         }
         return null
@@ -200,6 +224,7 @@ class TdLibVideoDataSource(
         closed = true
         activeJob?.cancel()
         activeJob = null
+        lookaheadScope.cancel()
         dataUri = null
         cachedState = null
         openedPath = null

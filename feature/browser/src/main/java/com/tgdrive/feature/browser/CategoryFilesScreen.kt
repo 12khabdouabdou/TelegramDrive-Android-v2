@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,6 +60,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -68,6 +70,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Size
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.classifyFile
@@ -107,6 +111,7 @@ import java.io.File
 import java.util.Collections
 import javax.inject.Inject
 
+@Immutable
 data class CategoryFilesUiState(
     val filter: FileFilter = FileFilter.VIDEOS,
     val items: List<FileCacheEntity> = emptyList(),
@@ -178,6 +183,14 @@ class CategoryFilesViewModel @Inject constructor(
         }
     }
 
+    private data class CategoryControls(
+        val filter: FileFilter,
+        val query: String,
+        val sort: FileSort,
+        val viewMode: FileViewMode,
+        val lockedFolderIds: Set<Long>,
+    )
+
     val state: StateFlow<CategoryFilesUiState> = combine(
         combine(
             activeCategoryFilesFlow,
@@ -188,12 +201,16 @@ class CategoryFilesViewModel @Inject constructor(
             _query,
             _sort,
             preferences.data,
-        ) { filter, query, sort, prefs -> CategoryControls(filter, query, sort, prefs.fileViewMode) },
+        ) { filter, query, sort, prefs ->
+            CategoryControls(filter, query, sort, prefs.fileViewMode, prefs.lockedFolderIdsAsLong())
+        },
         _savedChatId,
     ) { (files, folders), controls, savedId ->
         val q = controls.query.trim().lowercase()
+        val lockedFolders = controls.lockedFolderIds
         val filtered = files
             .asSequence()
+            .filter { it.chatId !in lockedFolders }
             .filter { q.isEmpty() || it.fileName.lowercase().contains(q) }
             .toList()
             .let { list -> sortCategoryItems(list, controls.sort) }
@@ -308,13 +325,6 @@ class CategoryFilesViewModel @Inject constructor(
             FileSort.SIZE_DESC -> list.sortedByDescending { it.fileSize }
             FileSort.SIZE_ASC -> list.sortedBy { it.fileSize }
         }
-
-    private data class CategoryControls(
-        val filter: FileFilter,
-        val query: String,
-        val sort: FileSort,
-        val viewMode: FileViewMode,
-    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -483,7 +493,7 @@ fun CategoryFilesScreen(
                     .padding(pad)
                     .navigationBarsPadding(),
             ) {
-                items(state.items, key = { "${it.chatId}_${it.messageId}" }) { item ->
+                items(state.items, key = { "${it.chatId}_${it.messageId}" }, contentType = { "category_grid_item" }) { item ->
                     val folderTitle = state.folderNames[item.chatId] ?: savedTitle
                     LaunchedEffect(item.chatId, item.messageId) { vm.requestThumbnail(item) }
                     CategoryGridItem(
@@ -513,7 +523,7 @@ fun CategoryFilesScreen(
                     .padding(pad)
                     .navigationBarsPadding(),
             ) {
-                items(state.items, key = { "${it.chatId}_${it.messageId}" }) { item ->
+                items(state.items, key = { "${it.chatId}_${it.messageId}" }, contentType = { "category_grid_item" }) { item ->
                     val folderTitle = state.folderNames[item.chatId] ?: savedTitle
                     LaunchedEffect(item.chatId, item.messageId) { vm.requestThumbnail(item) }
                     CategoryListItem(
@@ -544,9 +554,19 @@ private fun CategoryGridItem(
     folderTitle: String,
     onClick: () -> Unit,
 ) {
+    val context = LocalContext.current
     val (icon, tint) = categoryVisual(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath) {
-        item.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    var loadFailed by remember(item.thumbnailPath) { mutableStateOf(false) }
+    val thumbRequest = remember(item.thumbnailPath, context) {
+        item.thumbnailPath
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(360, 360))
+                    .crossfade(false)
+                    .build()
+            }
     }
     Column(
         modifier = Modifier
@@ -563,11 +583,12 @@ private fun CategoryGridItem(
                 .background(tint.copy(alpha = 0.14f)),
             contentAlignment = Alignment.Center,
         ) {
-            if (thumbFile != null) {
+            if (!loadFailed && thumbRequest != null) {
                 AsyncImage(
-                    model = thumbFile,
+                    model = thumbRequest,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
+                    onError = { loadFailed = true },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
@@ -599,9 +620,19 @@ private fun CategoryListItem(
     folderTitle: String,
     onClick: () -> Unit,
 ) {
+    val context = LocalContext.current
     val (icon, tint) = categoryVisual(item.mimeType, item.fileName)
-    val thumbFile = remember(item.thumbnailPath) {
-        item.thumbnailPath?.let(::File)?.takeIf { it.isFile && it.length() > 0L }
+    var loadFailed by remember(item.thumbnailPath) { mutableStateOf(false) }
+    val thumbRequest = remember(item.thumbnailPath, context) {
+        item.thumbnailPath
+            ?.takeIf { it.isNotBlank() && !it.endsWith(".tgethumb", ignoreCase = true) }
+            ?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(160, 160))
+                    .crossfade(false)
+                    .build()
+            }
     }
     Row(
         modifier = Modifier
@@ -619,11 +650,12 @@ private fun CategoryListItem(
                 .background(tint.copy(alpha = 0.15f)),
             contentAlignment = Alignment.Center,
         ) {
-            if (thumbFile != null) {
+            if (!loadFailed && thumbRequest != null) {
                 AsyncImage(
-                    model = thumbFile,
+                    model = thumbRequest,
                     contentDescription = item.fileName,
                     contentScale = ContentScale.Crop,
+                    onError = { loadFailed = true },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {

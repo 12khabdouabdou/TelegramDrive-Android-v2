@@ -106,6 +106,7 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.FileDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -791,7 +792,17 @@ private fun VideoPlayerBody(
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val exo = remember(chatId, messageId) {
         try {
+            val loadControl = DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    /* minBufferMs = */ 10_000,
+                    /* maxBufferMs = */ 25_000,
+                    /* bufferForPlaybackMs = */ 1_000,
+                    /* bufferForPlaybackAfterRebufferMs = */ 2_000,
+                )
+                .setBackBuffer(5_000, true)
+                .build()
             ExoPlayer.Builder(ctx.applicationContext)
+                .setLoadControl(loadControl)
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(C.USAGE_MEDIA)

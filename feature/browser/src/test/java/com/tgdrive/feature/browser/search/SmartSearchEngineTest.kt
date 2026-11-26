@@ -229,4 +229,63 @@ class SmartSearchEngineTest {
         assertThat(parsedTags.locations).containsExactly("paris")
         assertThat(parsedTags.audioMeta).containsExactly("daft punk")
     }
+
+    @Test
+    fun `private vault search handles bucket fallback locked items NL fallback and folder names`() {
+        val nowMs = System.currentTimeMillis()
+        val files = listOf(
+            // Encrypted item whose stored name stripped extension — falls back to entity.bucket
+            FileCacheEntity(
+                messageId = 40L,
+                chatId = 700L,
+                fileName = "secret_image.tgenc",
+                fileSize = 400_000L,
+                mimeType = "application/octet-stream",
+                thumbnailPath = null,
+                date = nowMs,
+                isEncryptedVault = true,
+                bucket = "IMAGES",
+            ),
+            // Hidden locked unencrypted file
+            FileCacheEntity(
+                messageId = 41L,
+                chatId = 701L,
+                fileName = "hidden_contract.pdf",
+                fileSize = 200_000L,
+                mimeType = "application/pdf",
+                thumbnailPath = null,
+                date = nowMs,
+                isLocked = true,
+            ),
+            // File with word "big" in filename whose size is < 2MB (tests NL over-filter raw fallback)
+            FileCacheEntity(
+                messageId = 42L,
+                chatId = 700L,
+                fileName = "big_passport.jpg.tgenc",
+                fileSize = 500_000L,
+                mimeType = "application/octet-stream",
+                thumbnailPath = null,
+                date = nowMs,
+                isEncryptedVault = true,
+            ),
+        )
+        val criteria = SearchFilterCriteria(folderNames = mapOf(700L to "Personal Docs", 701L to "Private Folder"))
+
+        // 1. "photos" matches secret_image.tgenc via bucket fallback
+        val photoHits = SmartSearchEngine.search("photos", files, emptyList(), criteria = criteria, includeLocked = true)
+        assertThat(photoHits.map { it.displayName }).containsExactly("secret_image.tgenc", "big_passport.jpg.tgenc")
+
+        // 2. "private" inside Vault matches both encrypted and hidden locked items
+        val privateHits = SmartSearchEngine.search("private", files, emptyList(), criteria = criteria, includeLocked = true)
+        assertThat(privateHits.map { it.displayName })
+            .containsExactly("secret_image.tgenc", "hidden_contract.pdf", "big_passport.jpg.tgenc")
+
+        // 3. "big passport" on 500KB file falls back to raw literal match instead of returning empty
+        val bigPassport = SmartSearchEngine.search("big passport", files, emptyList(), criteria = criteria, includeLocked = true)
+        assertThat(bigPassport.map { it.displayName }).containsExactly("big_passport.jpg.tgenc")
+
+        // 4. Folder name search works inside Private Vault
+        val folderHits = SmartSearchEngine.search("Personal Docs", files, emptyList(), criteria = criteria, includeLocked = true)
+        assertThat(folderHits.map { it.displayName }).containsExactly("secret_image.tgenc", "big_passport.jpg.tgenc")
+    }
 }

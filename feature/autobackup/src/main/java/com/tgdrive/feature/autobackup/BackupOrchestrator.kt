@@ -1293,6 +1293,9 @@ class BackupOrchestrator @Inject constructor(
     }
 
     private fun checkBatterySkipReason(minBatteryPercent: Int): String? {
+        if (com.tgdrive.core.common.ThermalGuard.isThermalSevere(ctx)) {
+            return "Paused while device cools down"
+        }
         val power = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val battery = ctx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
         val isCharging = runCatching { battery?.isCharging == true }.getOrDefault(false)

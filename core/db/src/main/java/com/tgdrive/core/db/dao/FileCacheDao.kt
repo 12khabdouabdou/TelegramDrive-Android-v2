@@ -363,6 +363,19 @@ interface FileCacheDao {
     @Query("UPDATE file_cache SET thumbnail_path = :thumbnailPath WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun updateThumbnailPath(chatId: Long, messageId: Long, thumbnailPath: String?)
 
+    data class ThumbnailPathUpdate(
+        val chatId: Long,
+        val messageId: Long,
+        val thumbnailPath: String,
+    )
+
+    @Transaction
+    suspend fun updateThumbnailPaths(updates: List<ThumbnailPathUpdate>) {
+        for (u in updates) {
+            updateThumbnailPath(u.chatId, u.messageId, u.thumbnailPath)
+        }
+    }
+
     @Query("DELETE FROM file_cache WHERE message_id = :newId AND chat_id = :chatId")
     suspend fun deleteByMessageId(chatId: Long, newId: Long): Int
 
@@ -451,6 +464,11 @@ interface FileCacheDao {
         "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",
     )
     fun observeEncryptedVaultFiles(): Flow<List<FileCacheEntity>>
+
+    @Query(
+        "SELECT * FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc' ORDER BY date DESC",
+    )
+    suspend fun getEncryptedVaultFiles(): List<FileCacheEntity>
 
     @Query(
         "SELECT COUNT(*) FROM file_cache WHERE is_encrypted_vault = 1 OR is_locked = 1 OR lower(file_name) LIKE '%.tgenc'",

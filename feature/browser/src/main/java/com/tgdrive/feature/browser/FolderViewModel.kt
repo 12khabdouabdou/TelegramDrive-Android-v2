@@ -2,6 +2,7 @@ package com.tgdrive.feature.browser
 
 import android.content.Context
 import android.net.Uri
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.tgdrive.core.common.DispatchersProvider
@@ -30,7 +31,9 @@ import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.UploadTracker
 import com.tgdrive.core.download.ZipUploadRequest
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.AccessLockManager
 import com.tgdrive.core.security.BackupCrypto
+import com.tgdrive.core.security.BiometricHelper
 import com.tgdrive.core.security.EncryptedFileFormat
 import com.tgdrive.core.telegram.TelegramClient
 import com.tgdrive.core.telegram.TelegramFolder
@@ -45,6 +48,8 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -62,6 +67,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Collections
 import javax.inject.Inject
 
 private const val MAX_FOLDER_DECRYPTED_THUMBS = 60
@@ -101,6 +107,7 @@ data class DecryptedOpenEvent(
     val outcome: DecryptOutcome.Success,
 )
 
+@Immutable
 data class FolderUiState(
     val items: List<FileCacheEntity> = emptyList(),
     val selectedIds: Set<Long> = emptySet(),
@@ -126,6 +133,15 @@ data class FolderUiState(
     val childVirtualFolderThumbs: Map<String, List<String>> = emptyMap(),
     val allVirtualPaths: List<String> = emptyList(),
     val encryptedPreviewFingerprint: String? = null,
+    val isFolderLockedByPref: Boolean = false,
+    val isFolderLockRequired: Boolean = false,
+    val isFolderUnlocked: Boolean = true,
+    val folderLockReady: Boolean = false,
+    val hasAccessPassword: Boolean = false,
+    val canUseBiometricLock: Boolean = false,
+    val biometricAvailable: Boolean = false,
+    val accessLockBiometricEnabled: Boolean = true,
+    val lockError: String? = null,
 )
 
 data class FolderSnackbarEvent(
@@ -147,13 +163,20 @@ class FolderViewModel
         private val uploadTracker: UploadTracker,
         private val uploadManager: UploadManager,
         private val backupCrypto: BackupCrypto,
+        private val accessLockManager: AccessLockManager,
+        private val biometricHelper: BiometricHelper,
         private val offlinePinStore: OfflinePinStore,
         private val trashEntryDao: TrashEntryDao,
         private val cloudSyncManager: CloudSyncManager,
         private val mediaThumbnailCache: MediaThumbnailCache,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
-        private val attemptedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val attemptedThumbKeys = Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
+        private val thumbRequests = Channel<Pair<FileCacheEntity, Boolean>>(
+            capacity = 64,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+        private val thumbSemaphore = Semaphore(2)
         private val _selected = MutableStateFlow<Set<Long>>(emptySet())
         private val _loading = MutableStateFlow(false)
         private val _refreshing = MutableStateFlow(false)
@@ -171,6 +194,10 @@ class FolderViewModel
         private val _zipPreviewSummary = MutableStateFlow<ZipSelectionSummary?>(null)
         private val _zipPreviewLoading = MutableStateFlow(false)
         private val _batchDecryptProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+        private val _isFolderUnlocked = MutableStateFlow(false)
+        private val _folderLockReady = MutableStateFlow(false)
+        private val _lockError = MutableStateFlow<String?>(null)
+        private val _lockConfigVersion = MutableStateFlow(0)
 
         private val decryptFlow = DecryptFlowCoordinator(
             scope = viewModelScope,
@@ -207,6 +234,7 @@ class FolderViewModel
         private val _boundChatId = MutableStateFlow<Long?>(null)
         private var oldestMessageId: Long = 0L
         private var hasMoreMessages: Boolean = true
+        private var hasRefreshedSinceBind: Boolean = false
 
         init {
             viewModelScope.launch(dispatchers.io) {
@@ -216,6 +244,31 @@ class FolderViewModel
                     }
                 }
             }
+            viewModelScope.launch(dispatchers.io) {
+                for ((entity, force) in thumbRequests) {
+                    launch {
+                        thumbSemaphore.withPermit {
+                            try {
+                                mediaThumbnailCache.ensureThumbnail(entity, force = force)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fun requestThumbnail(entity: FileCacheEntity, force: Boolean = false) {
+            if (entity.isLocked || entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)) {
+                return
+            }
+            if (!force && !mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)) return
+            val key = entity.chatId to entity.messageId
+            if (force || attemptedThumbKeys.add(key)) {
+                thumbRequests.trySend(entity to force)
+            }
         }
 
         private data class FolderAuxTail(
@@ -223,6 +276,10 @@ class FolderViewModel
             val batchProgress: Pair<Int, Int>?,
             val virtualPath: String,
             val createdVirtualFolders: Map<Long, Set<String>>,
+            val isFolderUnlocked: Boolean,
+            val folderLockReady: Boolean,
+            val lockError: String?,
+            val lockConfigVersion: Int,
         )
 
         private data class FolderCoreState(
@@ -240,6 +297,15 @@ class FolderViewModel
             val zipSummaryLoading: Boolean,
             val decryptDialog: DecryptDialogState?,
         )
+
+        private val lockTailFlow = combine(
+            _isFolderUnlocked,
+            _folderLockReady,
+            _lockError,
+            _lockConfigVersion,
+        ) { unlocked, ready, lockErr, cfgVer ->
+            listOf(unlocked, ready, lockErr, cfgVer)
+        }
 
         val state: StateFlow<FolderUiState> =
             combine(
@@ -264,8 +330,18 @@ class FolderViewModel
                         _batchDecryptProgress,
                         _virtualPath,
                         _createdVirtualFolders,
-                    ) { b, bp, vp, createdVps ->
-                        FolderAuxTail(b, bp, vp, createdVps)
+                        lockTailFlow,
+                    ) { b, bp, vp, createdVps, lt ->
+                        FolderAuxTail(
+                            boundId = b,
+                            batchProgress = bp,
+                            virtualPath = vp,
+                            createdVirtualFolders = createdVps,
+                            isFolderUnlocked = lt[0] as Boolean,
+                            folderLockReady = lt[1] as Boolean,
+                            lockError = lt[2] as String?,
+                            lockConfigVersion = lt[3] as Int,
+                        )
                     },
                 ) {
                         search,
@@ -285,6 +361,12 @@ class FolderViewModel
                 val rawVirtualPath = normalizeVirtualPath(auxTail.virtualPath)
                 val customForChat = boundId?.let { auxTail.createdVirtualFolders[it] }.orEmpty()
 
+                val isLockedPref = boundId != null && prefs.isFolderLocked(boundId)
+                val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
+                val hasAccessPass = accessLockManager.hasPassword()
+                val canUseBio = isLockedPref && bioAvail && prefs.accessLockBiometricEnabled
+                val lockRequired = isLockedPref && (hasAccessPass || canUseBio)
+
                 val unlockedItems = c.items.filterNot { it.isLocked }
                 val inVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
 
@@ -303,7 +385,10 @@ class FolderViewModel
                         val candidateThumb = if (!item.isEncryptedVault &&
                             !BackupCrypto.isEncryptedFileName(item.fileName)
                         ) {
-                            item.thumbnailPath?.takeIf { !it.endsWith(".tgethumb", ignoreCase = true) }
+                            item.thumbnailPath?.takeIf { path ->
+                                !path.endsWith(".tgethumb", ignoreCase = true) &&
+                                    File(path).let { f -> f.isFile && f.length() > 0L }
+                            }
                         } else {
                             null
                         }
@@ -401,9 +486,120 @@ class FolderViewModel
                     } else {
                         null
                     },
+                    isFolderLockedByPref = isLockedPref,
+                    isFolderLockRequired = lockRequired,
+                    isFolderUnlocked = !lockRequired || auxTail.isFolderUnlocked,
+                    folderLockReady = auxTail.folderLockReady,
+                    hasAccessPassword = hasAccessPass,
+                    canUseBiometricLock = canUseBio,
+                    biometricAvailable = bioAvail,
+                    accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
+                    lockError = auxTail.lockError,
                 )
-            }.flowOn(dispatchers.default)
+            }.flowOn(dispatchers.io)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
+
+        fun lockFolderView() {
+            _isFolderUnlocked.value = false
+            _selected.value = emptySet()
+        }
+
+        fun clearLockError() {
+            _lockError.value = null
+        }
+
+        private fun triggerInitialRefreshIfNeeded() {
+            if (!hasRefreshedSinceBind) {
+                hasRefreshedSinceBind = true
+                refresh()
+            }
+        }
+
+        fun unlockFolderWithPassword(candidate: String) {
+            viewModelScope.launch(dispatchers.default) {
+                if (accessLockManager.verifyPassword(candidate)) {
+                    _lockError.value = null
+                    _isFolderUnlocked.value = true
+                    withContext(dispatchers.main) { triggerInitialRefreshIfNeeded() }
+                } else {
+                    _lockError.value = appContext.getString(R.string.access_lock_wrong_password)
+                }
+            }
+        }
+
+        fun authenticateFolder(
+            activity: androidx.fragment.app.FragmentActivity,
+            title: String,
+            subtitle: String,
+        ) {
+            if (biometricHelper.availability() != BiometricHelper.Availability.AVAILABLE) {
+                if (!accessLockManager.hasPassword()) {
+                    _isFolderUnlocked.value = true
+                    triggerInitialRefreshIfNeeded()
+                }
+                return
+            }
+            biometricHelper.authenticate(
+                activity = activity,
+                title = title,
+                subtitle = subtitle,
+                onSuccess = {
+                    _lockError.value = null
+                    _isFolderUnlocked.value = true
+                    triggerInitialRefreshIfNeeded()
+                },
+                onError = { msg -> _lockError.value = msg },
+            )
+        }
+
+        fun setCurrentFolderLocked(locked: Boolean) {
+            val chatId = currentChatId ?: return
+            viewModelScope.launch(dispatchers.io) {
+                preferences.update { it.withFolderLocked(chatId, locked) }
+                _isFolderUnlocked.value = true
+                _lockConfigVersion.value += 1
+            }
+        }
+
+        fun configureFolderAccessLock(
+            newPassword: String?,
+            biometricEnabled: Boolean,
+            lockCurrentFolder: Boolean,
+            removePassword: Boolean = false,
+        ) {
+            val chatId = currentChatId
+            viewModelScope.launch(dispatchers.io) {
+                if (removePassword) {
+                    accessLockManager.clearPassword()
+                } else if (!newPassword.isNullOrBlank()) {
+                    accessLockManager.setPassword(newPassword)
+                }
+                preferences.update { prefs ->
+                    val updated = prefs.copy(accessLockBiometricEnabled = biometricEnabled)
+                    if (chatId != null && lockCurrentFolder) updated.withFolderLocked(chatId, true) else updated
+                }
+                _isFolderUnlocked.value = true
+                _lockConfigVersion.value += 1
+            }
+        }
+
+        fun verifyAccessPasswordSync(candidate: String): Boolean = accessLockManager.verifyPassword(candidate)
+
+        fun authenticateRemoveLock(
+            activity: androidx.fragment.app.FragmentActivity,
+            title: String,
+            subtitle: String,
+            onSuccess: () -> Unit,
+            onError: (String) -> Unit,
+        ) {
+            biometricHelper.authenticate(
+                activity = activity,
+                title = title,
+                subtitle = subtitle,
+                onSuccess = onSuccess,
+                onError = onError,
+            )
+        }
 
         fun bind(chatId: Long) {
             if (chatId == 0L) {
@@ -433,24 +629,41 @@ class FolderViewModel
             attemptedThumbKeys.clear()
             _items.value = emptyList()
             _selected.value = emptySet()
+            _lockError.value = null
+            _folderLockReady.value = false
+            _isFolderUnlocked.value = false
+            hasRefreshedSinceBind = false
             oldestMessageId = 0L
             hasMoreMessages = true
+            viewModelScope.launch(dispatchers.io) {
+                val prefs = runCatching { preferences.data.first() }.getOrNull()
+                val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
+                val hasPass = accessLockManager.hasPassword()
+                val lockedByPref = prefs?.isFolderLocked(chatId) == true
+                val lockRequired = lockedByPref && (hasPass || (bioAvail && prefs?.accessLockBiometricEnabled != false))
+                _isFolderUnlocked.value = !lockRequired
+                _folderLockReady.value = true
+                if (!lockRequired && !hasRefreshedSinceBind) {
+                    hasRefreshedSinceBind = true
+                    refresh()
+                }
+            }
             bindJob =
                 viewModelScope.launch(dispatchers.io) {
                     fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
                         _items.value = entities
-                        val toWarm =
-                            entities
-                                .filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
-                                .filter { attemptedThumbKeys.add(it.chatId to it.messageId) }
-                                .take(50)
-                        for (entity in toWarm) {
-                            launch {
-                                try {
-                                    mediaThumbnailCache.ensureThumbnail(entity)
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (_: Throwable) {
+                        var queued = 0
+                        for (entity in entities) {
+                            if (queued >= 30) break
+                            if (mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath) &&
+                                !entity.isLocked &&
+                                !entity.isEncryptedVault &&
+                                !BackupCrypto.isEncryptedFileName(entity.fileName)
+                            ) {
+                                val key = entity.chatId to entity.messageId
+                                if (attemptedThumbKeys.add(key)) {
+                                    thumbRequests.trySend(entity to false)
+                                    queued++
                                 }
                             }
                         }
@@ -472,7 +685,6 @@ class FolderViewModel
             viewModelScope.launch(dispatchers.io) {
                 _isSavedMessages.value = runCatching { telegramClient.myUserId() == chatId }.getOrDefault(false)
             }
-            refresh()
         }
 
         private suspend fun refreshLocalThumbnails(
@@ -515,6 +727,7 @@ class FolderViewModel
         fun refresh() {
             val chatId = currentChatId ?: return
             refreshJob?.cancel()
+            attemptedThumbKeys.clear()
             oldestMessageId = 0L
             hasMoreMessages = true
             refreshJob =

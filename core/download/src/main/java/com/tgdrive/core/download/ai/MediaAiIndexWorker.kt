@@ -60,6 +60,7 @@ class MediaAiIndexWorker @AssistedInject constructor(
                     .setConstraints(
                         Constraints.Builder()
                             .setRequiresBatteryNotLow(true)
+                            .setRequiresDeviceIdle(true)
                             .build(),
                     )
                     .build()

@@ -112,7 +112,20 @@ data class AppPreferencesData(
     val lastSyncedMetaMessageId: Long = 0L,
     val lastSyncedSearchMessageId: Long = 0L,
     val lastSyncedVaultIndexMessageId: Long = 0L,
+    val vaultAccessLockEnabled: Boolean = false,
+    val accessLockBiometricEnabled: Boolean = true,
+    val lockedFolderChatIds: Set<String> = emptySet(),
 ) {
+    fun isFolderLocked(chatId: Long): Boolean = chatId.toString() in lockedFolderChatIds
+
+    fun lockedFolderIdsAsLong(): Set<Long> = lockedFolderChatIds.mapNotNull { it.toLongOrNull() }.toSet()
+
+    fun withFolderLocked(chatId: Long, locked: Boolean): AppPreferencesData {
+        val k = chatId.toString()
+        val next = if (locked) lockedFolderChatIds + k else lockedFolderChatIds - k
+        return copy(lockedFolderChatIds = next)
+    }
+
     fun isFolderPinned(chatId: Long): Boolean = chatId.toString() in pinnedFolderChatIds
 
     fun withToggledPinnedFolder(chatId: Long): AppPreferencesData {
@@ -254,6 +267,9 @@ class AppPreferences @Inject constructor(
         val LAST_SYNCED_META_MSG_ID = longPreferencesKey("last_synced_meta_msg_id")
         val LAST_SYNCED_SEARCH_MSG_ID = longPreferencesKey("last_synced_search_msg_id")
         val LAST_SYNCED_VAULT_IDX_MSG_ID = longPreferencesKey("last_synced_vault_idx_msg_id")
+        val VAULT_ACCESS_LOCK_ENABLED = booleanPreferencesKey("vault_access_lock_enabled")
+        val ACCESS_LOCK_BIOMETRIC_ENABLED = booleanPreferencesKey("access_lock_biometric_enabled")
+        val LOCKED_FOLDER_CHAT_IDS = stringSetPreferencesKey("locked_folder_chat_ids")
     }
 
     /**
@@ -358,6 +374,9 @@ class AppPreferences @Inject constructor(
             lastSyncedMetaMessageId = get(Keys.LAST_SYNCED_META_MSG_ID) ?: 0L,
             lastSyncedSearchMessageId = get(Keys.LAST_SYNCED_SEARCH_MSG_ID) ?: 0L,
             lastSyncedVaultIndexMessageId = get(Keys.LAST_SYNCED_VAULT_IDX_MSG_ID) ?: 0L,
+            vaultAccessLockEnabled = get(Keys.VAULT_ACCESS_LOCK_ENABLED) ?: false,
+            accessLockBiometricEnabled = get(Keys.ACCESS_LOCK_BIOMETRIC_ENABLED) ?: true,
+            lockedFolderChatIds = get(Keys.LOCKED_FOLDER_CHAT_IDS) ?: emptySet(),
         )
     }
 
@@ -422,5 +441,8 @@ class AppPreferences @Inject constructor(
         this[Keys.LAST_SYNCED_META_MSG_ID] = d.lastSyncedMetaMessageId
         this[Keys.LAST_SYNCED_SEARCH_MSG_ID] = d.lastSyncedSearchMessageId
         this[Keys.LAST_SYNCED_VAULT_IDX_MSG_ID] = d.lastSyncedVaultIndexMessageId
+        this[Keys.VAULT_ACCESS_LOCK_ENABLED] = d.vaultAccessLockEnabled
+        this[Keys.ACCESS_LOCK_BIOMETRIC_ENABLED] = d.accessLockBiometricEnabled
+        this[Keys.LOCKED_FOLDER_CHAT_IDS] = d.lockedFolderChatIds
     }
 }

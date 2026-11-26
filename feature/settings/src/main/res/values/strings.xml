@@ -116,4 +116,18 @@
     <string name="settings_downloads_wifi_only_desc">Pause queued downloads on cellular and auto-resume on Wi-Fi</string>
     <string name="settings_downloads_autosave">Auto-save to Downloads/TelegramDrive</string>
     <string name="settings_downloads_autosave_desc">Automatically export unencrypted completed downloads to public storage</string>
+    <string name="settings_access_lock_vault">Lock Private Vault</string>
+    <string name="settings_access_lock_vault_desc">Require password or fingerprint every time Private Vault is opened (%1$d locked folders)</string>
+    <string name="settings_access_lock_fingerprint">Fingerprint for Vault &amp; Folders</string>
+    <string name="settings_access_lock_fingerprint_desc">Allow biometric unlock alongside or instead of an access password</string>
+    <string name="settings_access_lock_password_row">Vault &amp; Folder Password</string>
+    <string name="settings_access_lock_password_set">Access password configured</string>
+    <string name="settings_access_lock_password_unset">Not set — tap to create password or PIN</string>
+    <string name="settings_access_lock_password_title">Set Vault &amp; Folder Password</string>
+    <string name="settings_access_lock_password_desc">Used to lock and unlock Private Vault and any folders you choose to lock.</string>
+    <string name="settings_access_lock_password_label">Password or PIN (min 4 chars)</string>
+    <string name="settings_access_lock_password_confirm">Confirm password</string>
+    <string name="settings_access_lock_password_short">Password must be at least 4 characters</string>
+    <string name="settings_access_lock_password_mismatch">Passwords do not match</string>
+    <string name="settings_access_lock_password_remove">Remove</string>
 </resources>

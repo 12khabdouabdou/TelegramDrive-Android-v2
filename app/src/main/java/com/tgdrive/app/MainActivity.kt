@@ -51,7 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.fragment.app.FragmentActivity
-import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tgdrive.app.nav.RootNavHost
 import com.tgdrive.core.datastore.ThemeMode
@@ -74,14 +74,15 @@ class MainActivity : FragmentActivity() {
 
     @OptIn(ExperimentalLayoutApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
-        installSplashScreen()
+        val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         currentIntent = intent
+        val rootVm = ViewModelProvider(this)[RootViewModel::class.java]
+        rootVmRef = rootVm
+        splashScreen.setKeepOnScreenCondition { rootVm.state.value.isInitializing }
 
         setContent {
-            val rootVm: RootViewModel = hiltViewModel()
-            rootVmRef = rootVm
             val state by rootVm.state.collectAsStateWithLifecycle()
 
             LaunchedEffect(currentIntent) {
@@ -120,7 +121,7 @@ class MainActivity : FragmentActivity() {
                         .fillMaxSize()
                         .background(MaterialTheme.colorScheme.background),
                 ) {
-                    OfflineBanner(visible = !state.isOnline, queuedOps = 0)
+                    OfflineBanner(visible = !state.isOnline, queuedOps = state.queuedOfflineOps)
                     val contentModifier = if (!state.isOnline) {
                         Modifier
                             .weight(1f)

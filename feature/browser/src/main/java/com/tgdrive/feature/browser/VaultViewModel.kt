@@ -1,6 +1,7 @@
 package com.tgdrive.feature.browser
 
 import android.content.Context
+import androidx.compose.runtime.Immutable
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,6 +15,7 @@ import com.tgdrive.core.common.classifyFile
 import com.tgdrive.core.common.isTextPreviewable
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.db.dao.FileCacheDao
+import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.download.DecryptOutcome
 import com.tgdrive.core.download.DownloadItem
@@ -26,8 +28,10 @@ import com.tgdrive.core.download.UploadManager
 import com.tgdrive.core.download.ai.MediaAiIndexWorker
 import com.tgdrive.core.download.ai.MediaAiIndexer
 import com.tgdrive.core.download.sync.CloudSyncManager
+import com.tgdrive.core.security.AccessLockManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
+import com.tgdrive.feature.browser.search.SearchFilterCriteria
 import com.tgdrive.feature.browser.search.SmartSearchEngine
 import com.tgdrive.feature.browser.search.SmartSearchHit
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -39,6 +43,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -55,6 +60,7 @@ data class VaultExternalOpenEvent(
     val mimeType: String,
 )
 
+@Immutable
 data class VaultUiState(
     val items: List<FileCacheEntity> = emptyList(),
     val filteredItems: List<FileCacheEntity> = emptyList(),
@@ -73,6 +79,11 @@ data class VaultUiState(
     val hasCloudVerifier: Boolean = false,
     val passphraseBusy: Boolean = false,
     val batchProgress: Pair<Int, Int>? = null,
+    val vaultAccessLockEnabled: Boolean = false,
+    val hasAccessPassword: Boolean = false,
+    val canUseBiometricLock: Boolean = false,
+    val accessLockBiometricEnabled: Boolean = true,
+    val biometricAvailable: Boolean = false,
     val error: String? = null,
 )
 
@@ -84,8 +95,10 @@ enum class VaultPassphraseSaveStatus {
 @HiltViewModel
 class VaultViewModel @Inject constructor(
     private val fileCacheDao: FileCacheDao,
+    private val folderDao: FolderDao,
     private val preferences: AppPreferences,
     private val biometricHelper: BiometricHelper,
+    private val accessLockManager: AccessLockManager,
     private val mediaThumbnailCache: MediaThumbnailCache,
     val downloadManager: DownloadManager,
     private val offlinePinStore: OfflinePinStore,
@@ -111,6 +124,7 @@ class VaultViewModel @Inject constructor(
     private val _searchQuery = MutableStateFlow("")
     private val _unindexedAiCount = MutableStateFlow(0)
     private val _aiIndexingProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+    private val _lockConfigVersion = MutableStateFlow(0)
     private val _error = MutableStateFlow<String?>(null)
     private val _snackbar = MutableStateFlow<String?>(null)
     val snackbar: StateFlow<String?> = _snackbar.asStateFlow()
@@ -146,7 +160,28 @@ class VaultViewModel @Inject constructor(
         val unindexedAiCount: Int,
         val aiIndexingProgress: Pair<Int, Int>?,
         val passphraseFingerprint: String?,
+        val folderNames: Map<Long, String>,
     )
+
+    private data class VaultLockMeta(
+        val vaultAccessLockEnabled: Boolean,
+        val hasAccessPassword: Boolean,
+        val canUseBiometric: Boolean,
+        val accessLockBiometricEnabled: Boolean,
+        val biometricAvailable: Boolean,
+    )
+
+    private val lockMetaFlow = combine(preferences.data, _lockConfigVersion) { prefs, _ ->
+        val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
+        val hasPass = accessLockManager.hasPassword()
+        VaultLockMeta(
+            vaultAccessLockEnabled = prefs.vaultAccessLockEnabled,
+            hasAccessPassword = hasPass,
+            canUseBiometric = bioAvail && (prefs.biometricLockEnabled || (prefs.vaultAccessLockEnabled && prefs.accessLockBiometricEnabled)),
+            accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
+            biometricAvailable = bioAvail,
+        )
+    }
 
     val state: StateFlow<VaultUiState> = combine(
         combine(
@@ -165,11 +200,19 @@ class VaultViewModel @Inject constructor(
             combine(_hasVaultPassphrase, _hasCloudVerifier, _passphraseBusy) { hasPass, hasVer, busy ->
                 Triple(hasPass, hasVer, busy)
             },
-        ) { dialog, batch, err, passTuple ->
-            listOf(dialog, batch, err, passTuple)
+            lockMetaFlow,
+        ) { dialog, batch, err, passTuple, lockMeta ->
+            listOf(dialog, batch, err, passTuple, lockMeta)
         },
-        combine(_searchQuery, _unindexedAiCount, _aiIndexingProgress, _passphraseFingerprint) { sq, unindexed, aiProg, fp ->
-            VaultAiSearchState(sq, unindexed, aiProg, fp)
+        combine(
+            _searchQuery,
+            _unindexedAiCount,
+            _aiIndexingProgress,
+            _passphraseFingerprint,
+            folderDao.observeAll(),
+        ) { sq, unindexed, aiProg, fp, folders ->
+            val folderNames = folders.associate { it.channelId to it.title }
+            VaultAiSearchState(sq, unindexed, aiProg, fp, folderNames)
         },
     ) { core, aux, aiSearch ->
         @Suppress("UNCHECKED_CAST")
@@ -186,9 +229,15 @@ class VaultViewModel @Inject constructor(
         val err = aux[2] as String?
         @Suppress("UNCHECKED_CAST")
         val passTuple = aux[3] as Triple<Boolean, Boolean, Boolean>
+        val lockMeta = aux[4] as VaultLockMeta
 
         val q = aiSearch.searchQuery
-        val parsedQuery = if (q.isBlank()) null else SmartSearchEngine.parseQuery(q)
+        val parsedQuery = if (q.isBlank()) {
+            null
+        } else {
+            SmartSearchEngine.parseQuery(q, knownFolderNames = aiSearch.folderNames.values)
+        }
+        val criteria = SearchFilterCriteria(folderNames = aiSearch.folderNames)
         val searchHits = if (q.isBlank()) {
             null
         } else {
@@ -196,6 +245,7 @@ class VaultViewModel @Inject constructor(
                 query = q,
                 files = items,
                 zipEntries = emptyList(),
+                criteria = criteria,
                 includeLocked = true,
             ).filterIsInstance<SmartSearchHit.CloudFileHit>()
         }
@@ -223,6 +273,11 @@ class VaultViewModel @Inject constructor(
             hasCloudVerifier = passTuple.second,
             passphraseBusy = passTuple.third,
             batchProgress = batch,
+            vaultAccessLockEnabled = lockMeta.vaultAccessLockEnabled,
+            hasAccessPassword = lockMeta.hasAccessPassword,
+            canUseBiometricLock = lockMeta.canUseBiometric,
+            accessLockBiometricEnabled = lockMeta.accessLockBiometricEnabled,
+            biometricAvailable = lockMeta.biometricAvailable,
             error = err,
         )
     }.flowOn(dispatchers.default)
@@ -234,9 +289,23 @@ class VaultViewModel @Inject constructor(
             refreshUnindexedAiCount()
         }
         viewModelScope.launch(dispatchers.io) {
-            preferences.data.collect { prefs ->
+            combine(
+                fileCacheDao.observeEncryptedVaultFiles().map { it.size }.distinctUntilChanged(),
+                _isUnlocked,
+                _hasVaultPassphrase,
+            ) { _, unlocked, hasPass -> unlocked && hasPass }
+                .distinctUntilChanged()
+                .collect {
+                    refreshUnindexedAiCount()
+                }
+        }
+        viewModelScope.launch(dispatchers.io) {
+            combine(preferences.data, _lockConfigVersion) { prefs, _ -> prefs }.collect { prefs ->
                 val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
-                val required = prefs.biometricLockEnabled && bioAvail
+                val hasPass = accessLockManager.hasPassword()
+                val customLock = prefs.vaultAccessLockEnabled && (hasPass || (prefs.accessLockBiometricEnabled && bioAvail))
+                val globalBioLock = prefs.biometricLockEnabled && bioAvail
+                val required = customLock || globalBioLock
                 _biometricRequired.value = required
                 if (!initialLockEvaluated) {
                     initialLockEvaluated = true
@@ -255,7 +324,9 @@ class VaultViewModel @Inject constructor(
         subtitle: String,
     ) {
         if (biometricHelper.availability() != BiometricHelper.Availability.AVAILABLE) {
-            _isUnlocked.value = true
+            if (!accessLockManager.hasPassword()) {
+                _isUnlocked.value = true
+            }
             return
         }
         biometricHelper.authenticate(
@@ -268,6 +339,40 @@ class VaultViewModel @Inject constructor(
             },
             onError = { msg -> _error.value = msg },
         )
+    }
+
+    fun unlockWithPassword(candidate: String) {
+        viewModelScope.launch(dispatchers.default) {
+            val ok = accessLockManager.verifyPassword(candidate)
+            if (ok) {
+                _error.value = null
+                _isUnlocked.value = true
+            } else {
+                _error.value = appContext.getString(R.string.access_lock_wrong_password)
+            }
+        }
+    }
+
+    fun configureVaultLock(
+        enableVaultLock: Boolean,
+        newPassword: String?,
+        biometricEnabled: Boolean,
+        removePassword: Boolean = false,
+    ) {
+        viewModelScope.launch(dispatchers.io) {
+            if (removePassword) {
+                accessLockManager.clearPassword()
+            } else if (!newPassword.isNullOrBlank()) {
+                accessLockManager.setPassword(newPassword)
+            }
+            preferences.update { prefs ->
+                prefs.copy(
+                    vaultAccessLockEnabled = enableVaultLock,
+                    accessLockBiometricEnabled = biometricEnabled,
+                )
+            }
+            _lockConfigVersion.value += 1
+        }
     }
 
     @OptIn(ExperimentalCoilApi::class)
@@ -295,7 +400,9 @@ class VaultViewModel @Inject constructor(
     fun indexVaultAi() {
         if (_aiIndexingProgress.value != null || !backupCrypto.hasVaultPassphrase()) return
         viewModelScope.launch(dispatchers.io) {
-            val pending = runCatching { mediaAiIndexer.countUnindexed(includeLocked = true) }.getOrDefault(0)
+            val pending = runCatching {
+                mediaAiIndexer.countUnindexed(includeLocked = true, vaultOnly = true)
+            }.getOrDefault(0)
             if (pending == 0) {
                 _unindexedAiCount.value = 0
                 return@launch
@@ -305,6 +412,7 @@ class VaultViewModel @Inject constructor(
                 mediaAiIndexer.indexUnindexedBatch(
                     maxCount = 50,
                     includeLocked = true,
+                    vaultOnly = true,
                 ) { done, total ->
                     _aiIndexingProgress.value = done to total
                 }
@@ -317,7 +425,7 @@ class VaultViewModel @Inject constructor(
 
     private suspend fun refreshUnindexedAiCount() {
         val pending = if (backupCrypto.hasVaultPassphrase()) {
-            runCatching { mediaAiIndexer.countUnindexed(includeLocked = true) }.getOrDefault(0)
+            runCatching { mediaAiIndexer.countUnindexed(includeLocked = true, vaultOnly = true) }.getOrDefault(0)
         } else {
             0
         }

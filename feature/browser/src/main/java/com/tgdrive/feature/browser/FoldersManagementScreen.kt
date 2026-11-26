@@ -25,6 +25,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Sort
@@ -52,6 +54,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -90,9 +93,15 @@ fun FoldersManagementScreen(
     var deleteTarget by remember { mutableStateOf<FolderEntity?>(null) }
     var colorTarget by remember { mutableStateOf<FolderEntity?>(null) }
     var menuForFolder by remember { mutableStateOf<FolderEntity?>(null) }
+    var savedMenuExpanded by remember { mutableStateOf(false) }
+    var setupLockForChatId by remember { mutableStateOf<Long?>(null) }
+    var confirmUnlockTarget by remember { mutableStateOf<Pair<Long, String>?>(null) }
+    var confirmUnlockError by remember { mutableStateOf<String?>(null) }
     var showSortMenu by remember { mutableStateOf(false) }
 
+    val context = LocalContext.current
     val savedTitle = stringResource(R.string.browser_saved_messages)
+    val wrongPwdMsg = stringResource(R.string.access_lock_wrong_password)
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -204,24 +213,64 @@ fun FoldersManagementScreen(
                 }
 
                 // Saved Messages (always visible even when custom channels list is empty)
-                item {
+                item(contentType = "saved_messages_row") {
                     val ready = state.savedMessagesChatId != 0L
+                    val savedLocked = ready && state.savedMessagesChatId in state.lockedFolderChatIds
                     SectionLabel(
                         text = savedTitle,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
-                    FolderManagementRow(
-                        title = savedTitle,
-                        subtitle = if (ready) {
-                            stringResource(R.string.browser_saved_messages_subtitle)
-                        } else {
-                            stringResource(R.string.browser_connecting)
-                        },
-                        icon = Icons.Filled.Bookmark,
-                        tint = MaterialTheme.colorScheme.tertiary,
-                        enabled = ready,
-                        onClick = { onOpenFolder(state.savedMessagesChatId, savedTitle) },
-                    )
+                    Box {
+                        FolderManagementRow(
+                            title = savedTitle,
+                            subtitle = if (ready) {
+                                stringResource(R.string.browser_saved_messages_subtitle)
+                            } else {
+                                stringResource(R.string.browser_connecting)
+                            },
+                            icon = Icons.Filled.Bookmark,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            isLocked = savedLocked,
+                            enabled = ready,
+                            onClick = { onOpenFolder(state.savedMessagesChatId, savedTitle) },
+                            onMoreClick = if (ready) {
+                                { savedMenuExpanded = true }
+                            } else {
+                                null
+                            },
+                        )
+                        DropdownMenu(
+                            expanded = savedMenuExpanded,
+                            onDismissRequest = { savedMenuExpanded = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        stringResource(
+                                            if (savedLocked) R.string.folders_unlock_remove else R.string.folders_lock,
+                                        ),
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        if (savedLocked) Icons.Filled.LockOpen else Icons.Filled.Lock,
+                                        contentDescription = null,
+                                    )
+                                },
+                                onClick = {
+                                    savedMenuExpanded = false
+                                    if (savedLocked) {
+                                        confirmUnlockError = null
+                                        confirmUnlockTarget = state.savedMessagesChatId to savedTitle
+                                    } else if (state.hasAccessPassword || (state.accessLockBiometricEnabled && state.biometricAvailable)) {
+                                        vm.setFolderLocked(state.savedMessagesChatId, true)
+                                    } else {
+                                        setupLockForChatId = state.savedMessagesChatId
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
 
                 // 30-day Trash bin shortcut
@@ -254,9 +303,10 @@ fun FoldersManagementScreen(
                         )
                     }
                 } else {
-                    items(state.folders, key = { it.id }) { folder ->
+                    items(state.folders, key = { it.id }, contentType = { "folder_mgmt_row" }) { folder ->
                         val size = state.folderSizes[folder.channelId] ?: 0L
                         val isPinned = folder.channelId in state.pinnedFolderChatIds
+                        val isLocked = folder.channelId in state.lockedFolderChatIds
                         Box {
                             FolderManagementRow(
                                 title = folder.title,
@@ -268,6 +318,7 @@ fun FoldersManagementScreen(
                                 icon = Icons.Filled.Folder,
                                 tint = Color(folder.color),
                                 isPinned = isPinned,
+                                isLocked = isLocked,
                                 onClick = { onOpenFolder(folder.channelId, folder.title) },
                                 onMoreClick = { menuForFolder = folder },
                             )
@@ -275,6 +326,32 @@ fun FoldersManagementScreen(
                                 expanded = menuForFolder == folder,
                                 onDismissRequest = { menuForFolder = null },
                             ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            stringResource(
+                                                if (isLocked) R.string.folders_unlock_remove else R.string.folders_lock,
+                                            ),
+                                        )
+                                    },
+                                    onClick = {
+                                        menuForFolder = null
+                                        if (isLocked) {
+                                            confirmUnlockError = null
+                                            confirmUnlockTarget = folder.channelId to folder.title
+                                        } else if (state.hasAccessPassword || (state.accessLockBiometricEnabled && state.biometricAvailable)) {
+                                            vm.setFolderLocked(folder.channelId, true)
+                                        } else {
+                                            setupLockForChatId = folder.channelId
+                                        }
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            if (isLocked) Icons.Filled.LockOpen else Icons.Filled.Lock,
+                                            contentDescription = null,
+                                        )
+                                    },
+                                )
                                 DropdownMenuItem(
                                     text = {
                                         Text(
@@ -465,6 +542,70 @@ fun FoldersManagementScreen(
             },
         )
     }
+
+    setupLockForChatId?.let { lockChatId ->
+        SetAccessPasswordDialog(
+            title = stringResource(R.string.access_lock_setup_title),
+            subtitle = stringResource(R.string.access_lock_setup_subtitle),
+            hasExistingPassword = state.hasAccessPassword,
+            biometricAvailable = state.biometricAvailable,
+            biometricEnabled = state.accessLockBiometricEnabled,
+            onSave = { newPass, bioEnabled ->
+                vm.configureAccessLock(
+                    newPassword = newPass,
+                    biometricEnabled = bioEnabled,
+                    alsoLockChatId = lockChatId,
+                )
+                setupLockForChatId = null
+            },
+            onDismiss = { setupLockForChatId = null },
+        )
+    }
+
+    confirmUnlockTarget?.let { (targetChatId, targetTitle) ->
+        ConfirmAccessUnlockDialog(
+            title = stringResource(R.string.folders_lock_remove_title),
+            subtitle = stringResource(R.string.folders_lock_remove_subtitle, targetTitle),
+            hasPassword = state.hasAccessPassword,
+            canUseBiometric = state.accessLockBiometricEnabled && state.biometricAvailable,
+            error = confirmUnlockError,
+            onVerifyPassword = { candidate ->
+                if (vm.verifyAccessPassword(candidate)) {
+                    vm.setFolderLocked(targetChatId, false)
+                    confirmUnlockTarget = null
+                    confirmUnlockError = null
+                } else {
+                    confirmUnlockError = wrongPwdMsg
+                }
+            },
+            onUseBiometric = {
+                val act = context.findFragmentActivity()
+                if (act != null) {
+                    vm.authenticateBiometric(
+                        activity = act,
+                        title = context.getString(R.string.folders_lock_remove_title),
+                        subtitle = context.getString(R.string.folders_lock_remove_subtitle, targetTitle),
+                        onSuccess = {
+                            vm.setFolderLocked(targetChatId, false)
+                            confirmUnlockTarget = null
+                            confirmUnlockError = null
+                        },
+                        onError = { msg -> confirmUnlockError = msg },
+                    )
+                }
+            },
+            onDismiss = {
+                confirmUnlockTarget = null
+                confirmUnlockError = null
+            },
+        )
+    }
+}
+
+private tailrec fun android.content.Context.findFragmentActivity(): androidx.fragment.app.FragmentActivity? = when (this) {
+    is androidx.fragment.app.FragmentActivity -> this
+    is android.content.ContextWrapper -> baseContext.findFragmentActivity()
+    else -> null
 }
 
 @Composable
@@ -474,6 +615,7 @@ private fun FolderManagementRow(
     icon: ImageVector,
     tint: Color,
     isPinned: Boolean = false,
+    isLocked: Boolean = false,
     enabled: Boolean = true,
     onClick: () -> Unit,
     onMoreClick: (() -> Unit)? = null,
@@ -515,6 +657,16 @@ private fun FolderManagementRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (isLocked) {
+            Icon(
+                Icons.Filled.Lock,
+                contentDescription = stringResource(R.string.folders_locked_badge),
+                tint = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier
+                    .padding(end = 6.dp)
+                    .size(16.dp),
             )
         }
         if (isPinned) {

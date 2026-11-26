@@ -5,11 +5,15 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.tgdrive.core.db.entity.PendingUploadEntity
+import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface PendingUploadDao {
     @Query("SELECT * FROM pending_uploads ORDER BY created_at_ms ASC")
     suspend fun getAll(): List<PendingUploadEntity>
+
+    @Query("SELECT COUNT(*) FROM pending_uploads")
+    fun observeCount(): Flow<Int>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: PendingUploadEntity)

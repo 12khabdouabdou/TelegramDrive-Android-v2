@@ -515,6 +515,32 @@ class TgDriveDatabaseTest {
                 .containsExactly(801L, 77L)
             assertThat(migrated.fileCacheDao().observeActiveByBuckets(listOf("IMAGES", "VIDEOS"), 0L).first().map { it.messageId })
                 .containsExactly(803L, 801L, 77L)
+
+            // Verify vault-only list, batched thumbnail update tx, and PendingUploadDao.observeCount()
+            val vaultOnlyIds = migrated.fileCacheDao().getEncryptedVaultFiles().map { it.messageId }
+            assertThat(vaultOnlyIds).containsExactly(802L, 803L)
+
+            migrated.fileCacheDao().updateThumbnailPaths(
+                listOf(
+                    com.tgdrive.core.db.dao.FileCacheDao.ThumbnailPathUpdate(10L, 1L, "/tmp/thumb_1.jpg"),
+                    com.tgdrive.core.db.dao.FileCacheDao.ThumbnailPathUpdate(10L, 77L, "/tmp/thumb_77.jpg"),
+                ),
+            )
+            assertThat(migrated.fileCacheDao().getById(10L, 1L)?.thumbnailPath).isEqualTo("/tmp/thumb_1.jpg")
+            assertThat(migrated.fileCacheDao().getById(10L, 77L)?.thumbnailPath).isEqualTo("/tmp/thumb_77.jpg")
+
+            assertThat(migrated.pendingUploadDao().observeCount().first()).isEqualTo(0)
+            migrated.pendingUploadDao().upsert(
+                com.tgdrive.core.db.entity.PendingUploadEntity(
+                    id = "u1",
+                    kind = "FILE",
+                    chatId = 10L,
+                    displayName = "doc.pdf",
+                    payloadJson = "{}",
+                    createdAtMs = 100L,
+                ),
+            )
+            assertThat(migrated.pendingUploadDao().observeCount().first()).isEqualTo(1)
         } finally {
             migrated.close()
             dbFile.delete()
