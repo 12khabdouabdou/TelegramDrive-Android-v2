@@ -33,6 +33,7 @@ import com.tgdrive.core.telegram.TelegramFolder
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +44,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
@@ -50,6 +53,7 @@ import java.time.LocalDate
 import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import javax.inject.Inject
@@ -145,9 +149,9 @@ class PhotosTimelineViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
-    private val attemptedThumbKeys = java.util.Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
-    private val thumbChannel = kotlinx.coroutines.channels.Channel<FileCacheEntity>(capacity = 64)
-    private val thumbSemaphore = kotlinx.coroutines.sync.Semaphore(2)
+    private val attemptedThumbKeys = Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
+    private val thumbChannel = Channel<FileCacheEntity>(capacity = 64)
+    private val thumbSemaphore = Semaphore(2)
     private val attemptedDurationKeys = HashSet<Pair<Long, Long>>()
 
     private val _viewMode = MutableStateFlow(PhotosViewMode.TIMELINE)
@@ -170,7 +174,7 @@ class PhotosTimelineViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             for (entity in thumbChannel) {
                 launch {
-                    kotlinx.coroutines.sync.withPermit(thumbSemaphore) {
+                    thumbSemaphore.withPermit {
                         try {
                             mediaThumbnailCache.ensureThumbnail(entity)
                         } catch (e: CancellationException) {
