@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.tgdrive.core.common.CrashLogStore
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.FileBucket
 import com.tgdrive.core.common.Log
@@ -36,6 +37,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +45,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import javax.inject.Inject
 
@@ -119,6 +123,7 @@ class HomeViewModel
         private val _zipPreviewLoading = MutableStateFlow(false)
         val zipPreviewLoading: StateFlow<Boolean> = _zipPreviewLoading.asStateFlow()
         private var zipInspectJob: Job? = null
+        private val refreshFoldersMutex = Mutex()
         private val warmedThumbKeys = HashSet<Pair<Long, Long>>()
 
         val state: StateFlow<HomeUiState> =
@@ -296,49 +301,62 @@ class HomeViewModel
 
         fun refreshFolders() {
             viewModelScope.launch(dispatchers.io) {
-                _loading.value = true
-                try {
-                    if (_savedChatId.value == 0L) {
-                        runCatching { telegramClient.myUserId() }.onSuccess { _savedChatId.value = it }
-                    }
-                    val remote = telegramClient.listFolders()
-                    val remoteChannelIds = remote.filter { !it.isSelf }.map { it.chatId }.toSet()
-
-                    val all = folderDao.getAll()
-                    val existing = all.associateBy { it.channelId }
-                    remote.filter { !it.isSelf }.forEach { f ->
-                        val local = existing[f.chatId]
-                        if (local == null) {
-                            folderDao.insert(
-                                FolderEntity(
-                                    channelId = f.chatId,
-                                    title = f.title,
-                                    createdAt = f.createdAtMs,
-                                ),
-                            )
-                        } else if (local.title != f.title) {
-                            folderDao.update(local.copy(title = f.title))
+                refreshFoldersMutex.withLock {
+                    _loading.value = true
+                    try {
+                        if (_savedChatId.value == 0L) {
+                            runCatching { telegramClient.myUserId() }.onSuccess { _savedChatId.value = it }
                         }
-                    }
-
-                    if (remoteChannelIds.isNotEmpty()) {
-                        val toDelete = existing.keys - remoteChannelIds
-                        for (channelId in toDelete) {
-                            val localFolder = existing[channelId]
-                            if (localFolder != null) {
-                                folderDao.deleteById(localFolder.id)
+                        var remote = telegramClient.listFolders()
+                        if (remote.none { !it.isSelf }) {
+                            delay(600L)
+                            val retry = telegramClient.listFolders()
+                            if (retry.any { !it.isSelf }) {
+                                remote = retry
                             }
                         }
-                    }
+                        val remoteChannelIds = remote.filter { !it.isSelf }.map { it.chatId }.toSet()
 
-                    _error.value = null
-                    refreshDashboard()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (t: Throwable) {
-                    _error.value = t.message ?: "Failed to load folders"
-                } finally {
-                    _loading.value = false
+                        val all = folderDao.getAll()
+                        val existing = all.associateBy { it.channelId }
+                        remote.filter { !it.isSelf }.forEach { f ->
+                            val local = existing[f.chatId]
+                            if (local == null) {
+                                folderDao.insert(
+                                    FolderEntity(
+                                        channelId = f.chatId,
+                                        title = f.title,
+                                        createdAt = f.createdAtMs,
+                                    ),
+                                )
+                            } else if (local.title != f.title) {
+                                folderDao.update(local.copy(title = f.title))
+                            }
+                        }
+
+                        if (remoteChannelIds.isNotEmpty()) {
+                            val toDelete = existing.keys - remoteChannelIds
+                            for (channelId in toDelete) {
+                                val localFolder = existing[channelId]
+                                if (localFolder != null) {
+                                    folderDao.deleteById(localFolder.id)
+                                }
+                            }
+                        }
+
+                        _error.value = null
+                        refreshDashboard()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w("HomeViewModel: refreshFolders failed", t)
+                        CrashLogStore.recordNonFatal(appContext, "refreshFolders", t)
+                        val detail = t.message?.takeIf { it.isNotBlank() }?.let { "${t.javaClass.simpleName}: $it" }
+                            ?: t.javaClass.simpleName
+                        _error.value = "Failed to load folders: $detail"
+                    } finally {
+                        _loading.value = false
+                    }
                 }
             }
         }

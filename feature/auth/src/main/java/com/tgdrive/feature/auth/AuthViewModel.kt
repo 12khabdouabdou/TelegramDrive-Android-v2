@@ -17,8 +17,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
 /**
@@ -207,7 +209,12 @@ class AuthViewModel @Inject constructor(
                     apiHash = trimmedHash,
                     sessionDir = SESSION_DIR,
                 )
-                val nextStep = mapAuthStep(telegramClient.authState.value) ?: AuthStep.Phone
+                val settled = withTimeoutOrNull(2_000L) {
+                    telegramClient.authState.first {
+                        it !is AuthorizationState.WaitInitialization && mapAuthStep(it) != null
+                    }
+                } ?: telegramClient.authState.value
+                val nextStep = mapAuthStep(settled) ?: AuthStep.Phone
                 _state.update { it.copy(loading = false, step = nextStep) }
             } catch (e: CancellationException) {
                 throw e
@@ -306,6 +313,11 @@ class AuthViewModel @Inject constructor(
                 throw e
             } catch (e: TelegramException) {
                 val raw = e.errorMessage.orEmpty()
+                val resyncedStep = if (raw.contains("Unexpected", ignoreCase = true)) {
+                    mapAuthStep(telegramClient.authState.value)
+                } else {
+                    null
+                }
                 val friendly = when {
                     raw.contains("UPDATE_APP_TO_LOGIN", ignoreCase = true) ||
                         raw.contains("PHONE_NUMBER_APP_SIGNUP_FORBIDDEN", ignoreCase = true) ->
@@ -318,10 +330,12 @@ class AuthViewModel @Inject constructor(
                         "Too many login attempts ($raw). Wait before retrying, or try QR sign-in later."
                     else -> e.message ?: "Authentication error"
                 }
-                _state.update { it.copy(loading = false, error = friendly) }
+                _state.update { it.copy(loading = false, step = resyncedStep ?: it.step, error = friendly) }
             } catch (t: Throwable) {
                 Log.w("Auth action failed", t)
-                _state.update { it.copy(loading = false, error = t.message ?: "Unexpected error") }
+                val detail = t.message?.takeIf { it.isNotBlank() }?.let { "${t.javaClass.simpleName}: $it" }
+                    ?: t.javaClass.simpleName
+                _state.update { it.copy(loading = false, error = detail) }
             } finally {
                 if (_state.value.error == null) {
                     _state.update { it.copy(loading = false) }

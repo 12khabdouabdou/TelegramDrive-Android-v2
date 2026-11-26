@@ -38,7 +38,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -49,6 +48,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipFile
+import com.tgdrive.core.common.CrashLogStore
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.common.Log
 import com.tgdrive.core.security.KeystoreHelper
@@ -63,6 +63,7 @@ class TdLibTelegramClient(
 
     @Volatile private var scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatchers.io)
     @Volatile private var client: Client? = null
+    @Volatile internal var rawSendOverride: ((TdApi.Function<*>, (TdApi.Object?) -> Unit, (Throwable?) -> Unit) -> Unit)? = null
     @Volatile private var initializedApiId: Int? = null
     @Volatile private var initializedApiHash: String? = null
     @Volatile private var myUserIdCache: Long? = null
@@ -289,7 +290,7 @@ class TdLibTelegramClient(
                 systemLanguageCode = langCode
                 deviceModel = modelName
                 systemVersion = sysVersion
-                applicationVersion = "1.0.3"
+                applicationVersion = "1.0.4"
                 useTestDc = false
                 databaseEncryptionKey = keystoreHelper.tdlibSessionKey()
             }
@@ -342,7 +343,7 @@ class TdLibTelegramClient(
                             systemLanguageCode = langCode
                             deviceModel = modelName
                             systemVersion = sysVersion
-                            applicationVersion = "1.0.3"
+                            applicationVersion = "1.0.4"
                             useTestDc = false
                             databaseEncryptionKey = freshKey
                         }
@@ -386,11 +387,7 @@ class TdLibTelegramClient(
             val retrySafe = isFloodRetrySafe(function)
             for (attempt in 0..MAX_FLOOD_WAIT_RETRIES) {
                 try {
-                    return@withContext if (bypassGate) {
-                        sendOnce(function)
-                    } else {
-                        requestSemaphore.withPermit { sendOnce(function) }
-                    }
+                    return@withContext sendGated(bypassGate, function)
                 } catch (e: TelegramException) {
                     val waitSec = parseFloodWaitSeconds(e.code, e.errorMessage)
                     if (waitSec != null &&
@@ -406,23 +403,63 @@ class TdLibTelegramClient(
                     } else {
                         throw e
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("TDLib send(${function.javaClass.simpleName}) failed unexpectedly", t)
+                    CrashLogStore.recordNonFatal(appContext, "tdlib_send:${function.javaClass.simpleName}", t)
+                    throw t
                 }
             }
             throw TelegramException(-1, "Unexpected retry termination for ${function.javaClass.simpleName}")
         }
 
+    private suspend fun <T : TdApi.Object> sendGated(
+        bypassGate: Boolean,
+        function: TdApi.Function<*>,
+    ): T {
+        if (bypassGate) return sendOnce(function)
+        requestSemaphore.acquire()
+        try {
+            return sendOnce(function)
+        } finally {
+            requestSemaphore.release()
+        }
+    }
+
     private suspend fun <T : TdApi.Object> sendOnce(function: TdApi.Function<*>): T {
-        val c = client ?: throw TelegramException(-1, "TDLib not initialised")
+        val override = rawSendOverride
+        val c = if (override == null) {
+            client ?: initLock.withLock { client }
+                ?: throw TelegramException(-1, "TDLib not initialised")
+        } else {
+            null
+        }
         return suspendCancellableCoroutine { cont ->
-            c.send(function, { result ->
-                if (!cont.isActive) return@send
-                when (result) {
-                    is TdApi.Error -> cont.resumeWithException(TelegramException.fromError(result))
-                    else -> @Suppress("UNCHECKED_CAST") cont.resume(result as T)
+            val onResult: (TdApi.Object?) -> Unit = { result ->
+                if (cont.isActive) {
+                    when (result) {
+                        null -> cont.resumeWithException(
+                            IllegalStateException("TDLib returned null response for ${function.javaClass.simpleName}"),
+                        )
+                        is TdApi.Error -> cont.resumeWithException(TelegramException.fromError(result))
+                        else -> @Suppress("UNCHECKED_CAST") cont.resume(result as T)
+                    }
                 }
-            }, { t ->
-                if (cont.isActive) cont.resumeWithException(t)
-            })
+            }
+            val onException: (Throwable?) -> Unit = { t ->
+                if (cont.isActive) {
+                    val cause = t ?: IllegalStateException(
+                        "TDLib raised unknown exception for ${function.javaClass.simpleName}",
+                    )
+                    cont.resumeWithException(cause)
+                }
+            }
+            if (override != null) {
+                override(function, onResult, onException)
+            } else {
+                c!!.send(function, onResult, onException)
+            }
         }
     }
 
@@ -572,14 +609,24 @@ class TdLibTelegramClient(
         catch (t: Throwable) { Log.w("searchMessagesGlobal failed", t); emptyList() }
     }
 
-    override suspend fun listFolders(): List<TelegramFolder> = withContext(dispatchers.io) {
-        val me = myUserId()
+    private suspend fun fetchMainChats(): TdApi.Chats {
         try {
             send<TdApi.Ok>(TdApi.LoadChats(TdApi.ChatListMain(), 200))
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
-        } catch (_: Throwable) {}
-        val resp = send<TdApi.Chats>(TdApi.GetChats(TdApi.ChatListMain(), 200))
+        } catch (t: Throwable) {
+            Log.w("TDLib: LoadChats failed", t)
+        }
+        return send<TdApi.Chats>(TdApi.GetChats(TdApi.ChatListMain(), 200))
+    }
+
+    override suspend fun listFolders(): List<TelegramFolder> = withContext(dispatchers.io) {
+        val me = myUserId()
+        var resp = fetchMainChats()
+        if (resp.chatIds.isEmpty()) {
+            delay(500L)
+            resp = fetchMainChats()
+        }
         val folders = mutableListOf(TelegramFolder(me, "Saved Messages", true, false, System.currentTimeMillis()))
         val extraFolders = coroutineScope {
             resp.chatIds.map { id ->

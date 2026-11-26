@@ -24,7 +24,7 @@ interface FolderDao {
     @Query("SELECT * FROM folders WHERE channel_id = :channelId LIMIT 1")
     suspend fun getByChannelId(channelId: Long): FolderEntity?
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(folder: FolderEntity): Long
 
     @Update

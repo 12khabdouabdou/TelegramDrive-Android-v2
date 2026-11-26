@@ -221,4 +221,18 @@ class AuthViewModelTest {
         advanceUntilIdle()
         coVerify { telegramClient.registerNewUser("Ada", "Lovelace") }
     }
+
+    @Test
+    fun `runAuthAction surfaces exception class name when throwable message is null`() = runTest(testDispatcher) {
+        coEvery { telegramClient.sendPhoneNumber("+15551234567") } throws RuntimeException()
+        val vm = AuthViewModel(telegramClient, keystore, dispatchers)
+        runCurrent()
+
+        vm.onPhoneChanged("+15551234567")
+        vm.submitPhone()
+        advanceUntilIdle()
+
+        assertThat(vm.state.value.error).isEqualTo("RuntimeException")
+        assertThat(vm.state.value.loading).isFalse()
+    }
 }

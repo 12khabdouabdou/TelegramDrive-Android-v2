@@ -34,6 +34,24 @@ object CrashLogStore {
         }
     }
 
+    fun recordNonFatal(context: Context, tag: String, throwable: Throwable) {
+        try {
+            val sw = StringWriter()
+            PrintWriter(sw).use { pw ->
+                pw.println("Timestamp: ${Instant.now()}")
+                pw.println("Device: ${Build.MANUFACTURER} ${Build.MODEL} (SDK ${Build.VERSION.SDK_INT})")
+                pw.println("NonFatal: $tag")
+                pw.println()
+                throwable.printStackTrace(pw)
+            }
+            val text = sw.toString().take(MAX_CHARS)
+            val file = File(context.filesDir, FILE_NAME)
+            file.writeText(text)
+        } catch (_: Throwable) {
+            // Best-effort diagnostic logging only; never mask the original exception.
+        }
+    }
+
     fun read(context: Context): String? =
         try {
             val file = File(context.filesDir, FILE_NAME)
