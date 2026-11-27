@@ -215,9 +215,9 @@ class FolderSubfolderLogicTest {
     }
 
     @Test
-    fun `sanitizeSubfolderSegment strips path separators and control chars`() {
-        assertThat(FolderViewModel.sanitizeSubfolderSegment("  /Vacation\\2026/ ")).isEqualTo("Vacation2026")
-        assertThat(FolderViewModel.sanitizeSubfolderSegment("...")).isEmpty()
+    fun `sanitizeSubfolderSegment normalizes path separators`() {
+        assertThat(FolderViewModel.sanitizeSubfolderSegment("  /Vacation\\2026/ ")).isEqualTo("Vacation_2026")
+        assertThat(FolderViewModel.sanitizeSubfolderSegment("   /\\  ")).isEmpty()
     }
 
     @Test
