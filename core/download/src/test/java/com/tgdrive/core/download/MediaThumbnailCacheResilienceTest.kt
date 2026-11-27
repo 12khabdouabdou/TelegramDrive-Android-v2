@@ -15,13 +15,15 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -38,21 +40,12 @@ class MediaThumbnailCacheResilienceTest {
     private lateinit var backupCrypto: BackupCrypto
     private lateinit var cloudSyncManager: CloudSyncManager
     private lateinit var appPreferences: AppPreferences
-    private lateinit var dispatchers: DispatchersProvider
 
     @TempDir
     lateinit var tempDir: File
 
     @BeforeEach
     fun setUp() {
-        val d = UnconfinedTestDispatcher()
-        dispatchers =
-            object : DispatchersProvider {
-                override val io: CoroutineDispatcher = d
-                override val default: CoroutineDispatcher = d
-                override val main: CoroutineDispatcher = d
-                override val unconfined: CoroutineDispatcher = d
-            }
         ctx = mockk(relaxed = true)
         telegramClient = mockk(relaxed = true)
         fileCacheDao = mockk(relaxed = true)
@@ -68,7 +61,17 @@ class MediaThumbnailCacheResilienceTest {
         every { downloadManager.findItem(any(), any()) } returns null
     }
 
-    private fun newCache() =
+    private fun testDispatchers(scheduler: TestCoroutineScheduler): DispatchersProvider {
+        val d = UnconfinedTestDispatcher(scheduler)
+        return object : DispatchersProvider {
+            override val io: CoroutineDispatcher = d
+            override val default: CoroutineDispatcher = d
+            override val main: CoroutineDispatcher = d
+            override val unconfined: CoroutineDispatcher = d
+        }
+    }
+
+    private fun newCache(scheduler: TestCoroutineScheduler) =
         MediaThumbnailCache(
             ctx = ctx,
             telegramClient = telegramClient,
@@ -78,20 +81,22 @@ class MediaThumbnailCacheResilienceTest {
             backupCrypto = backupCrypto,
             cloudSyncManager = cloudSyncManager,
             appPreferences = appPreferences,
-            dispatchers = dispatchers,
+            dispatchers = testDispatchers(scheduler),
         )
 
     @Test
     fun `restoreEncryptedThumbFromCloud deduplicates concurrent requests`() =
         runTest {
-            val cache = newCache()
+            val cache = newCache(testScheduler)
+            val gate = CompletableDeferred<ByteArray>()
             coEvery { cloudSyncManager.restoreEncryptedThumbBytes(10L, 100L) } coAnswers {
-                delay(40L)
-                byteArrayOf(7, 8, 9)
+                gate.await()
             }
 
             val a = async { cache.restoreEncryptedThumbFromCloud(10L, 100L) }
             val b = async { cache.restoreEncryptedThumbFromCloud(10L, 100L) }
+            runCurrent()
+            gate.complete(byteArrayOf(7, 8, 9))
             val pathA = a.await()
             val pathB = b.await()
 
@@ -103,7 +108,7 @@ class MediaThumbnailCacheResilienceTest {
     @Test
     fun `restoreEncryptedThumbFromCloud retries immediately after clearThumbnailFailure`() =
         runTest {
-            val cache = newCache()
+            val cache = newCache(testScheduler)
             coEvery {
                 cloudSyncManager.restoreEncryptedThumbBytes(10L, 200L)
             } returnsMany listOf(null, byteArrayOf(1, 2, 3, 4))
@@ -122,7 +127,7 @@ class MediaThumbnailCacheResilienceTest {
     @Test
     fun `ensureThumbnail bypasses cooldown and recovers when force is true`() =
         runTest {
-            val cache = newCache()
+            val cache = newCache(testScheduler)
             val validThumb = File(tempDir, "ok_300.jpg").apply { writeBytes(byteArrayOf(10, 20, 30)) }
             val entity =
                 FileCacheEntity(

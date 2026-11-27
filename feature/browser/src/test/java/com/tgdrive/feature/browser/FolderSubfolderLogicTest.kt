@@ -34,6 +34,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -65,6 +66,7 @@ class FolderSubfolderLogicTest {
     private lateinit var cloudSyncManager: CloudSyncManager
     private lateinit var mediaThumbnailCache: MediaThumbnailCache
     private lateinit var appContext: Context
+    private lateinit var testDispatcher: TestDispatcher
     private lateinit var dispatchers: DispatchersProvider
 
     private lateinit var prefsFlow: MutableStateFlow<AppPreferencesData>
@@ -78,7 +80,7 @@ class FolderSubfolderLogicTest {
 
     @BeforeEach
     fun setUp() {
-        val testDispatcher = UnconfinedTestDispatcher()
+        testDispatcher = UnconfinedTestDispatcher()
         Dispatchers.setMain(testDispatcher)
         dispatchers =
             object : DispatchersProvider {
@@ -224,7 +226,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `deleteVirtualFolder trash mode deletes contents and undoLastTrash restores virtualPath`() =
-        runTest {
+        runTest(testDispatcher) {
             val vm = newVm()
             val collectJob = backgroundScope.launch { vm.state.collect {} }
             dbItemsFlow.value =
@@ -263,7 +265,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `deleteVirtualFolder permanent mode deletes messages on Telegram and unpins`() =
-        runTest {
+        runTest(testDispatcher) {
             val vm = newVm()
             val collectJob = backgroundScope.launch { vm.state.collect {} }
             dbItemsFlow.value =
@@ -290,7 +292,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `renameVirtualFolder updates nested file paths and custom empty folders`() =
-        runTest {
+        runTest(testDispatcher) {
             val vm = newVm()
             val collectJob = backgroundScope.launch { vm.state.collect {} }
             dbItemsFlow.value =
@@ -316,7 +318,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `refresh inside subfolder syncs cloud increments nonce and warms encrypted thumbs`() =
-        runTest {
+        runTest(testDispatcher) {
             every { backupCrypto.hasVaultPassphrase() } returns true
             every { backupCrypto.passphraseFingerprint() } returns "fp-123"
             coEvery { mediaThumbnailCache.restoreEncryptedThumbFromCloud(chatId, 31L) } returns "/tmp/enc_31.tgthumb"
@@ -344,7 +346,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `encrypted preview items appear in subfolder cover thumbs when enabled and hide when disabled`() =
-        runTest {
+        runTest(testDispatcher) {
             every { backupCrypto.hasVaultPassphrase() } returns true
             every { backupCrypto.passphraseFingerprint() } returns "fp-abc"
 
@@ -380,7 +382,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `opening subfolder warms all its items immediately after large root warm`() =
-        runTest {
+        runTest(testDispatcher) {
             every { mediaThumbnailCache.needsThumbnailUpgrade(null) } returns true
             val rootItems =
                 (1L..200L).map { id ->
@@ -410,7 +412,7 @@ class FolderSubfolderLogicTest {
 
     @Test
     fun `large 1500 item folder caps subfolder cover thumbs at 4 per subfolder`() =
-        runTest {
+        runTest(testDispatcher) {
             val largeList =
                 (0 until 1500).map { idx ->
                     val folderIdx = idx / 30
