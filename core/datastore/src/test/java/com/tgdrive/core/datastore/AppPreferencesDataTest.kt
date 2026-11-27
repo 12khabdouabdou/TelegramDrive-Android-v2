@@ -31,7 +31,7 @@ class AppPreferencesDataTest {
         assertThat(d.downloadWifiOnly).isFalse()
         assertThat(d.autoSaveDownloadsToPublic).isFalse()
         assertThat(d.pinnedFolderChatIds).isEmpty()
-        assertThat(d.showEncryptedPreviewsWhenUnlocked).isFalse()
+        assertThat(d.showEncryptedPreviewsWhenUnlocked).isTrue()
     }
 
     @Test

@@ -48,6 +48,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -130,9 +131,10 @@ data class FolderUiState(
     val batchDecryptProgress: Pair<Int, Int>? = null,
     val currentVirtualPath: String = "",
     val childVirtualFolders: List<Pair<String, Int>> = emptyList(),
-    val childVirtualFolderThumbs: Map<String, List<String>> = emptyMap(),
+    val childVirtualFolderThumbs: Map<String, List<SubfolderThumbItem>> = emptyMap(),
     val allVirtualPaths: List<String> = emptyList(),
     val encryptedPreviewFingerprint: String? = null,
+    val thumbRefreshNonce: Int = 0,
     val isFolderLockedByPref: Boolean = false,
     val isFolderLockRequired: Boolean = false,
     val isFolderUnlocked: Boolean = true,
@@ -142,6 +144,22 @@ data class FolderUiState(
     val biometricAvailable: Boolean = false,
     val accessLockBiometricEnabled: Boolean = true,
     val lockError: String? = null,
+)
+
+@Immutable
+data class SubfolderThumbItem(
+    val chatId: Long,
+    val messageId: Long,
+    val localPath: String?,
+    val isEncrypted: Boolean,
+)
+
+@Immutable
+data class SubfolderDeleteStats(
+    val virtualPath: String,
+    val displayName: String,
+    val fileCount: Int,
+    val nestedSubfolderCount: Int,
 )
 
 data class FolderSnackbarEvent(
@@ -198,6 +216,8 @@ class FolderViewModel
         private val _folderLockReady = MutableStateFlow(false)
         private val _lockError = MutableStateFlow<String?>(null)
         private val _lockConfigVersion = MutableStateFlow(0)
+        private val _thumbRefreshNonce = MutableStateFlow(0)
+        private val _passphraseVersion = MutableStateFlow(0)
 
         private val decryptFlow = DecryptFlowCoordinator(
             scope = viewModelScope,
@@ -229,6 +249,7 @@ class FolderViewModel
         private var audioPlayWaitJob: Job? = null
         private var zipInspectJob: Job? = null
         private var lastTrashedBatch: List<TrashEntryEntity> = emptyList()
+        private val lastTrashedVirtualPaths = HashMap<Pair<Long, Long>, String>()
 
         private val _items = MutableStateFlow<List<FileCacheEntity>>(emptyList())
         private val _boundChatId = MutableStateFlow<Long?>(null)
@@ -237,6 +258,9 @@ class FolderViewModel
         private var hasRefreshedSinceBind: Boolean = false
 
         init {
+            viewModelScope.launch(dispatchers.io) {
+                loadCustomVirtualFoldersFromDisk()
+            }
             viewModelScope.launch(dispatchers.io) {
                 uploadManager.completedChatEvents.collect { doneChatId ->
                     if (doneChatId == currentChatId) {
@@ -249,7 +273,17 @@ class FolderViewModel
                     launch {
                         thumbSemaphore.withPermit {
                             try {
-                                mediaThumbnailCache.ensureThumbnail(entity, force = force)
+                                val isEncrypted = isEncryptedEntity(entity)
+                                if (isEncrypted) {
+                                    if (backupCrypto.hasVaultPassphrase()) {
+                                        mediaThumbnailCache.restoreEncryptedThumbFromCloud(
+                                            entity.chatId,
+                                            entity.messageId,
+                                        )
+                                    }
+                                } else {
+                                    mediaThumbnailCache.ensureThumbnail(entity, force = force)
+                                }
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (_: Throwable) {
@@ -261,10 +295,17 @@ class FolderViewModel
         }
 
         fun requestThumbnail(entity: FileCacheEntity, force: Boolean = false) {
-            if (entity.isLocked || entity.isEncryptedVault || BackupCrypto.isEncryptedFileName(entity.fileName)) {
-                return
+            val isEncrypted = isEncryptedEntity(entity)
+            if (isEncrypted) {
+                if (!backupCrypto.hasVaultPassphrase()) return
+                val hasLocal = entity.thumbnailPath?.let { path ->
+                    path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
+                        mediaThumbnailCache.isValidThumbnailPath(path)
+                } == true
+                if (!force && hasLocal) return
+            } else {
+                if (!force && !mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)) return
             }
-            if (!force && !mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)) return
             val key = entity.chatId to entity.messageId
             if (force || attemptedThumbKeys.add(key)) {
                 thumbRequests.trySend(entity to force)
@@ -280,6 +321,7 @@ class FolderViewModel
             val folderLockReady: Boolean,
             val lockError: String?,
             val lockConfigVersion: Int,
+            val thumbRefreshNonce: Int,
         )
 
         private data class FolderCoreState(
@@ -299,12 +341,18 @@ class FolderViewModel
         )
 
         private val lockTailFlow = combine(
-            _isFolderUnlocked,
-            _folderLockReady,
-            _lockError,
-            _lockConfigVersion,
-        ) { unlocked, ready, lockErr, cfgVer ->
-            listOf(unlocked, ready, lockErr, cfgVer)
+            combine(
+                _isFolderUnlocked,
+                _folderLockReady,
+                _lockError,
+                _lockConfigVersion,
+            ) { unlocked, ready, lockErr, cfgVer ->
+                listOf(unlocked, ready, lockErr, cfgVer)
+            },
+            _thumbRefreshNonce,
+            _passphraseVersion,
+        ) { base, nonce, _ ->
+            base + nonce
         }
 
         val state: StateFlow<FolderUiState> =
@@ -341,6 +389,7 @@ class FolderViewModel
                             folderLockReady = lt[1] as Boolean,
                             lockError = lt[2] as String?,
                             lockConfigVersion = lt[3] as Int,
+                            thumbRefreshNonce = lt[4] as Int,
                         )
                     },
                 ) {
@@ -366,62 +415,92 @@ class FolderViewModel
                 val hasAccessPass = accessLockManager.hasPassword()
                 val canUseBio = isLockedPref && bioAvail && prefs.accessLockBiometricEnabled
                 val lockRequired = isLockedPref && (hasAccessPass || canUseBio)
+                val isUnlockedNow = !lockRequired || auxTail.isFolderUnlocked
+                val encFp = if (prefs.showEncryptedPreviewsWhenUnlocked && isUnlockedNow) {
+                    backupCrypto.passphraseFingerprint()
+                } else {
+                    null
+                }
 
                 val unlockedItems = c.items.filterNot { it.isLocked }
-                val inVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
+                val inDirectVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
 
                 val childCounts = LinkedHashMap<String, Int>()
-                val childThumbs = LinkedHashMap<String, MutableList<String>>()
+                val childThumbs = LinkedHashMap<String, MutableList<SubfolderThumbItem>>()
                 val allVPaths = LinkedHashSet<String>()
                 for (cv in customForChat) {
                     val normCv = normalizeVirtualPath(cv)
                     if (normCv.isNotEmpty()) allVPaths.add(normCv)
                 }
 
-                val folderScoped = if (inVirtualMode) {
-                    unlockedItems.filter { item ->
-                        val itemPath = normalizeVirtualPath(item.virtualPath)
-                        if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
-                        val candidateThumb = if (!item.isEncryptedVault &&
-                            !BackupCrypto.isEncryptedFileName(item.fileName)
-                        ) {
-                            item.thumbnailPath?.takeIf { path ->
-                                !path.endsWith(".tgethumb", ignoreCase = true) &&
+                val folderScoped = unlockedItems.filter { item ->
+                    val itemPath = normalizeVirtualPath(item.virtualPath)
+                    if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
+
+                    val isEnc = isEncryptedEntity(item)
+                    val candidateThumb: SubfolderThumbItem? = if (isEnc) {
+                        if (encFp != null) {
+                            val validLocal = item.thumbnailPath?.takeIf { path ->
+                                path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
                                     File(path).let { f -> f.isFile && f.length() > 0L }
+                            } ?: mediaThumbnailCache.getEncryptedThumbnailPath(item.chatId, item.messageId)
+                            val hasCloud = validLocal != null ||
+                                cloudSyncManager.getCloudEncryptedThumbRemoteId(item.chatId, item.messageId) != null
+                            if (hasCloud) {
+                                SubfolderThumbItem(
+                                    chatId = item.chatId,
+                                    messageId = item.messageId,
+                                    localPath = validLocal,
+                                    isEncrypted = true,
+                                )
+                            } else {
+                                null
                             }
                         } else {
                             null
                         }
-                        if (rawVirtualPath.isEmpty()) {
-                            if (itemPath.isNotEmpty()) {
-                                val top = itemPath.substringBefore('/')
-                                childCounts[top] = (childCounts[top] ?: 0) + 1
-                                if (candidateThumb != null) {
-                                    val list = childThumbs.getOrPut(top) { ArrayList(4) }
-                                    if (list.size < 4) list.add(candidateThumb)
-                                }
-                            }
-                        } else if (itemPath.startsWith("$rawVirtualPath/")) {
-                            val rest = itemPath.removePrefix("$rawVirtualPath/")
-                            val directChild = rest.substringBefore('/')
-                            if (directChild.isNotEmpty()) {
-                                childCounts[directChild] = (childCounts[directChild] ?: 0) + 1
-                                if (candidateThumb != null) {
-                                    val list = childThumbs.getOrPut(directChild) { ArrayList(4) }
-                                    if (list.size < 4) list.add(candidateThumb)
-                                }
+                    } else {
+                        item.thumbnailPath?.takeIf { path ->
+                            !path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
+                                File(path).let { f -> f.isFile && f.length() > 0L }
+                        }?.let { path ->
+                            SubfolderThumbItem(
+                                chatId = item.chatId,
+                                messageId = item.messageId,
+                                localPath = path,
+                                isEncrypted = false,
+                            )
+                        }
+                    }
+
+                    if (rawVirtualPath.isEmpty()) {
+                        if (itemPath.isNotEmpty()) {
+                            val top = itemPath.substringBefore('/')
+                            childCounts[top] = (childCounts[top] ?: 0) + 1
+                            if (candidateThumb != null) {
+                                val list = childThumbs.getOrPut(top) { ArrayList(4) }
+                                if (list.size < 4) list.add(candidateThumb)
                             }
                         }
-                        itemPath == rawVirtualPath
+                    } else if (itemPath.startsWith("$rawVirtualPath/")) {
+                        val rest = itemPath.removePrefix("$rawVirtualPath/")
+                        val directChild = rest.substringBefore('/')
+                        if (directChild.isNotEmpty()) {
+                            childCounts[directChild] = (childCounts[directChild] ?: 0) + 1
+                            if (candidateThumb != null) {
+                                val list = childThumbs.getOrPut(directChild) { ArrayList(4) }
+                                if (list.size < 4) list.add(candidateThumb)
+                            }
+                        }
                     }
-                } else {
-                    for (item in unlockedItems) {
-                        val itemPath = normalizeVirtualPath(item.virtualPath)
-                        if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
+
+                    when {
+                        inDirectVirtualMode -> itemPath == rawVirtualPath
+                        rawVirtualPath.isNotEmpty() -> matchesSubfolderPrefix(itemPath, rawVirtualPath)
+                        else -> true
                     }
-                    unlockedItems
                 }
-                if (inVirtualMode) {
+                if (inDirectVirtualMode) {
                     for (cv in customForChat) {
                         val normCv = normalizeVirtualPath(cv)
                         if (normCv.isEmpty()) continue
@@ -481,14 +560,11 @@ class FolderViewModel
                     childVirtualFolders = childFolders,
                     childVirtualFolderThumbs = childThumbs,
                     allVirtualPaths = allVPaths.sorted(),
-                    encryptedPreviewFingerprint = if (prefs.showEncryptedPreviewsWhenUnlocked) {
-                        backupCrypto.passphraseFingerprint()
-                    } else {
-                        null
-                    },
+                    encryptedPreviewFingerprint = encFp,
+                    thumbRefreshNonce = auxTail.thumbRefreshNonce,
                     isFolderLockedByPref = isLockedPref,
                     isFolderLockRequired = lockRequired,
-                    isFolderUnlocked = !lockRequired || auxTail.isFolderUnlocked,
+                    isFolderUnlocked = isUnlockedNow,
                     folderLockReady = auxTail.folderLockReady,
                     hasAccessPassword = hasAccessPass,
                     canUseBiometricLock = canUseBio,
@@ -652,38 +728,7 @@ class FolderViewModel
                 viewModelScope.launch(dispatchers.io) {
                     fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
                         _items.value = entities
-                        var queued = 0
-                        val perSubfolderCount = HashMap<String, Int>()
-                        var subfolderQueued = 0
-                        for (entity in entities) {
-                            if (mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath) &&
-                                !entity.isLocked &&
-                                !entity.isEncryptedVault &&
-                                !BackupCrypto.isEncryptedFileName(entity.fileName)
-                            ) {
-                                val normVpath = normalizeVirtualPath(entity.virtualPath)
-                                val topFolder = if (normVpath.isNotEmpty()) normVpath.substringBefore('/') else ""
-                                val shouldWarmTop = queued < 30
-                                val shouldWarmSubfolderCover = !shouldWarmTop &&
-                                    topFolder.isNotEmpty() &&
-                                    subfolderQueued < 24 &&
-                                    (perSubfolderCount[topFolder] ?: 0) < 4 &&
-                                    hasThumbnailableKind(entity)
-                                if (shouldWarmTop || shouldWarmSubfolderCover) {
-                                    val key = entity.chatId to entity.messageId
-                                    if (attemptedThumbKeys.add(key)) {
-                                        thumbRequests.trySend(entity to false)
-                                        if (shouldWarmTop) {
-                                            queued++
-                                        } else {
-                                            subfolderQueued++
-                                            perSubfolderCount[topFolder] = (perSubfolderCount[topFolder] ?: 0) + 1
-                                        }
-                                    }
-                                }
-                            }
-                            if (queued >= 30 && subfolderQueued >= 24) break
-                        }
+                        warmThumbnailsForEntities(entities, activeSubfolder = normalizeVirtualPath(_virtualPath.value))
                         launch { refreshLocalThumbnails(chatId, entities) }
                     }
                 }
@@ -741,10 +786,76 @@ class FolderViewModel
             return if (trashedIds.isEmpty()) msgs else msgs.filter { it.id !in trashedIds }
         }
 
+        private fun warmThumbnailsForEntities(
+            entities: List<FileCacheEntity>,
+            activeSubfolder: String,
+        ) {
+            val hasPassphrase = backupCrypto.hasVaultPassphrase()
+            fun needsWarm(entity: FileCacheEntity): Boolean {
+                if (entity.isLocked) return false
+                if (isEncryptedEntity(entity)) {
+                    if (!hasPassphrase) return false
+                    val path = entity.thumbnailPath
+                    val validLocal = path != null &&
+                        path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
+                        mediaThumbnailCache.isValidThumbnailPath(path)
+                    return !validLocal
+                }
+                return mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)
+            }
+
+            var queued = 0
+            val normActive = normalizeVirtualPath(activeSubfolder)
+            if (normActive.isNotEmpty()) {
+                for (entity in entities) {
+                    if (queued >= 30) break
+                    val itemPath = normalizeVirtualPath(entity.virtualPath)
+                    if (!matchesSubfolderPrefix(itemPath, normActive)) continue
+                    if (!needsWarm(entity)) continue
+                    if (attemptedThumbKeys.add(entity.chatId to entity.messageId)) {
+                        thumbRequests.trySend(entity to false)
+                        queued++
+                    }
+                }
+            }
+
+            val perSubfolderCount = HashMap<String, Int>()
+            var subfolderQueued = 0
+            for (entity in entities) {
+                if (!needsWarm(entity)) continue
+                val normVpath = normalizeVirtualPath(entity.virtualPath)
+                val subKey = when {
+                    normActive.isEmpty() && normVpath.isNotEmpty() -> normVpath.substringBefore('/')
+                    normActive.isNotEmpty() && normVpath.startsWith("$normActive/") ->
+                        normVpath.removePrefix("$normActive/").substringBefore('/')
+                    else -> ""
+                }
+                val shouldWarmTop = queued < 30
+                val shouldWarmSubfolderCover = !shouldWarmTop &&
+                    subKey.isNotEmpty() &&
+                    subfolderQueued < 24 &&
+                    (perSubfolderCount[subKey] ?: 0) < 4 &&
+                    (isEncryptedEntity(entity) || hasThumbnailableKind(entity))
+                if (shouldWarmTop || shouldWarmSubfolderCover) {
+                    if (attemptedThumbKeys.add(entity.chatId to entity.messageId)) {
+                        thumbRequests.trySend(entity to false)
+                        if (shouldWarmTop) {
+                            queued++
+                        } else {
+                            subfolderQueued++
+                            perSubfolderCount[subKey] = (perSubfolderCount[subKey] ?: 0) + 1
+                        }
+                    }
+                }
+                if (queued >= 30 && subfolderQueued >= 24) break
+            }
+        }
+
         fun refresh() {
             val chatId = currentChatId ?: return
             refreshJob?.cancel()
             attemptedThumbKeys.clear()
+            _thumbRefreshNonce.value += 1
             oldestMessageId = 0L
             hasMoreMessages = true
             refreshJob =
@@ -752,11 +863,48 @@ class FolderViewModel
                     _refreshing.value = true
                     _error.value = null
                     try {
-                        val msgs = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
-                        val entities = msgs.map { it.toCacheEntity(chatId) }
-                        fileCacheDao.upsertAll(entities)
-                        oldestMessageId = msgs.minOfOrNull { it.id } ?: 0L
-                        hasMoreMessages = msgs.size >= 50
+                        val cloudSyncDeferred = async { runCatching { cloudSyncManager.syncFromCloud() } }
+                        val firstBatch = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
+                        cloudSyncDeferred.await()
+
+                        val allFetched = ArrayList<TelegramMessage>(firstBatch.size)
+                        allFetched.addAll(firstBatch)
+                        oldestMessageId = firstBatch.minOfOrNull { it.id } ?: 0L
+                        hasMoreMessages = firstBatch.size >= 50
+
+                        val activeSubfolder = normalizeVirtualPath(_virtualPath.value)
+                        if (activeSubfolder.isNotEmpty()) {
+                            var matchedCount = allFetched.count { msg ->
+                                val resolved =
+                                    cloudSyncManager.getCloudVirtualPath(chatId, msg.id) ?: msg.virtualPathFromCaption
+                                matchesSubfolderPrefix(normalizeVirtualPath(resolved), activeSubfolder)
+                            }
+                            var extraPages = 0
+                            while (hasMoreMessages && matchedCount < 10 && extraPages < 2) {
+                                extraPages++
+                                val nextRaw = telegramClient.fetchMessages(chatId, oldestMessageId, 100)
+                                if (nextRaw.isEmpty()) {
+                                    hasMoreMessages = false
+                                    break
+                                }
+                                val filteredNext = filterOutTrashed(chatId, nextRaw)
+                                allFetched.addAll(filteredNext)
+                                oldestMessageId = nextRaw.minOfOrNull { it.id } ?: oldestMessageId
+                                hasMoreMessages = nextRaw.size >= 50
+                                matchedCount += filteredNext.count { msg ->
+                                    val resolved =
+                                        cloudSyncManager.getCloudVirtualPath(chatId, msg.id)
+                                            ?: msg.virtualPathFromCaption
+                                    matchesSubfolderPrefix(normalizeVirtualPath(resolved), activeSubfolder)
+                                }
+                            }
+                        }
+
+                        val entities = allFetched.map { it.toCacheEntity(chatId) }
+                        if (entities.isNotEmpty()) {
+                            fileCacheDao.upsertAll(entities)
+                        }
+                        warmThumbnailsForEntities(entities, activeSubfolder = activeSubfolder)
                         _refreshing.value = false
                         launch {
                             for (delayMs in listOf(2000L, 4000L, 8000L, 16000L, 32000L)) {
@@ -994,6 +1142,7 @@ class FolderViewModel
                     if (entities.isEmpty()) return@launch
 
                     val trashed = entities.map { item ->
+                        lastTrashedVirtualPaths[item.chatId to item.messageId] = item.virtualPath
                         TrashEntryEntity(
                             messageId = item.messageId,
                             chatId = item.chatId,
@@ -1034,8 +1183,20 @@ class FolderViewModel
             lastTrashedBatch = emptyList()
             viewModelScope.launch(dispatchers.io) {
                 try {
+                    var restoredAnyVpath = false
                     fileCacheDao.upsertAll(
                         batch.map { entry ->
+                            val restoredVpath =
+                                lastTrashedVirtualPaths.remove(entry.chatId to entry.messageId).orEmpty()
+                            if (restoredVpath.isNotEmpty()) {
+                                restoredAnyVpath = true
+                                cloudSyncManager.noteVirtualPathChanged(
+                                    chatId = entry.chatId,
+                                    messageId = entry.messageId,
+                                    virtualPath = restoredVpath,
+                                    schedulePush = false,
+                                )
+                            }
                             FileCacheEntity(
                                 messageId = entry.messageId,
                                 chatId = entry.chatId,
@@ -1046,12 +1207,16 @@ class FolderViewModel
                                 remoteId = entry.remoteId,
                                 date = entry.originalDate,
                                 isStarred = entry.isStarred,
+                                virtualPath = restoredVpath,
                             )
                         },
                     )
                     for (entry in batch) {
                         trashEntryDao.deleteById(entry.chatId, entry.messageId)
                         cloudSyncManager.noteTrashRemoved(entry.chatId, entry.messageId)
+                    }
+                    if (restoredAnyVpath) {
+                        cloudSyncManager.schedulePushMetadata()
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -1230,6 +1395,8 @@ class FolderViewModel
             if (clean.length >= 8) {
                 backupCrypto.setVaultPassphrase(clean)
                 mediaThumbnailCache.clearDecryptedMemoryCache()
+                _passphraseVersion.value += 1
+                _thumbRefreshNonce.value += 1
             }
         }
 
@@ -1432,7 +1599,7 @@ class FolderViewModel
 
         fun createVirtualFolder(rawName: String) {
             val chatId = currentChatId ?: return
-            val cleanSeg = rawName.trim().replace('\\', '/').trim('/').replace('/', '_')
+            val cleanSeg = sanitizeSubfolderSegment(rawName)
             if (cleanSeg.isEmpty()) return
             val cur = normalizeVirtualPath(_virtualPath.value)
             val fullPath = if (cur.isEmpty()) cleanSeg else "$cur/$cleanSeg"
@@ -1440,7 +1607,253 @@ class FolderViewModel
                 val curSet = map[chatId].orEmpty()
                 map + (chatId to (curSet + fullPath))
             }
+            viewModelScope.launch(dispatchers.io) { persistCustomVirtualFoldersToDisk() }
             showSnackbar("Created subfolder: $cleanSeg")
+        }
+
+        fun computeSubfolderStats(targetVirtualPath: String): SubfolderDeleteStats {
+            val target = normalizeVirtualPath(targetVirtualPath)
+            val leaf = target.substringAfterLast('/', target)
+            if (target.isEmpty()) {
+                return SubfolderDeleteStats("", "", 0, 0)
+            }
+            val nestedFolders = LinkedHashSet<String>()
+            var count = 0
+            for (item in _items.value) {
+                if (item.isLocked) continue
+                val p = normalizeVirtualPath(item.virtualPath)
+                if (matchesSubfolderPrefix(p, target)) {
+                    count++
+                    if (p.length > target.length) {
+                        nestedFolders.add(p)
+                    }
+                }
+            }
+            val chatId = currentChatId
+            if (chatId != null) {
+                for (cv in _createdVirtualFolders.value[chatId].orEmpty()) {
+                    val normCv = normalizeVirtualPath(cv)
+                    if (normCv.startsWith("$target/")) {
+                        nestedFolders.add(normCv)
+                    }
+                }
+            }
+            return SubfolderDeleteStats(
+                virtualPath = target,
+                displayName = leaf,
+                fileCount = count,
+                nestedSubfolderCount = nestedFolders.size,
+            )
+        }
+
+        fun deleteVirtualFolder(
+            targetVirtualPath: String,
+            permanent: Boolean,
+        ) {
+            val chatId = currentChatId ?: return
+            val target = normalizeVirtualPath(targetVirtualPath)
+            if (target.isEmpty()) return
+            val displayName = target.substringAfterLast('/', target)
+
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    val allInChat =
+                        (runCatching { fileCacheDao.forChat(chatId) }.getOrDefault(emptyList()) + _items.value)
+                            .distinctBy { it.messageId }
+                    val targets = allInChat.filter { item ->
+                        !item.isLocked && matchesSubfolderPrefix(normalizeVirtualPath(item.virtualPath), target)
+                    }
+
+                    _createdVirtualFolders.update { map ->
+                        val curSet = map[chatId].orEmpty()
+                        val filtered =
+                            curSet.filterNot { matchesSubfolderPrefix(normalizeVirtualPath(it), target) }.toSet()
+                        if (filtered.isEmpty()) map - chatId else map + (chatId to filtered)
+                    }
+                    persistCustomVirtualFoldersToDisk()
+
+                    val curVpath = normalizeVirtualPath(_virtualPath.value)
+                    if (matchesSubfolderPrefix(curVpath, target)) {
+                        _virtualPath.value = target.substringBeforeLast('/', "")
+                    }
+
+                    if (targets.isEmpty()) {
+                        showSnackbar("Removed subfolder: $displayName")
+                        return@launch
+                    }
+
+                    if (!permanent) {
+                        val now = System.currentTimeMillis()
+                        val trashed = targets.map { item ->
+                            lastTrashedVirtualPaths[item.chatId to item.messageId] = item.virtualPath
+                            TrashEntryEntity(
+                                messageId = item.messageId,
+                                chatId = item.chatId,
+                                fileName = item.fileName,
+                                fileSize = item.fileSize,
+                                mimeType = item.mimeType,
+                                thumbnailPath = item.thumbnailPath,
+                                remoteId = item.remoteId,
+                                originalDate = item.date,
+                                isStarred = item.isStarred,
+                                deletedAt = now,
+                            )
+                        }
+                        trashEntryDao.upsertAll(trashed)
+                        for (item in targets) {
+                            fileCacheDao.deleteById(chatId, item.messageId)
+                        }
+                        _selected.update { current -> current - targets.mapTo(HashSet()) { it.messageId } }
+                        lastTrashedBatch = trashed
+                        cloudSyncManager.schedulePushMetadata()
+                        _snackbarEvent.value = FolderSnackbarEvent(
+                            id = System.nanoTime(),
+                            message = appContext.getString(R.string.trash_moved_snackbar, trashed.size),
+                            canUndoTrash = true,
+                        )
+                    } else {
+                        var deletedCount = 0
+                        var lastErr: String? = null
+                        for (item in targets) {
+                            try {
+                                telegramClient.deleteMessage(chatId, item.messageId)
+                                fileCacheDao.deleteById(chatId, item.messageId)
+                                runCatching { offlinePinStore.unpinFile(chatId, item.messageId) }
+                                deletedCount++
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (t: Throwable) {
+                                lastErr = t.message
+                                Log.w("deleteVirtualFolder: failed deleting msg=${item.messageId}", t)
+                            }
+                        }
+                        _selected.update { current -> current - targets.mapTo(HashSet()) { it.messageId } }
+                        cloudSyncManager.schedulePushMetadata()
+                        if (lastErr != null && deletedCount < targets.size) {
+                            _error.value = "Deleted $deletedCount/${targets.size} file(s) from $displayName: $lastErr"
+                        } else {
+                            showSnackbar("Deleted $displayName ($deletedCount file(s))")
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("deleteVirtualFolder failed", t)
+                    _error.value = t.message ?: "Failed to delete subfolder"
+                }
+            }
+        }
+
+        fun renameVirtualFolder(
+            oldVirtualPath: String,
+            newLeafName: String,
+        ) {
+            val chatId = currentChatId ?: return
+            val oldNorm = normalizeVirtualPath(oldVirtualPath)
+            val cleanSeg = sanitizeSubfolderSegment(newLeafName)
+            if (oldNorm.isEmpty() || cleanSeg.isEmpty()) return
+            val parent = oldNorm.substringBeforeLast('/', "")
+            val newNorm = if (parent.isEmpty()) cleanSeg else "$parent/$cleanSeg"
+            if (newNorm == oldNorm) return
+
+            viewModelScope.launch(dispatchers.io) {
+                try {
+                    val allInChat =
+                        (runCatching { fileCacheDao.forChat(chatId) }.getOrDefault(emptyList()) + _items.value)
+                            .distinctBy { it.messageId }
+                    var updatedCount = 0
+                    for (item in allInChat) {
+                        val itemPath = normalizeVirtualPath(item.virtualPath)
+                        if (matchesSubfolderPrefix(itemPath, oldNorm)) {
+                            val rewritten = rewriteSubfolderPrefix(itemPath, oldNorm, newNorm)
+                            fileCacheDao.updateVirtualPath(chatId, item.messageId, rewritten)
+                            cloudSyncManager.noteVirtualPathChanged(
+                                chatId = chatId,
+                                messageId = item.messageId,
+                                virtualPath = rewritten,
+                                schedulePush = false,
+                            )
+                            updatedCount++
+                        }
+                    }
+
+                    _createdVirtualFolders.update { map ->
+                        val curSet = map[chatId].orEmpty()
+                        val updatedSet = curSet.mapTo(LinkedHashSet()) { cv ->
+                            val normCv = normalizeVirtualPath(cv)
+                            if (matchesSubfolderPrefix(normCv, oldNorm)) {
+                                rewriteSubfolderPrefix(normCv, oldNorm, newNorm)
+                            } else {
+                                normCv
+                            }
+                        }
+                        if (updatedSet.isEmpty()) map - chatId else map + (chatId to updatedSet)
+                    }
+                    persistCustomVirtualFoldersToDisk()
+
+                    val curVpath = normalizeVirtualPath(_virtualPath.value)
+                    if (matchesSubfolderPrefix(curVpath, oldNorm)) {
+                        _virtualPath.value = rewriteSubfolderPrefix(curVpath, oldNorm, newNorm)
+                    }
+                    if (updatedCount > 0) {
+                        cloudSyncManager.schedulePushMetadata()
+                    }
+                    showSnackbar("Renamed subfolder to $cleanSeg")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w("renameVirtualFolder failed", t)
+                    _error.value = t.message ?: "Failed to rename subfolder"
+                }
+            }
+        }
+
+        private fun customFoldersStorageFile(): File? =
+            runCatching { File(appContext.filesDir, CUSTOM_FOLDERS_FILE) }.getOrNull()
+
+        private fun loadCustomVirtualFoldersFromDisk() {
+            runCatching {
+                val f = customFoldersStorageFile() ?: return
+                if (!f.isFile || f.length() <= 0L) return
+                val loaded = LinkedHashMap<Long, MutableSet<String>>()
+                f.forEachLine { line ->
+                    if (line.isBlank()) return@forEachLine
+                    val idx = line.indexOf('\t')
+                    if (idx <= 0) return@forEachLine
+                    val cid = line.substring(0, idx).toLongOrNull() ?: return@forEachLine
+                    val vpath = normalizeVirtualPath(line.substring(idx + 1))
+                    if (vpath.isNotEmpty()) {
+                        loaded.getOrPut(cid) { LinkedHashSet() }.add(vpath)
+                    }
+                }
+                if (loaded.isNotEmpty()) {
+                    _createdVirtualFolders.value = loaded
+                }
+            }
+        }
+
+        private fun persistCustomVirtualFoldersToDisk() {
+            runCatching {
+                val target = customFoldersStorageFile() ?: return
+                target.parentFile?.mkdirs()
+                val snapshot = _createdVirtualFolders.value
+                val tmp = File(target.parentFile, "$CUSTOM_FOLDERS_FILE.tmp")
+                tmp.bufferedWriter().use { writer ->
+                    for ((cid, paths) in snapshot) {
+                        for (p in paths) {
+                            val norm = normalizeVirtualPath(p)
+                            if (norm.isNotEmpty()) {
+                                writer.write("$cid\t$norm\n")
+                            }
+                        }
+                    }
+                }
+                if (target.exists()) target.delete()
+                if (!tmp.renameTo(target)) {
+                    tmp.copyTo(target, overwrite = true)
+                    tmp.delete()
+                }
+            }
         }
 
         fun moveSelectedToVirtualPath(targetVirtualPath: String) {
@@ -1771,4 +2184,34 @@ class FolderViewModel
                 date = date,
                 virtualPath = cloudSyncManager.getCloudVirtualPath(chatId, id) ?: virtualPathFromCaption,
             )
+
+        companion object {
+            private const val CUSTOM_FOLDERS_FILE = "custom_virtual_folders.tsv"
+
+            internal fun isEncryptedEntity(entity: FileCacheEntity): Boolean =
+                entity.isEncryptedVault ||
+                    BackupCrypto.isEncryptedFileName(entity.fileName) ||
+                    entity.thumbnailPath?.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) == true
+
+            internal fun sanitizeSubfolderSegment(rawName: String): String =
+                rawName.trim().replace('\\', '/').trim('/').replace('/', '_')
+
+            internal fun matchesSubfolderPrefix(
+                itemPath: String,
+                prefix: String,
+            ): Boolean {
+                if (prefix.isEmpty()) return itemPath.isEmpty()
+                return itemPath == prefix || itemPath.startsWith("$prefix/")
+            }
+
+            internal fun rewriteSubfolderPrefix(
+                itemPath: String,
+                oldPrefix: String,
+                newPrefix: String,
+            ): String = when {
+                itemPath == oldPrefix -> newPrefix
+                itemPath.startsWith("$oldPrefix/") -> "$newPrefix/${itemPath.removePrefix("$oldPrefix/")}"
+                else -> itemPath
+            }
+        }
     }

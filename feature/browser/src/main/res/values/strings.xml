@@ -442,4 +442,15 @@
     <string name="vault_lock_settings">Vault lock settings</string>
     <string name="vault_lock_toggle_label">Require lock to open Private Vault</string>
     <string name="vault_lock_subtitle">Enter password or verify fingerprint to open Private Vault</string>
+    <string name="browser_action_refresh">Refresh</string>
+    <string name="browser_subfolder_rename">Rename subfolder</string>
+    <string name="browser_subfolder_delete">Delete subfolder</string>
+    <string name="browser_subfolder_delete_title">Delete \"%1$s\"?</string>
+    <string name="browser_subfolder_delete_desc">Contains %1$d file(s) and %2$d nested subfolder(s). Choose how to delete:</string>
+    <string name="browser_subfolder_delete_empty_desc">This subfolder is empty and will be removed.</string>
+    <string name="browser_subfolder_move_trash">Move all to Trash (30 days)</string>
+    <string name="browser_subfolder_delete_forever">Delete permanently from Telegram</string>
+    <string name="browser_subfolder_remove_empty">Remove</string>
+    <string name="browser_subfolder_rename_title">Rename subfolder</string>
+    <string name="browser_subfolder_empty_files_hint">No files directly in this folder. Pull down or tap Refresh to sync.</string>
 </resources>

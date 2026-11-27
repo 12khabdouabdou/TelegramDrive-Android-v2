@@ -214,6 +214,8 @@ fun FolderScreen(
     var showScannerDialog by remember { mutableStateOf(false) }
     var showNewSubfolderDialog by remember { mutableStateOf(false) }
     var renameFileTarget by remember { mutableStateOf<FileCacheEntity?>(null) }
+    var deleteSubfolderTarget by remember { mutableStateOf<SubfolderDeleteStats?>(null) }
+    var renameSubfolderTarget by remember { mutableStateOf<String?>(null) }
     var showMoveChoiceDialog by remember { mutableStateOf(false) }
     var showSubfolderMovePicker by remember { mutableStateOf(false) }
     var showSetFolderLockDialog by remember { mutableStateOf(false) }
@@ -510,6 +512,13 @@ fun FolderScreen(
                                 )
                             }
                         }
+                        IconButton(onClick = { vm.refresh() }) {
+                            Icon(
+                                Icons.Filled.Refresh,
+                                contentDescription = stringResource(R.string.browser_action_refresh),
+                                tint = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
                         Box {
                             IconButton(onClick = { showSortMenu = true }) {
                                 Icon(
@@ -749,6 +758,11 @@ fun FolderScreen(
                 VirtualBreadcrumbBar(
                     virtualPath = state.currentVirtualPath,
                     onNavigate = vm::openVirtualFolder,
+                    onRefresh = vm::refresh,
+                    onRenameCurrent = { renameSubfolderTarget = state.currentVirtualPath },
+                    onDeleteCurrent = {
+                        deleteSubfolderTarget = vm.computeSubfolderStats(state.currentVirtualPath)
+                    },
                 )
             }
 
@@ -756,8 +770,12 @@ fun FolderScreen(
                 VirtualSubfoldersRow(
                     currentVirtualPath = state.currentVirtualPath,
                     subfolders = state.childVirtualFolders,
-                    thumbPathsByFolder = state.childVirtualFolderThumbs,
+                    thumbItemsByFolder = state.childVirtualFolderThumbs,
+                    encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
+                    thumbRefreshNonce = state.thumbRefreshNonce,
                     onOpenSubfolder = vm::openVirtualFolder,
+                    onRenameSubfolder = { path -> renameSubfolderTarget = path },
+                    onDeleteSubfolder = { path -> deleteSubfolderTarget = vm.computeSubfolderStats(path) },
                 )
             }
 
@@ -766,7 +784,7 @@ fun FolderScreen(
                 onRefresh = { vm.refresh() },
                 modifier = Modifier.weight(1f),
             ) {
-                if (state.items.isEmpty() && state.childVirtualFolders.isEmpty() && !state.refreshing) {
+                if (state.items.isEmpty() && !state.refreshing) {
                     val hasFilter = state.search.isNotBlank() || state.fileFilter != FileFilter.ALL
                     Box(
                         modifier = Modifier
@@ -786,6 +804,13 @@ fun FolderScreen(
                                     vm.setFileFilter(FileFilter.ALL)
                                 },
                             )
+                        } else if (state.childVirtualFolders.isNotEmpty()) {
+                            Text(
+                                text = stringResource(R.string.browser_subfolder_empty_files_hint),
+                                style = TgTypography.Display.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 24.dp),
+                            )
                         } else {
                             EditorialEmptyState(
                                 icon = Icons.Filled.InsertDriveFile,
@@ -800,6 +825,7 @@ fun FolderScreen(
                             FileGrid(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
+                                thumbRefreshNonce = state.thumbRefreshNonce,
                                 selectedIds = state.selectedIds,
                                 onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
@@ -834,6 +860,7 @@ fun FolderScreen(
                             FileList(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
+                                thumbRefreshNonce = state.thumbRefreshNonce,
                                 selectedIds = state.selectedIds,
                                 onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
@@ -1164,6 +1191,108 @@ fun FolderScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showNewSubfolderDialog = false }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
+        )
+    }
+
+    renameSubfolderTarget?.let { oldPath ->
+        val oldLeaf = oldPath.substringAfterLast('/')
+        var draft by remember(oldPath) { mutableStateOf(oldLeaf) }
+        val trimmed = draft.trim()
+        AlertDialog(
+            onDismissRequest = { renameSubfolderTarget = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.browser_subfolder_rename_title)) },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    label = { Text(stringResource(R.string.browser_new_subfolder_hint)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = trimmed.isNotEmpty() && trimmed != oldLeaf,
+                    onClick = {
+                        vm.renameVirtualFolder(oldPath, trimmed)
+                        renameSubfolderTarget = null
+                    },
+                ) {
+                    Text(stringResource(R.string.folders_rename))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameSubfolderTarget = null }) {
+                    Text(stringResource(R.string.browser_cancel))
+                }
+            },
+        )
+    }
+
+    deleteSubfolderTarget?.let { stats ->
+        AlertDialog(
+            onDismissRequest = { deleteSubfolderTarget = null },
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            title = { Text(stringResource(R.string.browser_subfolder_delete_title, stats.displayName)) },
+            text = {
+                Text(
+                    if (stats.fileCount == 0 && stats.nestedSubfolderCount == 0) {
+                        stringResource(R.string.browser_subfolder_delete_empty_desc)
+                    } else {
+                        stringResource(
+                            R.string.browser_subfolder_delete_desc,
+                            stats.fileCount,
+                            stats.nestedSubfolderCount,
+                        )
+                    },
+                )
+            },
+            confirmButton = {
+                Column(horizontalAlignment = Alignment.End) {
+                    if (stats.fileCount > 0) {
+                        TextButton(
+                            onClick = {
+                                val targetPath = stats.virtualPath
+                                deleteSubfolderTarget = null
+                                vm.deleteVirtualFolder(targetPath, permanent = false)
+                            },
+                        ) {
+                            Text(stringResource(R.string.browser_subfolder_move_trash))
+                        }
+                        TextButton(
+                            onClick = {
+                                val targetPath = stats.virtualPath
+                                deleteSubfolderTarget = null
+                                vm.deleteVirtualFolder(targetPath, permanent = true)
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(R.string.browser_subfolder_delete_forever),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    } else {
+                        TextButton(
+                            onClick = {
+                                val targetPath = stats.virtualPath
+                                deleteSubfolderTarget = null
+                                vm.deleteVirtualFolder(targetPath, permanent = false)
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(R.string.browser_subfolder_remove_empty),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteSubfolderTarget = null }) {
                     Text(stringResource(R.string.browser_cancel))
                 }
             },
@@ -1717,6 +1846,7 @@ private val PART_ZIP_REGEX = Regex("_part(\\d+)\\.zip$", RegexOption.IGNORE_CASE
 private fun FileGrid(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
+    thumbRefreshNonce: Int = 0,
     selectedIds: Set<Long>,
     onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
@@ -1742,6 +1872,7 @@ private fun FileGrid(
 
     LazyVerticalGrid(
         state = gridState,
+        modifier = Modifier.fillMaxSize(),
         columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 96.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1751,6 +1882,7 @@ private fun FileGrid(
             FileGridCell(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                thumbRefreshNonce = thumbRefreshNonce,
                 isSelected = item.messageId in selectedIds,
                 onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
@@ -1782,6 +1914,7 @@ private fun FileGrid(
 private fun FileGridCell(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
+    thumbRefreshNonce: Int = 0,
     isSelected: Boolean,
     onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
@@ -1795,11 +1928,18 @@ private fun FileGridCell(
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
-    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath) {
-        onRequestThumbnail(false)
+    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath, encryptedPreviewFingerprint, thumbRefreshNonce) {
+        onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
     }
-    var loadFailed by remember(item.chatId, item.messageId, item.thumbnailPath) { mutableStateOf(false) }
-    val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+    var loadFailed by remember(
+        item.chatId,
+        item.messageId,
+        item.thumbnailPath,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+    ) { mutableStateOf(false) }
+    val encThumbRequest =
+        remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
         if (isEnc && encryptedPreviewFingerprint != null) {
             EncryptedThumbRequest(
                 chatId = item.chatId,
@@ -2004,6 +2144,7 @@ private fun FileGridCell(
 private fun FileList(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
+    thumbRefreshNonce: Int = 0,
     selectedIds: Set<Long>,
     onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
@@ -2029,6 +2170,7 @@ private fun FileList(
 
     LazyColumn(
         state = listState,
+        modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -2036,6 +2178,7 @@ private fun FileList(
             FileListRow(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                thumbRefreshNonce = thumbRefreshNonce,
                 isSelected = item.messageId in selectedIds,
                 onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
@@ -2067,6 +2210,7 @@ private fun FileList(
 private fun FileListRow(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
+    thumbRefreshNonce: Int = 0,
     isSelected: Boolean,
     onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
@@ -2080,11 +2224,18 @@ private fun FileListRow(
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
-    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath) {
-        onRequestThumbnail(false)
+    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath, encryptedPreviewFingerprint, thumbRefreshNonce) {
+        onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
     }
-    var loadFailed by remember(item.chatId, item.messageId, item.thumbnailPath) { mutableStateOf(false) }
-    val encThumbRequest = remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+    var loadFailed by remember(
+        item.chatId,
+        item.messageId,
+        item.thumbnailPath,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+    ) { mutableStateOf(false) }
+    val encThumbRequest =
+        remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
         if (isEnc && encryptedPreviewFingerprint != null) {
             EncryptedThumbRequest(
                 chatId = item.chatId,
@@ -2391,40 +2542,100 @@ private fun FilterChipsRow(
 private fun VirtualBreadcrumbBar(
     virtualPath: String,
     onNavigate: (String) -> Unit,
+    onRefresh: () -> Unit = {},
+    onRenameCurrent: () -> Unit = {},
+    onDeleteCurrent: () -> Unit = {},
 ) {
     val segments = virtualPath.split('/').filter { it.isNotEmpty() }
+    var menuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 4.dp),
+            .padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TextButton(
-            onClick = { onNavigate("") },
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(stringResource(R.string.browser_root_folder), fontWeight = FontWeight.SemiBold)
-        }
-        var cumulative = ""
-        for ((idx, seg) in segments.withIndex()) {
-            cumulative = if (cumulative.isEmpty()) seg else "$cumulative/$seg"
-            val targetPath = cumulative
-            val isLast = idx == segments.lastIndex
-            Icon(
-                Icons.Filled.ChevronRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(16.dp),
-            )
             TextButton(
-                onClick = { if (!isLast) onNavigate(targetPath) },
+                onClick = { onNavigate("") },
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
             ) {
-                Text(
-                    text = seg,
-                    fontWeight = if (isLast) FontWeight.Bold else FontWeight.Medium,
-                    color = if (isLast) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                Text(stringResource(R.string.browser_root_folder), fontWeight = FontWeight.SemiBold)
+            }
+            var cumulative = ""
+            for ((idx, seg) in segments.withIndex()) {
+                cumulative = if (cumulative.isEmpty()) seg else "$cumulative/$seg"
+                val targetPath = cumulative
+                val isLast = idx == segments.lastIndex
+                Icon(
+                    Icons.Filled.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+                TextButton(
+                    onClick = { if (!isLast) onNavigate(targetPath) },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = seg,
+                        fontWeight = if (isLast) FontWeight.Bold else FontWeight.Medium,
+                        color = if (isLast) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+            }
+        }
+        Box {
+            IconButton(
+                onClick = { menuOpen = true },
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(
+                    Icons.Filled.MoreVert,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.browser_action_refresh)) },
+                    leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                    onClick = {
+                        menuOpen = false
+                        onRefresh()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.browser_subfolder_rename)) },
+                    leadingIcon = { Icon(Icons.Filled.CreateNewFolder, contentDescription = null) },
+                    onClick = {
+                        menuOpen = false
+                        onRenameCurrent()
+                    },
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = stringResource(R.string.browser_subfolder_delete),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            Icons.Filled.Delete,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    onClick = {
+                        menuOpen = false
+                        onDeleteCurrent()
+                    },
                 )
             }
         }
@@ -2432,11 +2643,77 @@ private fun VirtualBreadcrumbBar(
 }
 
 @Composable
+private fun SubfolderCoverTile(
+    thumb: SubfolderThumbItem,
+    encryptedPreviewFingerprint: String?,
+    thumbRefreshNonce: Int,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var loadFailed by remember(thumb, encryptedPreviewFingerprint, thumbRefreshNonce) { mutableStateOf(false) }
+    val model = remember(thumb, encryptedPreviewFingerprint, loadFailed, context) {
+        if (loadFailed) {
+            null
+        } else if (thumb.isEncrypted) {
+            if (encryptedPreviewFingerprint != null) {
+                val req = EncryptedThumbRequest(
+                    chatId = thumb.chatId,
+                    messageId = thumb.messageId,
+                    localPath = thumb.localPath,
+                    passphraseFingerprint = encryptedPreviewFingerprint,
+                )
+                ImageRequest.Builder(context)
+                    .data(req)
+                    .size(Size(120, 120))
+                    .crossfade(false)
+                    .build()
+            } else {
+                null
+            }
+        } else {
+            thumb.localPath?.takeIf { it.isNotBlank() }?.let { path ->
+                ImageRequest.Builder(context)
+                    .data(File(path))
+                    .size(Size(120, 120))
+                    .crossfade(false)
+                    .build()
+            }
+        }
+    }
+    if (model != null) {
+        AsyncImage(
+            model = model,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            onError = { loadFailed = true },
+            modifier = modifier,
+        )
+    } else {
+        Box(
+            modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.Folder,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(14.dp),
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
 private fun VirtualSubfoldersRow(
     currentVirtualPath: String,
     subfolders: List<Pair<String, Int>>,
-    thumbPathsByFolder: Map<String, List<String>> = emptyMap(),
+    thumbItemsByFolder: Map<String, List<SubfolderThumbItem>> = emptyMap(),
+    encryptedPreviewFingerprint: String? = null,
+    thumbRefreshNonce: Int = 0,
     onOpenSubfolder: (String) -> Unit,
+    onRenameSubfolder: (String) -> Unit = {},
+    onDeleteSubfolder: (String) -> Unit = {},
 ) {
     LazyRow(
         modifier = Modifier
@@ -2444,101 +2721,147 @@ private fun VirtualSubfoldersRow(
             .padding(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        items(subfolders, key = { it.first }) { (name, count) ->
+        items(subfolders, key = { it.first }, contentType = { "virtual_subfolder_chip" }) { (name, count) ->
             val target = if (currentVirtualPath.isEmpty()) name else "$currentVirtualPath/$name"
-            val thumbPaths = thumbPathsByFolder[name].orEmpty()
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(MaterialTheme.colorScheme.surfaceContainer)
-                    .clickable { onOpenSubfolder(target) }
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (thumbPaths.size >= 2) {
-                    Column(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(MaterialTheme.colorScheme.surfaceContainerLow),
-                        verticalArrangement = Arrangement.spacedBy(1.dp),
-                    ) {
-                        Row(
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(1.dp),
+            val thumbItems = thumbItemsByFolder[name].orEmpty()
+            var menuOpen by remember { mutableStateOf(false) }
+            Box {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainer)
+                        .combinedClickable(
+                            onClick = { onOpenSubfolder(target) },
+                            onLongClick = { menuOpen = true },
+                        )
+                        .padding(start = 10.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (thumbItems.size >= 2) {
+                        Column(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerLow),
+                            verticalArrangement = Arrangement.spacedBy(1.dp),
                         ) {
-                            thumbPaths.getOrNull(0)?.let { p ->
-                                AsyncImage(
-                                    model = File(p),
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.weight(1f).fillMaxSize(),
-                                )
-                            }
-                            thumbPaths.getOrNull(1)?.let { p ->
-                                AsyncImage(
-                                    model = File(p),
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.weight(1f).fillMaxSize(),
-                                )
-                            }
-                        }
-                        if (thumbPaths.size > 2) {
                             Row(
                                 modifier = Modifier.weight(1f).fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(1.dp),
                             ) {
-                                thumbPaths.getOrNull(2)?.let { p ->
-                                    AsyncImage(
-                                        model = File(p),
-                                        contentDescription = null,
-                                        contentScale = ContentScale.Crop,
+                                thumbItems.getOrNull(0)?.let { item ->
+                                    SubfolderCoverTile(
+                                        thumb = item,
+                                        encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                                        thumbRefreshNonce = thumbRefreshNonce,
                                         modifier = Modifier.weight(1f).fillMaxSize(),
                                     )
                                 }
-                                thumbPaths.getOrNull(3)?.let { p ->
-                                    AsyncImage(
-                                        model = File(p),
-                                        contentDescription = null,
-                                        contentScale = ContentScale.Crop,
+                                thumbItems.getOrNull(1)?.let { item ->
+                                    SubfolderCoverTile(
+                                        thumb = item,
+                                        encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                                        thumbRefreshNonce = thumbRefreshNonce,
                                         modifier = Modifier.weight(1f).fillMaxSize(),
                                     )
                                 }
                             }
+                            if (thumbItems.size > 2) {
+                                Row(
+                                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(1.dp),
+                                ) {
+                                    thumbItems.getOrNull(2)?.let { item ->
+                                        SubfolderCoverTile(
+                                            thumb = item,
+                                            encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                                            thumbRefreshNonce = thumbRefreshNonce,
+                                            modifier = Modifier.weight(1f).fillMaxSize(),
+                                        )
+                                    }
+                                    thumbItems.getOrNull(3)?.let { item ->
+                                        SubfolderCoverTile(
+                                            thumb = item,
+                                            encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                                            thumbRefreshNonce = thumbRefreshNonce,
+                                            modifier = Modifier.weight(1f).fillMaxSize(),
+                                        )
+                                    }
+                                }
+                            }
                         }
+                    } else if (thumbItems.size == 1) {
+                        SubfolderCoverTile(
+                            thumb = thumbItems[0],
+                            encryptedPreviewFingerprint = encryptedPreviewFingerprint,
+                            thumbRefreshNonce = thumbRefreshNonce,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Folder,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
-                } else if (thumbPaths.size == 1) {
-                    AsyncImage(
-                        model = File(thumbPaths[0]),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(8.dp)),
-                    )
-                } else {
-                    Icon(
-                        Icons.Filled.Folder,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp),
-                    )
+                    Column {
+                        Text(
+                            text = name,
+                            style = TgTypography.Display.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = stringResource(R.string.browser_subfolder_items, count),
+                            style = TgTypography.Caption,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(
+                        onClick = { menuOpen = true },
+                        modifier = Modifier.size(28.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.MoreVert,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                 }
-                Column {
-                    Text(
-                        text = name,
-                        style = TgTypography.Display.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.browser_subfolder_rename)) },
+                        leadingIcon = { Icon(Icons.Filled.CreateNewFolder, contentDescription = null) },
+                        onClick = {
+                            menuOpen = false
+                            onRenameSubfolder(target)
+                        },
                     )
-                    Text(
-                        text = stringResource(R.string.browser_subfolder_items, count),
-                        style = TgTypography.Caption,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = stringResource(R.string.browser_subfolder_delete),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        },
+                        leadingIcon = {
+                            Icon(
+                                Icons.Filled.Delete,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onDeleteSubfolder(target)
+                        },
                     )
                 }
             }
