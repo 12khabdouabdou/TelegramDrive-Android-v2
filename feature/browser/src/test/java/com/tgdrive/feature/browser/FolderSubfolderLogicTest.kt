@@ -236,8 +236,9 @@ class FolderSubfolderLogicTest {
             advanceUntilIdle()
 
             val stats = vm.computeSubfolderStats("Trips")
-            assertThat(stats.directFiles).isEqualTo(1)
-            assertThat(stats.totalFiles).isEqualTo(2)
+            assertThat(stats.virtualPath).isEqualTo("Trips")
+            assertThat(stats.displayName).isEqualTo("Trips")
+            assertThat(stats.fileCount).isEqualTo(2)
             assertThat(stats.nestedSubfolderCount).isEqualTo(1)
 
             vm.deleteVirtualFolder("Trips", permanent = false)
