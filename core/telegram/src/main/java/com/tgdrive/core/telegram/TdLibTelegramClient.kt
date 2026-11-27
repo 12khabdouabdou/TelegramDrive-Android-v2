@@ -1368,7 +1368,9 @@ class TdLibTelegramClient(
                 } finally {
                     unregisterFileHandler(downloadHandlers, thumbFileId, dlHandler)
                     if (!thumbDeferred.isCompleted && downloadHandlers[thumbFileId].isNullOrEmpty()) {
-                        try { activeClient.send(TdApi.CancelDownloadFile(thumbFileId, false)) { } } catch (_: Throwable) {}
+                        runCatching {
+                            activeClient.send(TdApi.CancelDownloadFile(thumbFileId, false)) { }
+                        }
                     }
                 }
                 if (!path.isNullOrEmpty()) {

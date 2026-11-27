@@ -4,6 +4,7 @@ import android.content.Context
 import com.google.common.truth.Truth.assertThat
 import com.tgdrive.core.common.DispatchersProvider
 import com.tgdrive.core.security.KeystoreHelper
+import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -11,9 +12,13 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.drinkless.tdlib.TdApi
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TdLibPaginationTest {
+    @TempDir
+    lateinit var tempDir: File
 
     private fun makeClient(dispatcher: CoroutineDispatcher): TdLibTelegramClient {
         val dispatchers = object : DispatchersProvider {
@@ -22,9 +27,11 @@ class TdLibPaginationTest {
             override val main: CoroutineDispatcher = dispatcher
             override val unconfined: CoroutineDispatcher = dispatcher
         }
+        val ctx = mockk<Context>(relaxed = true)
+        every { ctx.cacheDir } returns tempDir
         return TdLibTelegramClient(
             dispatchers = dispatchers,
-            appContext = mockk<Context>(relaxed = true),
+            appContext = ctx,
             keystoreHelper = mockk<KeystoreHelper>(relaxed = true),
         )
     }
