@@ -59,7 +59,6 @@ class BulkDeleteManagerTest {
         coEvery { telegramClient.deleteMessage(any(), any()) } just Runs
         coEvery { fileCacheDao.deleteByIds(any(), any()) } just Runs
         coEvery { trashEntryDao.upsertAll(any()) } just Runs
-        coEvery { offlinePinStore.unpinFile(any(), any()) } just Runs
 
         manager =
             BulkDeleteManager(
