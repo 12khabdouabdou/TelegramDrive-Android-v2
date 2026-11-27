@@ -52,7 +52,7 @@ data class AppPreferencesData(
     val biometricLastBgTime: Long = 0L,
     val fileViewMode: FileViewMode = FileViewMode.GRID,
     val cacheLimitBytes: Long = 500L * 1024 * 1024,
-    val thumbnailCacheLimitBytes: Long = 50L * 1024 * 1024,
+    val thumbnailCacheLimitBytes: Long = 128L * 1024 * 1024,
     val fileFilter: FileFilter = FileFilter.ALL,
     val fileSort: FileSort = FileSort.DATE_DESC,
 
@@ -313,7 +313,7 @@ class AppPreferences @Inject constructor(
             biometricLastBgTime = get(Keys.BIOMETRIC_LAST_BG) ?: 0L,
             fileViewMode = FileViewMode.entries.getOrElse(get(Keys.FILE_VIEW_MODE) ?: 0) { FileViewMode.GRID },
             cacheLimitBytes = get(Keys.CACHE_LIMIT) ?: 500L * 1024 * 1024,
-            thumbnailCacheLimitBytes = get(Keys.THUMBNAIL_CACHE_LIMIT) ?: 50L * 1024 * 1024,
+            thumbnailCacheLimitBytes = get(Keys.THUMBNAIL_CACHE_LIMIT) ?: 128L * 1024 * 1024,
             fileFilter = FileFilter.entries.getOrElse(get(Keys.FILE_FILTER) ?: 0) { FileFilter.ALL },
             fileSort = FileSort.entries.getOrElse(get(Keys.FILE_SORT) ?: 5) { FileSort.DATE_DESC },
 

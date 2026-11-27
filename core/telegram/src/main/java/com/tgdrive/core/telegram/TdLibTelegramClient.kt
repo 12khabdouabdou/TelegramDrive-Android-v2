@@ -83,6 +83,14 @@ class TdLibTelegramClient(
     private val downloadHandlers = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
     private val uploadHandlers = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
     private val pendingThumbnails = ConcurrentHashMap<Int, CopyOnWriteArrayList<Pair<Long, Long>>>()
+    private val completedThumbPaths = ConcurrentHashMap<Pair<Long, Long>, String>()
+
+    private val _newMessages = MutableSharedFlow<TelegramMessage>(
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    override val newMessages: kotlinx.coroutines.flow.SharedFlow<TelegramMessage> =
+        _newMessages.asSharedFlow()
 
     private val _thumbnailUpdates = MutableSharedFlow<ThumbnailUpdate>(
         extraBufferCapacity = 512,
@@ -90,6 +98,24 @@ class TdLibTelegramClient(
     )
     override val thumbnailUpdates: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate> =
         _thumbnailUpdates.asSharedFlow()
+
+    private fun recordCompletedThumb(chatId: Long, messageId: Long, path: String) {
+        if (completedThumbPaths.size >= MAX_COMPLETED_THUMBS) {
+            completedThumbPaths.keys.take(MAX_COMPLETED_THUMBS / 4).forEach { completedThumbPaths.remove(it) }
+        }
+        completedThumbPaths[chatId to messageId] = path
+    }
+
+    override fun getCompletedThumbnailPath(chatId: Long, messageId: Long): String? {
+        val path = completedThumbPaths[chatId to messageId] ?: return null
+        val f = File(path)
+        return if (f.isFile && f.length() > 0L) {
+            path
+        } else {
+            completedThumbPaths.remove(chatId to messageId, path)
+            null
+        }
+    }
 
     private fun registerPendingThumbnail(
         fileId: Int,
@@ -111,6 +137,7 @@ class TdLibTelegramClient(
         if (!f.isFile || f.length() <= 0L) return
         val targets = pendingThumbnails.remove(file.id) ?: return
         targets.forEach { (chatId, msgId) ->
+            recordCompletedThumb(chatId, msgId, path)
             _thumbnailUpdates.tryEmit(ThumbnailUpdate(chatId, msgId, path))
         }
     }
@@ -220,7 +247,9 @@ class TdLibTelegramClient(
                             putBoundedOrphan(orphanedSendFailed, oldId, err)
                         }
                     }
-                    is TdApi.UpdateNewMessage -> Unit
+                    is TdApi.UpdateNewMessage -> {
+                        update.message?.toDomainFile()?.let { _newMessages.tryEmit(it) }
+                    }
                     else -> Unit
                 }
             } catch (t: Throwable) {
@@ -536,6 +565,7 @@ class TdLibTelegramClient(
                 downloadHandlers.clear()
                 uploadHandlers.clear()
                 pendingThumbnails.clear()
+                completedThumbPaths.clear()
                 verifiedChatIds.clear()
                 pendingUploadMeta.clear()
                 withTimeoutOrNull(5_000) {
@@ -596,11 +626,48 @@ class TdLibTelegramClient(
         }
     }
 
-    override suspend fun fetchMessages(chatId: Long, fromMessageId: Long, limit: Int): List<TelegramMessage> = withContext(dispatchers.io) {
-        val resp = send<TdApi.Messages>(TdApi.GetChatHistory(chatId, fromMessageId, 0, limit, false))
-        val msgs = resp.messages.mapNotNull { it.toDomainFile() }
-        prepareMessageThumbnails(resp.messages, msgs)
-    }
+    override suspend fun fetchMessagesPage(chatId: Long, fromMessageId: Long, limit: Int): MessagePage =
+        withContext(dispatchers.io) {
+            if (chatId !in verifiedChatIds) {
+                runCatching {
+                    send<TdApi.Chat>(TdApi.GetChat(chatId))
+                    verifiedChatIds.add(chatId)
+                }
+            }
+            var cursor = fromMessageId
+            var reachedEnd = false
+            val allRaw = ArrayList<TdApi.Message>(limit)
+            val collectedDomain = ArrayList<TelegramMessage>(limit)
+            var rounds = 0
+            while (collectedDomain.size < limit && rounds < 5) {
+                rounds++
+                val remaining = (limit - collectedDomain.size).coerceIn(1, 100)
+                val resp = send<TdApi.Messages>(TdApi.GetChatHistory(chatId, cursor, 0, remaining, false))
+                if (resp.messages.isEmpty()) {
+                    reachedEnd = true
+                    break
+                }
+                val oldestRaw = resp.messages.minOfOrNull { it.id } ?: 0L
+                allRaw.addAll(resp.messages)
+                for (m in resp.messages) {
+                    m.toDomainFile()?.let { collectedDomain.add(it) }
+                }
+                if (oldestRaw == 0L || oldestRaw == cursor) {
+                    reachedEnd = true
+                    break
+                }
+                cursor = oldestRaw
+            }
+            val prepared = prepareMessageThumbnails(allRaw.toTypedArray(), collectedDomain)
+            MessagePage(
+                messages = prepared,
+                nextFromMessageId = cursor,
+                reachedEnd = reachedEnd,
+            )
+        }
+
+    override suspend fun fetchMessages(chatId: Long, fromMessageId: Long, limit: Int): List<TelegramMessage> =
+        fetchMessagesPage(chatId, fromMessageId, limit).messages
 
     override suspend fun searchMessages(chatId: Long, query: String, limit: Int): List<TelegramMessage> = withContext(dispatchers.io) {
         if (query.isBlank()) return@withContext emptyList()
@@ -1256,9 +1323,15 @@ class TdLibTelegramClient(
     }
 
     override suspend fun requestMessageThumbnail(chatId: Long, messageId: Long): String? = withContext(dispatchers.io) {
-        if (chatId == 0L || messageId == 0L || client == null) return@withContext null
+        val activeClient = client ?: return@withContext null
+        if (chatId == 0L || messageId == 0L) return@withContext null
         try {
-            runCatching { send<TdApi.Chat>(TdApi.GetChat(chatId)) }
+            if (chatId !in verifiedChatIds) {
+                runCatching {
+                    send<TdApi.Chat>(TdApi.GetChat(chatId))
+                    verifiedChatIds.add(chatId)
+                }
+            }
             val tdMsg = send<TdApi.Message>(TdApi.GetMessage(chatId, messageId))
             val thumbFileId = tdMsg.extractThumbnailFileId()
             if (thumbFileId != null && thumbFileId != 0) {
@@ -1266,19 +1339,42 @@ class TdLibTelegramClient(
                     val existing = tdMsg.toDomainFile()?.thumbnailPath
                     if (!existing.isNullOrBlank()) {
                         val f = File(existing)
-                        if (f.isFile && f.length() > 0L) return@withContext existing
+                        if (f.isFile && f.length() > 0L) {
+                            recordCompletedThumb(chatId, messageId, existing)
+                            return@withContext existing
+                        }
                     }
                 }
-                val dl = withTimeoutOrNull(8_000L) {
-                    send<TdApi.File>(TdApi.DownloadFile(thumbFileId, 24, 0, 0, true))
-                }
-                val path = dl?.local?.path.orEmpty()
-                if (dl?.local?.isDownloadingCompleted == true && path.isNotEmpty()) {
-                    val f = File(path)
-                    if (f.isFile && f.length() > 0L) {
-                        _thumbnailUpdates.tryEmit(ThumbnailUpdate(chatId, messageId, path))
-                        return@withContext path
+                val thumbDeferred = CompletableDeferred<String?>()
+                val dlHandler: (TdApi.File) -> Unit = { f ->
+                    val loc = f.local
+                    if (loc?.isDownloadingCompleted == true) {
+                        val p = loc.path.orEmpty()
+                        val verified = if (p.isNotEmpty() && File(p).let { it.isFile && it.length() > 0L }) p else null
+                        thumbDeferred.complete(verified)
+                    } else if (loc != null && !loc.isDownloadingActive && !loc.canBeDownloaded) {
+                        thumbDeferred.complete(null)
                     }
+                }
+                registerFileHandler(downloadHandlers, thumbFileId, dlHandler)
+                val path = try {
+                    activeClient.send(TdApi.DownloadFile(thumbFileId, 24, 0, 0, false)) { res ->
+                        when (res) {
+                            is TdApi.Error -> thumbDeferred.complete(null)
+                            is TdApi.File -> dlHandler(res)
+                        }
+                    }
+                    withTimeoutOrNull(8_000L) { thumbDeferred.await() }
+                } finally {
+                    unregisterFileHandler(downloadHandlers, thumbFileId, dlHandler)
+                    if (!thumbDeferred.isCompleted && downloadHandlers[thumbFileId].isNullOrEmpty()) {
+                        try { activeClient.send(TdApi.CancelDownloadFile(thumbFileId, false)) { } } catch (_: Throwable) {}
+                    }
+                }
+                if (!path.isNullOrEmpty()) {
+                    recordCompletedThumb(chatId, messageId, path)
+                    _thumbnailUpdates.tryEmit(ThumbnailUpdate(chatId, messageId, path))
+                    return@withContext path
                 }
             }
             val domain = tdMsg.toDomainFile()
@@ -1669,6 +1765,7 @@ class TdLibTelegramClient(
             downloadHandlers.clear()
             uploadHandlers.clear()
             pendingThumbnails.clear()
+            completedThumbPaths.clear()
             verifiedChatIds.clear()
             pendingUploadMeta.clear()
             scope.cancel()
@@ -1692,6 +1789,7 @@ class TdLibTelegramClient(
         private const val UPLOAD_FINALIZE_TIMEOUT_MS = 180_000L
         private const val UPLOAD_NO_FILE_ID_TIMEOUT_MS = 60_000L
         private const val MAX_ORPHAN_CACHE = 256
+        private const val MAX_COMPLETED_THUMBS = 4000
         private const val MAX_ZIP_COVER_BYTES = 10L * 1024 * 1024
         private const val MAX_CONCURRENT_REQUESTS = 16
         private const val MAX_FLOOD_WAIT_RETRIES = 2

@@ -34,6 +34,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -147,6 +150,12 @@ class MediaThumbnailCache @Inject constructor(
     private val encInFlight = ConcurrentHashMap<Pair<Long, Long>, Deferred<String?>>()
     private val encFailedAtMs = ConcurrentHashMap<Pair<Long, Long>, Long>()
 
+    private val _thumbnailReady = MutableSharedFlow<Pair<Long, Long>>(
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val thumbnailReady: SharedFlow<Pair<Long, Long>> = _thumbnailReady.asSharedFlow()
+
     fun clearThumbnailFailure(chatId: Long, messageId: Long) {
         val key = chatId to messageId
         failedAtMs.remove(key)
@@ -218,6 +227,7 @@ class MediaThumbnailCache @Inject constructor(
             if (saved != null) {
                 failedAtMs.remove(chatId to messageId)
                 runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, saved) }
+                _thumbnailReady.tryEmit(chatId to messageId)
             }
             saved
         } finally {
@@ -264,6 +274,7 @@ class MediaThumbnailCache @Inject constructor(
         if (saved != null) {
             failedAtMs.remove(chatId to messageId)
             runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, saved) }
+            _thumbnailReady.tryEmit(chatId to messageId)
         }
         saved
     }
@@ -388,6 +399,7 @@ class MediaThumbnailCache @Inject constructor(
             if (path != null) {
                 encFailedAtMs.remove(key)
                 enqueueDbThumbUpdate(chatId, messageId, path)
+                _thumbnailReady.tryEmit(key)
             } else {
                 encFailedAtMs[key] = System.currentTimeMillis()
             }
@@ -508,6 +520,7 @@ class MediaThumbnailCache @Inject constructor(
                 failedAtMs[key] = System.currentTimeMillis()
             } else {
                 failedAtMs.remove(key)
+                _thumbnailReady.tryEmit(key)
             }
             deferred.complete(resolved)
             resolved
@@ -923,7 +936,7 @@ class MediaThumbnailCache @Inject constructor(
         private const val MAX_REMOTE_PDF_BYTES = 25L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024
         private const val FAIL_COOLDOWN_MS = 45_000L
-        private const val DEFAULT_DISK_LIMIT_BYTES = 50L * 1024 * 1024
+        private const val DEFAULT_DISK_LIMIT_BYTES = 128L * 1024 * 1024
         private const val MIN_DISK_LIMIT_BYTES = 10L * 1024 * 1024
         private const val EVICT_WRITE_STRIDE = 20
         private const val EVICT_COOLDOWN_MS = 30_000L

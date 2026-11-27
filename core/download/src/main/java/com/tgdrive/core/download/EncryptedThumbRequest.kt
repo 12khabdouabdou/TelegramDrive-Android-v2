@@ -10,4 +10,5 @@ data class EncryptedThumbRequest(
     val messageId: Long,
     val localPath: String? = null,
     val passphraseFingerprint: String = "",
+    val retryVersion: Int = 0,
 )

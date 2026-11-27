@@ -42,7 +42,11 @@ interface FileCacheDao {
             END,
             remote_id = CASE WHEN :remoteId != '' THEN :remoteId ELSE remote_id END,
             date = :date,
-            bucket = CASE WHEN :bucket != '' THEN :bucket ELSE bucket END
+            bucket = CASE WHEN :bucket != '' THEN :bucket ELSE bucket END,
+            virtual_path = CASE
+                WHEN virtual_path = '' AND :virtualPath != '' THEN :virtualPath
+                ELSE virtual_path
+            END
         WHERE message_id = :messageId AND chat_id = :chatId
     """)
     suspend fun updateRemoteMetadata(
@@ -54,6 +58,7 @@ interface FileCacheDao {
         remoteId: String,
         date: Long,
         bucket: String,
+        virtualPath: String = "",
     )
 
     /**
@@ -88,6 +93,7 @@ interface FileCacheDao {
                     remoteId = entry.remoteId,
                     date = entry.date,
                     bucket = resolvedBucket,
+                    virtualPath = entry.virtualPath,
                 )
             }
         }
@@ -388,17 +394,69 @@ interface FileCacheDao {
     @Query("UPDATE file_cache SET playback_position_ms = :positionMs WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun updatePlaybackPosition(chatId: Long, messageId: Long, positionMs: Long)
 
+    data class PlaybackPositionUpdate(
+        val chatId: Long,
+        val messageId: Long,
+        val positionMs: Long,
+    )
+
+    @Transaction
+    suspend fun updatePlaybackPositions(updates: List<PlaybackPositionUpdate>) {
+        for (u in updates) {
+            updatePlaybackPosition(u.chatId, u.messageId, u.positionMs)
+        }
+    }
+
     @Query("UPDATE file_cache SET virtual_path = :virtualPath WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun updateVirtualPath(chatId: Long, messageId: Long, virtualPath: String)
 
+    data class VirtualPathUpdate(
+        val chatId: Long,
+        val messageId: Long,
+        val virtualPath: String,
+    )
+
+    @Transaction
+    suspend fun updateVirtualPaths(updates: List<VirtualPathUpdate>) {
+        for (u in updates) {
+            updateVirtualPath(u.chatId, u.messageId, u.virtualPath)
+        }
+    }
+
     @Query("UPDATE file_cache SET is_locked = :locked WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun setLocked(chatId: Long, messageId: Long, locked: Boolean)
+
+    data class LockUpdate(
+        val chatId: Long,
+        val messageId: Long,
+        val locked: Boolean,
+    )
+
+    @Transaction
+    suspend fun setLockedBatch(updates: List<LockUpdate>) {
+        for (u in updates) {
+            setLocked(u.chatId, u.messageId, u.locked)
+        }
+    }
 
     @Query("UPDATE file_cache SET is_encrypted_vault = :encrypted WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun setEncryptedVault(chatId: Long, messageId: Long, encrypted: Boolean)
 
     @Query("UPDATE file_cache SET user_note = :note WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun updateUserNote(chatId: Long, messageId: Long, note: String?)
+
+    data class UserNoteUpdate(
+        val chatId: Long,
+        val messageId: Long,
+        val note: String?,
+    )
+
+    @Transaction
+    suspend fun updateUserNotes(updates: List<UserNoteUpdate>) {
+        for (u in updates) {
+            updateUserNote(u.chatId, u.messageId, u.note)
+        }
+    }
 
     @Query("UPDATE file_cache SET ocr_text = :ocrText, ai_tags = :aiTags WHERE chat_id = :chatId AND message_id = :messageId")
     suspend fun updateAiIndex(chatId: Long, messageId: Long, ocrText: String?, aiTags: String?)

@@ -453,4 +453,5 @@
     <string name="browser_subfolder_remove_empty">Remove</string>
     <string name="browser_subfolder_rename_title">Rename subfolder</string>
     <string name="browser_subfolder_empty_files_hint">No files directly in this folder. Pull down or tap Refresh to sync.</string>
+    <string name="browser_load_older_files">Load older files</string>
 </resources>

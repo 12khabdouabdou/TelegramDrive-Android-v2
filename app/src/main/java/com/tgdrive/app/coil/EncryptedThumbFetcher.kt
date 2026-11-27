@@ -15,7 +15,7 @@ import java.io.File
 
 class EncryptedThumbKeyer : Keyer<EncryptedThumbRequest> {
     override fun key(data: EncryptedThumbRequest, options: Options): String =
-        "enc_thumb:${data.chatId}:${data.messageId}:${data.passphraseFingerprint}"
+        "enc_thumb:${data.chatId}:${data.messageId}:${data.passphraseFingerprint}:${data.retryVersion}"
 }
 
 /**

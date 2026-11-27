@@ -58,6 +58,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -115,6 +116,8 @@ data class FolderUiState(
     val selectedIds: Set<Long> = emptySet(),
     val loading: Boolean = false,
     val refreshing: Boolean = false,
+    val syncingHistory: Boolean = false,
+    val hasMoreMessages: Boolean = false,
     val error: String? = null,
     val search: String = "",
     val viewMode: FileViewMode = FileViewMode.GRID,
@@ -136,6 +139,7 @@ data class FolderUiState(
     val allVirtualPaths: List<String> = emptyList(),
     val encryptedPreviewFingerprint: String? = null,
     val thumbRefreshNonce: Int = 0,
+    val thumbReadyVersions: Map<Long, Int> = emptyMap(),
     val isFolderLockedByPref: Boolean = false,
     val isFolderLockRequired: Boolean = false,
     val isFolderUnlocked: Boolean = true,
@@ -226,7 +230,10 @@ class FolderViewModel
         private val _biometricAvailable = MutableStateFlow(false)
         private val _hasAccessPassword = MutableStateFlow(false)
         private val _thumbRefreshNonce = MutableStateFlow(0)
+        private val _thumbReadyVersions = MutableStateFlow<Map<Long, Int>>(emptyMap())
         private val _passphraseVersion = MutableStateFlow(0)
+        private val _syncingHistory = MutableStateFlow(false)
+        private val _hasMoreMessages = MutableStateFlow(false)
 
         private val decryptFlow = DecryptFlowCoordinator(
             scope = viewModelScope,
@@ -254,6 +261,7 @@ class FolderViewModel
         private var bindJob: Job? = null
         private var pdfWatchJob: Job? = null
         private var refreshJob: Job? = null
+        private var backfillJob: Job? = null
         private var warmThumbsJob: Job? = null
         private var localThumbScanJob: Job? = null
         private var searchJob: Job? = null
@@ -301,32 +309,69 @@ class FolderViewModel
                             thumbWakeSignal.trySend(Unit)
                         }
                         val key = next.entity.chatId to next.entity.messageId
+                        var resolved: String? = null
                         try {
-                            if (isEncryptedEntity(next.entity)) {
-                                if (backupCrypto.hasVaultPassphrase()) {
-                                    if (next.force) {
-                                        mediaThumbnailCache.clearThumbnailFailure(
+                            resolved =
+                                if (isEncryptedEntity(next.entity)) {
+                                    if (backupCrypto.hasVaultPassphrase()) {
+                                        if (next.force) {
+                                            mediaThumbnailCache.clearThumbnailFailure(
+                                                next.entity.chatId,
+                                                next.entity.messageId,
+                                            )
+                                        }
+                                        mediaThumbnailCache.restoreEncryptedThumbFromCloud(
                                             next.entity.chatId,
                                             next.entity.messageId,
                                         )
+                                    } else {
+                                        null
                                     }
-                                    mediaThumbnailCache.restoreEncryptedThumbFromCloud(
-                                        next.entity.chatId,
-                                        next.entity.messageId,
-                                    )
+                                } else {
+                                    mediaThumbnailCache.ensureThumbnail(next.entity, force = next.force)
                                 }
-                            } else {
-                                mediaThumbnailCache.ensureThumbnail(next.entity, force = next.force)
-                            }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Throwable) {
                         } finally {
                             synchronized(thumbQueueLock) {
                                 inFlightThumbKeys.remove(key)
-                                if (isActive) {
+                                if (isActive && resolved != null) {
                                     completedThumbKeys.add(key)
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            viewModelScope.launch(dispatchers.io) {
+                mediaThumbnailCache.thumbnailReady.collect { (cid, msgId) ->
+                    if (cid == currentChatId) {
+                        _thumbReadyVersions.update { map ->
+                            map + (msgId to ((map[msgId] ?: 0) + 1))
+                        }
+                    }
+                }
+            }
+            viewModelScope.launch(dispatchers.io) {
+                cloudSyncManager.cloudMetaVersion.drop(1).collect {
+                    val chatId = currentChatId ?: return@collect
+                    clearPendingThumbQueue(clearCompleted = false)
+                    _thumbRefreshNonce.value += 1
+                    warmThumbnailsForEntities(
+                        _items.value.filter { it.chatId == chatId },
+                        activeSubfolder = normalizeVirtualPath(_virtualPath.value),
+                    )
+                }
+            }
+            viewModelScope.launch(dispatchers.io) {
+                telegramClient.newMessages.collect { msg ->
+                    val chatId = currentChatId
+                    if (chatId != null && msg.chatId == chatId) {
+                        val filtered = filterOutTrashed(chatId, listOf(msg))
+                        if (filtered.isNotEmpty()) {
+                            runCatching {
+                                fileCacheDao.upsertAll(filtered.map { it.toCacheEntity(chatId) })
                             }
                         }
                     }
@@ -435,24 +480,48 @@ class FolderViewModel
             enqueueThumbRequest(entity, force = force, highPriority = true)
         }
 
-        private data class FolderAuxTail(
-            val boundId: Long?,
-            val batchProgress: Pair<Int, Int>?,
-            val virtualPath: String,
-            val createdVirtualFolders: Map<Long, Set<String>>,
-            val isFolderUnlocked: Boolean,
-            val folderLockReady: Boolean,
-            val lockError: String?,
-            val lockConfigVersion: Int,
-            val thumbRefreshNonce: Int,
+        private data class FolderBrowserPrefs(
+            val fileViewMode: FileViewMode,
+            val fileFilter: FileFilter,
+            val fileSort: FileSort,
+            val manualUploadWifiOnly: Boolean,
+            val showEncryptedPreviewsWhenUnlocked: Boolean,
+            val lockedFolderChatIds: Set<String>,
+            val accessLockBiometricEnabled: Boolean,
         )
 
-        private data class FolderCoreState(
-            val items: List<FileCacheEntity>,
+        private data class FolderDerivedState(
+            val items: List<FileCacheEntity> = emptyList(),
+            val search: String = "",
+            val viewMode: FileViewMode = FileViewMode.GRID,
+            val fileFilter: FileFilter = FileFilter.ALL,
+            val fileSort: FileSort = FileSort.DATE_DESC,
+            val hasSavedBackupPassphrase: Boolean = false,
+            val manualUploadWifiOnly: Boolean = false,
+            val currentVirtualPath: String = "",
+            val childVirtualFolders: List<Pair<String, Int>> = emptyList(),
+            val childVirtualFolderThumbs: Map<String, List<SubfolderThumbItem>> = emptyMap(),
+            val allVirtualPaths: List<String> = emptyList(),
+            val encryptedPreviewFingerprint: String? = null,
+            val isFolderLockedByPref: Boolean = false,
+            val isFolderLockRequired: Boolean = false,
+            val isFolderUnlocked: Boolean = true,
+            val hasAccessPassword: Boolean = false,
+            val canUseBiometricLock: Boolean = false,
+            val biometricAvailable: Boolean = false,
+            val accessLockBiometricEnabled: Boolean = true,
+            val boundId: Long? = null,
+        )
+
+        private data class FolderStatusChrome(
             val selected: Set<Long>,
             val loading: Boolean,
             val refreshing: Boolean,
+            val syncingHistory: Boolean,
+            val hasMoreMessages: Boolean,
             val error: String?,
+            val folderLockReady: Boolean,
+            val lockError: String?,
         )
 
         private data class FolderOverlayState(
@@ -463,89 +532,63 @@ class FolderViewModel
             val decryptDialog: DecryptDialogState?,
         )
 
-        private val lockTailFlow = combine(
-            combine(
-                _isFolderUnlocked,
-                _folderLockReady,
-                _lockError,
-                _lockConfigVersion,
-            ) { unlocked, ready, lockErr, cfgVer ->
-                listOf(unlocked, ready, lockErr, cfgVer)
-            },
-            _thumbRefreshNonce,
-            _passphraseVersion,
-        ) { base, nonce, _ ->
-            base + nonce
-        }
+        private val browserPrefsFlow = preferences.data
+            .map { prefs ->
+                FolderBrowserPrefs(
+                    fileViewMode = prefs.fileViewMode,
+                    fileFilter = prefs.fileFilter,
+                    fileSort = prefs.fileSort,
+                    manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                    showEncryptedPreviewsWhenUnlocked = prefs.showEncryptedPreviewsWhenUnlocked,
+                    lockedFolderChatIds = prefs.lockedFolderChatIds,
+                    accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
+                )
+            }
+            .distinctUntilChanged()
 
-        val state: StateFlow<FolderUiState> =
+        private val derivedFolderFlow =
             combine(
-                combine(_items, _selected, _loading, _refreshing, _error) { items, selected, loading, refreshing, error ->
-                    FolderCoreState(items, selected, loading, refreshing, error)
-                },
-                combine(
-                    _pendingReviewFiles,
-                    _pendingZipFolder,
-                    _zipPreviewSummary,
-                    _zipPreviewLoading,
-                    decryptFlow.dialog,
-                ) { review, zipFolder, summary, summaryLoading, decrypt ->
-                    FolderOverlayState(review, zipFolder, summary, summaryLoading, decrypt)
-                },
-                combine(
-                    _search,
-                    preferences.data,
-                    uploadManager.uploads,
-                    combine(
-                        _boundChatId,
-                        _batchDecryptProgress,
-                        _virtualPath,
-                        _createdVirtualFolders,
-                        lockTailFlow,
-                    ) { b, bp, vp, createdVps, lt ->
-                        FolderAuxTail(
-                            boundId = b,
-                            batchProgress = bp,
-                            virtualPath = vp,
-                            createdVirtualFolders = createdVps,
-                            isFolderUnlocked = lt[0] as Boolean,
-                            folderLockReady = lt[1] as Boolean,
-                            lockError = lt[2] as String?,
-                            lockConfigVersion = lt[3] as Int,
-                            thumbRefreshNonce = lt[4] as Int,
-                        )
-                    },
-                ) {
+                combine(_items, _search, _virtualPath, _createdVirtualFolders, _boundChatId) {
+                        items,
                         search,
-                        prefs,
-                        uploadQueue,
-                        auxTail,
+                        vpath,
+                        createdVps,
+                        boundId,
                     ->
-                    listOf(search, prefs, uploadQueue, auxTail)
+                    listOf(items, search, vpath, createdVps, boundId)
                 },
-            ) { c, overlays, aux ->
-                val search = aux[0] as String
-                val prefs = aux[1] as com.tgdrive.core.datastore.AppPreferencesData
-                val uploadQueue = aux[2] as com.tgdrive.core.download.UploadQueueState
-                val auxTail = aux[3] as FolderAuxTail
-                val boundId = auxTail.boundId
-                val batchProgress = auxTail.batchProgress
-                val rawVirtualPath = normalizeVirtualPath(auxTail.virtualPath)
-                val customForChat = boundId?.let { auxTail.createdVirtualFolders[it] }.orEmpty()
+                browserPrefsFlow,
+                combine(
+                    _isFolderUnlocked,
+                    _lockConfigVersion,
+                    _passphraseVersion,
+                ) { unlocked, lockCfg, passVer ->
+                    Triple(unlocked, lockCfg, passVer)
+                },
+            ) { coreTuple, prefs, lockTuple ->
+                @Suppress("UNCHECKED_CAST")
+                val rawItems = coreTuple[0] as List<FileCacheEntity>
+                val search = coreTuple[1] as String
+                val rawVirtualPath = normalizeVirtualPath(coreTuple[2] as String)
+                @Suppress("UNCHECKED_CAST")
+                val createdVps = coreTuple[3] as Map<Long, Set<String>>
+                val boundId = coreTuple[4] as Long?
+                val isFolderUnlocked = lockTuple.first
+                val customForChat = boundId?.let { createdVps[it] }.orEmpty()
 
-                val isLockedPref = boundId != null && prefs.isFolderLocked(boundId)
+                val isLockedPref = boundId != null && boundId.toString() in prefs.lockedFolderChatIds
                 val bioAvail = _biometricAvailable.value
                 val hasAccessPass = _hasAccessPassword.value
                 val canUseBio = isLockedPref && bioAvail && prefs.accessLockBiometricEnabled
                 val lockRequired = isLockedPref && (hasAccessPass || canUseBio)
-                val isUnlockedNow = !lockRequired || auxTail.isFolderUnlocked
+                val isUnlockedNow = !lockRequired || isFolderUnlocked
                 val encFp = if (prefs.showEncryptedPreviewsWhenUnlocked && isUnlockedNow) {
                     backupCrypto.passphraseFingerprint()
                 } else {
                     null
                 }
 
-                val unlockedItems = c.items.filterNot { it.isLocked }
+                val unlockedItems = rawItems.filterNot { it.isLocked }
                 val inDirectVirtualMode = search.isBlank() && prefs.fileFilter == FileFilter.ALL
 
                 val childCounts = LinkedHashMap<String, Int>()
@@ -655,19 +698,105 @@ class FolderViewModel
                     }
                 val filtered = applyFilter(searched, prefs.fileFilter)
                 val sorted = applySort(filtered, prefs.fileSort)
-                val chatUploads = uploadQueue.items.filter {
-                    boundId == null || it.chatId == boundId || it.chatId == 0L
-                }
-                FolderUiState(
+                FolderDerivedState(
                     items = sorted,
-                    selectedIds = c.selected,
-                    loading = c.loading,
-                    refreshing = c.refreshing,
-                    error = c.error,
                     search = search,
                     viewMode = prefs.fileViewMode,
                     fileFilter = prefs.fileFilter,
                     fileSort = prefs.fileSort,
+                    hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase(),
+                    manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                    currentVirtualPath = rawVirtualPath,
+                    childVirtualFolders = childFolders,
+                    childVirtualFolderThumbs = childThumbs,
+                    allVirtualPaths = allVPaths.sorted(),
+                    encryptedPreviewFingerprint = encFp,
+                    isFolderLockedByPref = isLockedPref,
+                    isFolderLockRequired = lockRequired,
+                    isFolderUnlocked = isUnlockedNow,
+                    hasAccessPassword = hasAccessPass,
+                    canUseBiometricLock = canUseBio,
+                    biometricAvailable = bioAvail,
+                    accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
+                    boundId = boundId,
+                )
+            }
+
+        private val statusChromeFlow =
+            combine(
+                combine(_selected, _loading, _refreshing, _syncingHistory, _hasMoreMessages) {
+                        sel,
+                        loading,
+                        refreshing,
+                        syncingHistory,
+                        hasMore,
+                    ->
+                    listOf(sel, loading, refreshing, syncingHistory, hasMore)
+                },
+                combine(_error, _folderLockReady, _lockError) { err, ready, lockErr ->
+                    Triple(err, ready, lockErr)
+                },
+            ) { left, right ->
+                @Suppress("UNCHECKED_CAST")
+                FolderStatusChrome(
+                    selected = left[0] as Set<Long>,
+                    loading = left[1] as Boolean,
+                    refreshing = left[2] as Boolean,
+                    syncingHistory = left[3] as Boolean,
+                    hasMoreMessages = left[4] as Boolean,
+                    error = right.first,
+                    folderLockReady = right.second,
+                    lockError = right.third,
+                )
+            }
+
+        private val overlayFlow =
+            combine(
+                _pendingReviewFiles,
+                _pendingZipFolder,
+                _zipPreviewSummary,
+                _zipPreviewLoading,
+                decryptFlow.dialog,
+            ) { review, zipFolder, summary, summaryLoading, decrypt ->
+                FolderOverlayState(review, zipFolder, summary, summaryLoading, decrypt)
+            }
+
+        val state: StateFlow<FolderUiState> =
+            combine(
+                derivedFolderFlow,
+                statusChromeFlow,
+                overlayFlow,
+                combine(uploadManager.uploads, _batchDecryptProgress, _thumbRefreshNonce, _thumbReadyVersions) {
+                        uploads,
+                        batchProgress,
+                        nonce,
+                        readyVersions,
+                    ->
+                    listOf(uploads, batchProgress, nonce, readyVersions)
+                },
+            ) { derived, chrome, overlays, fastTail ->
+                val uploadQueue = fastTail[0] as com.tgdrive.core.download.UploadQueueState
+                @Suppress("UNCHECKED_CAST")
+                val batchProgress = fastTail[1] as Pair<Int, Int>?
+                val thumbRefreshNonce = fastTail[2] as Int
+                @Suppress("UNCHECKED_CAST")
+                val thumbReadyVersions = fastTail[3] as Map<Long, Int>
+                val boundId = derived.boundId
+                val chatUploads = uploadQueue.items.filter {
+                    boundId == null || it.chatId == boundId || it.chatId == 0L
+                }
+                FolderUiState(
+                    items = derived.items,
+                    selectedIds = chrome.selected,
+                    loading = chrome.loading,
+                    refreshing = chrome.refreshing,
+                    syncingHistory = chrome.syncingHistory,
+                    hasMoreMessages = chrome.hasMoreMessages,
+                    error = chrome.error,
+                    search = derived.search,
+                    viewMode = derived.viewMode,
+                    fileFilter = derived.fileFilter,
+                    fileSort = derived.fileSort,
                     uploads = chatUploads,
                     pendingReviewFiles = overlays.reviewFiles,
                     pendingZipTreeUri = overlays.zipFolder.first,
@@ -675,27 +804,51 @@ class FolderViewModel
                     zipPreviewSummary = overlays.zipSummary,
                     zipPreviewLoading = overlays.zipSummaryLoading,
                     decryptDialog = overlays.decryptDialog,
-                    hasSavedBackupPassphrase = backupCrypto.hasVaultPassphrase(),
-                    manualUploadWifiOnly = prefs.manualUploadWifiOnly,
+                    hasSavedBackupPassphrase = derived.hasSavedBackupPassphrase,
+                    manualUploadWifiOnly = derived.manualUploadWifiOnly,
                     batchDecryptProgress = batchProgress,
-                    currentVirtualPath = rawVirtualPath,
-                    childVirtualFolders = childFolders,
-                    childVirtualFolderThumbs = childThumbs,
-                    allVirtualPaths = allVPaths.sorted(),
-                    encryptedPreviewFingerprint = encFp,
-                    thumbRefreshNonce = auxTail.thumbRefreshNonce,
-                    isFolderLockedByPref = isLockedPref,
-                    isFolderLockRequired = lockRequired,
-                    isFolderUnlocked = isUnlockedNow,
-                    folderLockReady = auxTail.folderLockReady,
-                    hasAccessPassword = hasAccessPass,
-                    canUseBiometricLock = canUseBio,
-                    biometricAvailable = bioAvail,
-                    accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
-                    lockError = auxTail.lockError,
+                    currentVirtualPath = derived.currentVirtualPath,
+                    childVirtualFolders = derived.childVirtualFolders,
+                    childVirtualFolderThumbs = derived.childVirtualFolderThumbs,
+                    allVirtualPaths = derived.allVirtualPaths,
+                    encryptedPreviewFingerprint = derived.encryptedPreviewFingerprint,
+                    thumbRefreshNonce = thumbRefreshNonce,
+                    thumbReadyVersions = thumbReadyVersions,
+                    isFolderLockedByPref = derived.isFolderLockedByPref,
+                    isFolderLockRequired = derived.isFolderLockRequired,
+                    isFolderUnlocked = derived.isFolderUnlocked,
+                    folderLockReady = chrome.folderLockReady,
+                    hasAccessPassword = derived.hasAccessPassword,
+                    canUseBiometricLock = derived.canUseBiometricLock,
+                    biometricAvailable = derived.biometricAvailable,
+                    accessLockBiometricEnabled = derived.accessLockBiometricEnabled,
+                    lockError = chrome.lockError,
                 )
             }.flowOn(dispatchers.io)
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FolderUiState())
+
+        fun requestSubfolderThumb(thumb: SubfolderThumbItem) {
+            val entity = _items.value.find {
+                it.chatId == thumb.chatId && it.messageId == thumb.messageId
+            }
+            if (entity != null) {
+                requestThumbnail(entity, force = true)
+                return
+            }
+            viewModelScope.launch(dispatchers.io) {
+                mediaThumbnailCache.clearThumbnailFailure(thumb.chatId, thumb.messageId)
+                if (thumb.isEncrypted) {
+                    if (backupCrypto.hasVaultPassphrase()) {
+                        mediaThumbnailCache.restoreEncryptedThumbFromCloud(thumb.chatId, thumb.messageId)
+                    }
+                } else {
+                    val cached = fileCacheDao.getById(thumb.chatId, thumb.messageId)
+                    if (cached != null) {
+                        mediaThumbnailCache.ensureThumbnail(cached, force = true)
+                    }
+                }
+            }
+        }
 
         fun lockFolderView() {
             _isFolderUnlocked.value = false
@@ -826,6 +979,7 @@ class FolderViewModel
             bindJob?.cancel()
             pdfWatchJob?.cancel()
             refreshJob?.cancel()
+            backfillJob?.cancel()
             warmThumbsJob?.cancel()
             localThumbScanJob?.cancel()
             clearPendingThumbQueue(clearCompleted = true)
@@ -835,6 +989,9 @@ class FolderViewModel
             _lockError.value = null
             _folderLockReady.value = false
             _isFolderUnlocked.value = false
+            _syncingHistory.value = false
+            _hasMoreMessages.value = true
+            _thumbReadyVersions.value = emptyMap()
             hasRefreshedSinceBind = false
             oldestMessageId = 0L
             hasMoreMessages = true
@@ -1020,28 +1177,32 @@ class FolderViewModel
         fun refresh() {
             val chatId = currentChatId ?: return
             refreshJob?.cancel()
+            backfillJob?.cancel()
             clearPendingThumbQueue(clearCompleted = true)
             scannedLocalThumbIds.clear()
             _thumbRefreshNonce.value += 1
+            _syncingHistory.value = false
             oldestMessageId = 0L
             hasMoreMessages = true
+            _hasMoreMessages.value = true
             refreshJob =
                 viewModelScope.launch(dispatchers.io) {
                     _refreshing.value = true
                     _error.value = null
                     try {
-                        val cloudSyncDeferred = async {
+                        launch {
                             runCatching {
-                                withTimeoutOrNull(4_000L) { cloudSyncManager.syncFromCloud() }
+                                withTimeoutOrNull(8_000L) { cloudSyncManager.syncFromCloud() }
                             }
                         }
-                        val firstBatch = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
-                        cloudSyncDeferred.await()
+                        val firstPage = telegramClient.fetchMessagesPage(chatId, 0L, 100)
+                        val firstBatch = filterOutTrashed(chatId, firstPage.messages)
 
                         val allFetched = ArrayList<TelegramMessage>(firstBatch.size)
                         allFetched.addAll(firstBatch)
-                        oldestMessageId = firstBatch.minOfOrNull { it.id } ?: 0L
-                        hasMoreMessages = firstBatch.size >= 50
+                        oldestMessageId = firstPage.nextFromMessageId
+                        hasMoreMessages = !firstPage.reachedEnd
+                        _hasMoreMessages.value = hasMoreMessages
 
                         val activeSubfolder = normalizeVirtualPath(_virtualPath.value)
                         if (activeSubfolder.isNotEmpty()) {
@@ -1053,15 +1214,13 @@ class FolderViewModel
                             var extraPages = 0
                             while (hasMoreMessages && matchedCount < 10 && extraPages < 2) {
                                 extraPages++
-                                val nextRaw = telegramClient.fetchMessages(chatId, oldestMessageId, 100)
-                                if (nextRaw.isEmpty()) {
-                                    hasMoreMessages = false
-                                    break
-                                }
-                                val filteredNext = filterOutTrashed(chatId, nextRaw)
+                                val nextPage = telegramClient.fetchMessagesPage(chatId, oldestMessageId, 100)
+                                oldestMessageId = nextPage.nextFromMessageId
+                                hasMoreMessages = !nextPage.reachedEnd
+                                _hasMoreMessages.value = hasMoreMessages
+                                if (nextPage.messages.isEmpty()) break
+                                val filteredNext = filterOutTrashed(chatId, nextPage.messages)
                                 allFetched.addAll(filteredNext)
-                                oldestMessageId = nextRaw.minOfOrNull { it.id } ?: oldestMessageId
-                                hasMoreMessages = nextRaw.size >= 50
                                 matchedCount += filteredNext.count { msg ->
                                     val resolved =
                                         cloudSyncManager.getCloudVirtualPath(chatId, msg.id)
@@ -1077,6 +1236,9 @@ class FolderViewModel
                         }
                         warmThumbnailsForEntities(entities, activeSubfolder = activeSubfolder)
                         _refreshing.value = false
+                        if (hasMoreMessages) {
+                            startBackgroundBackfill(chatId)
+                        }
                         launch {
                             for (delayMs in listOf(2000L, 4000L, 8000L, 16000L, 32000L)) {
                                 delay(delayMs)
@@ -1125,22 +1287,74 @@ class FolderViewModel
                 }
         }
 
+        private fun startBackgroundBackfill(chatId: Long) {
+            backfillJob?.cancel()
+            backfillJob =
+                viewModelScope.launch(dispatchers.io) {
+                    _syncingHistory.value = true
+                    try {
+                        var consecutiveKnownPages = 0
+                        var pages = 0
+                        while (hasMoreMessages && pages < 30 && currentChatId == chatId) {
+                            val cursor = oldestMessageId
+                            if (cursor == 0L) break
+                            pages++
+                            delay(150L)
+                            val page = telegramClient.fetchMessagesPage(chatId, cursor, 100)
+                            oldestMessageId = page.nextFromMessageId
+                            hasMoreMessages = !page.reachedEnd
+                            _hasMoreMessages.value = hasMoreMessages
+                            val filtered = filterOutTrashed(chatId, page.messages)
+                            if (filtered.isNotEmpty()) {
+                                val knownIds = _items.value.mapTo(HashSet()) { it.messageId }
+                                val hasNew = filtered.any { it.id !in knownIds }
+                                val entities = filtered.map { it.toCacheEntity(chatId) }
+                                fileCacheDao.upsertAll(entities)
+                                if (!hasNew) {
+                                    consecutiveKnownPages++
+                                    if (consecutiveKnownPages >= 2 &&
+                                        normalizeVirtualPath(_virtualPath.value).isEmpty()
+                                    ) {
+                                        break
+                                    }
+                                } else {
+                                    consecutiveKnownPages = 0
+                                }
+                            } else if (page.reachedEnd) {
+                                break
+                            }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w("Background history backfill failed", t)
+                    } finally {
+                        withContext(NonCancellable) { _syncingHistory.value = false }
+                    }
+                }
+        }
+
         fun loadMore() {
             val chatId = currentChatId ?: return
             if (!hasMoreMessages || _loading.value) return
             viewModelScope.launch(dispatchers.io) {
                 _loading.value = true
                 try {
-                    val raw = telegramClient.fetchMessages(chatId, oldestMessageId, 100)
-                    if (raw.isEmpty()) {
-                        hasMoreMessages = false
-                    } else {
-                        val msgs = filterOutTrashed(chatId, raw)
-                        if (msgs.isNotEmpty()) {
-                            fileCacheDao.upsertAll(msgs.map { it.toCacheEntity(chatId) })
-                        }
-                        oldestMessageId = raw.minOfOrNull { it.id } ?: oldestMessageId
-                        hasMoreMessages = raw.size >= 50
+                    val cursor = oldestMessageId.takeIf { it > 0L }
+                        ?: _items.value.minOfOrNull { it.messageId }
+                        ?: 0L
+                    val page = telegramClient.fetchMessagesPage(chatId, cursor, 100)
+                    oldestMessageId = page.nextFromMessageId
+                    hasMoreMessages = !page.reachedEnd
+                    _hasMoreMessages.value = hasMoreMessages
+                    val msgs = filterOutTrashed(chatId, page.messages)
+                    if (msgs.isNotEmpty()) {
+                        val entities = msgs.map { it.toCacheEntity(chatId) }
+                        fileCacheDao.upsertAll(entities)
+                        warmThumbnailsForEntities(
+                            entities,
+                            activeSubfolder = normalizeVirtualPath(_virtualPath.value),
+                        )
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -2369,18 +2583,27 @@ class FolderViewModel
                 entity.mimeType.equals("application/pdf", ignoreCase = true)
         }
 
-        private fun TelegramMessage.toCacheEntity(chatId: Long): FileCacheEntity =
-            FileCacheEntity(
+        private fun TelegramMessage.toCacheEntity(chatId: Long): FileCacheEntity {
+            val resolvedThumb =
+                if (thumbnailPath == null || thumbnailPath.contains("/minithumbs/")) {
+                    telegramClient.getCompletedThumbnailPath(chatId, id)
+                        ?: mediaThumbnailCache.getCachedThumbnailPath(chatId, id)
+                        ?: thumbnailPath
+                } else {
+                    thumbnailPath
+                }
+            return FileCacheEntity(
                 messageId = id,
                 chatId = chatId,
                 fileName = fileName,
                 fileSize = fileSize,
                 mimeType = mimeType,
-                thumbnailPath = thumbnailPath,
+                thumbnailPath = resolvedThumb,
                 remoteId = fileRemoteId,
                 date = date,
                 virtualPath = cloudSyncManager.getCloudVirtualPath(chatId, id) ?: virtualPathFromCaption,
             )
+        }
 
         companion object {
             private const val CUSTOM_FOLDERS_FILE = "custom_virtual_folders.tsv"

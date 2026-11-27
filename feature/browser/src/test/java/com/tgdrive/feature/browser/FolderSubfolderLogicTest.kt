@@ -20,7 +20,9 @@ import com.tgdrive.core.download.sync.CloudSyncManager
 import com.tgdrive.core.security.AccessLockManager
 import com.tgdrive.core.security.BackupCrypto
 import com.tgdrive.core.security.BiometricHelper
+import com.tgdrive.core.telegram.MessagePage
 import com.tgdrive.core.telegram.TelegramClient
+import com.tgdrive.core.telegram.TelegramMessage
 import io.mockk.Runs
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -74,6 +76,9 @@ class FolderSubfolderLogicTest {
     private lateinit var dlStateFlow: MutableStateFlow<DownloadQueueState>
     private lateinit var uploadStateFlow: MutableStateFlow<UploadQueueState>
     private lateinit var completedEventsFlow: MutableSharedFlow<Long>
+    private lateinit var thumbReadyFlow: MutableSharedFlow<Pair<Long, Long>>
+    private lateinit var cloudMetaVersionFlow: MutableStateFlow<Int>
+    private lateinit var newMessagesFlow: MutableSharedFlow<TelegramMessage>
 
     @TempDir
     lateinit var tempDir: Path
@@ -111,6 +116,9 @@ class FolderSubfolderLogicTest {
         dlStateFlow = MutableStateFlow(DownloadQueueState())
         uploadStateFlow = MutableStateFlow(UploadQueueState())
         completedEventsFlow = MutableSharedFlow()
+        thumbReadyFlow = MutableSharedFlow(extraBufferCapacity = 32)
+        cloudMetaVersionFlow = MutableStateFlow(0)
+        newMessagesFlow = MutableSharedFlow(extraBufferCapacity = 32)
 
         val filesDir = File(tempDir.toFile(), "files").apply { mkdirs() }
         val cacheDir = File(tempDir.toFile(), "cache").apply { mkdirs() }
@@ -122,9 +130,15 @@ class FolderSubfolderLogicTest {
         every { downloadManager.state } returns dlStateFlow
         every { uploadManager.uploads } returns uploadStateFlow
         every { uploadManager.completedChatEvents } returns completedEventsFlow
+        every { mediaThumbnailCache.thumbnailReady } returns thumbReadyFlow
+        every { cloudSyncManager.cloudMetaVersion } returns cloudMetaVersionFlow
+        every { telegramClient.newMessages } returns newMessagesFlow
+        every { telegramClient.getCompletedThumbnailPath(any(), any()) } returns null
         coEvery { accessLockManager.hasPassword() } returns false
         coEvery { telegramClient.myUserId() } returns 12345L
         coEvery { telegramClient.fetchMessages(any(), any(), any()) } returns emptyList()
+        coEvery { telegramClient.fetchMessagesPage(any(), any(), any()) } returns
+            MessagePage(emptyList(), 0L, true)
         coEvery { cloudSyncManager.syncFromCloud() } returns true
         every { cloudSyncManager.getCloudVirtualPath(any(), any()) } returns null
         every { cloudSyncManager.getCloudEncryptedThumbRemoteId(any(), any()) } returns null
@@ -435,6 +449,104 @@ class FolderSubfolderLogicTest {
             assertThat(vm.state.value.childVirtualFolders.first().second).isEqualTo(30)
             assertThat(vm.state.value.childVirtualFolderThumbs["Sub00"].orEmpty()).hasSize(4)
             assertThat(vm.state.value.childVirtualFolderThumbs["Sub49"].orEmpty()).hasSize(4)
+            collectJob.cancel()
+        }
+
+    private fun sampleRemoteMsg(
+        id: Long,
+        name: String,
+        virtualPath: String = "",
+    ) = TelegramMessage(
+        id = id,
+        chatId = chatId,
+        fileName = name,
+        fileSize = 2048L,
+        mimeType = "image/jpeg",
+        date = 1_700_000_000L + id,
+        thumbnailPath = null,
+        fileRemoteId = "rem_$id",
+        isVideo = false,
+        isImage = true,
+        isAudio = false,
+        isDocument = false,
+        virtualPathFromCaption = virtualPath,
+    )
+
+    @Test
+    fun `refresh backfills multi-page MessagePage history even with short pages`() =
+        runTest(testDispatcher) {
+            coEvery { telegramClient.fetchMessagesPage(chatId, 0L, 100) } returns
+                MessagePage(
+                    messages = listOf(sampleRemoteMsg(300L, "p1.jpg")),
+                    nextFromMessageId = 300L,
+                    reachedEnd = false,
+                )
+            coEvery { telegramClient.fetchMessagesPage(chatId, 300L, 100) } returns
+                MessagePage(
+                    messages = listOf(sampleRemoteMsg(200L, "p2.jpg", virtualPath = "Trips")),
+                    nextFromMessageId = 200L,
+                    reachedEnd = false,
+                )
+            coEvery { telegramClient.fetchMessagesPage(chatId, 200L, 100) } returns
+                MessagePage(
+                    messages = emptyList(),
+                    nextFromMessageId = 200L,
+                    reachedEnd = true,
+                )
+
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            val ids = dbItemsFlow.value.map { it.messageId }
+            assertThat(ids).containsAtLeast(300L, 200L)
+            assertThat(vm.state.value.syncingHistory).isFalse()
+            assertThat(vm.state.value.hasMoreMessages).isFalse()
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `thumbnailReady and cloudMetaVersion update versions and re-warm encrypted thumbs`() =
+        runTest(testDispatcher) {
+            every { backupCrypto.hasVaultPassphrase() } returns true
+            every { backupCrypto.passphraseFingerprint() } returns "fp-live"
+            coEvery {
+                mediaThumbnailCache.restoreEncryptedThumbFromCloud(chatId, 501L)
+            } returnsMany listOf(null, "/tmp/restored_501.tgethumb")
+
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            dbItemsFlow.value =
+                listOf(
+                    sampleItem(501L, "hidden.jpg.tgenc", virtualPath = "", isEncrypted = true),
+                )
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            val nonceBefore = vm.state.value.thumbRefreshNonce
+            cloudMetaVersionFlow.value = 1
+            thumbReadyFlow.emit(chatId to 501L)
+            advanceUntilIdle()
+
+            assertThat(vm.state.value.thumbRefreshNonce).isGreaterThan(nonceBefore)
+            assertThat(vm.state.value.thumbReadyVersions[501L]).isEqualTo(1)
+            coVerify(atLeast = 2) { mediaThumbnailCache.restoreEncryptedThumbFromCloud(chatId, 501L) }
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `newMessages live-upserts incoming remote files for bound folder`() =
+        runTest(testDispatcher) {
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            newMessagesFlow.emit(sampleRemoteMsg(999L, "incoming_live.jpg"))
+            advanceUntilIdle()
+
+            assertThat(vm.state.value.items.map { it.messageId }).contains(999L)
             collectJob.cancel()
         }
 }

@@ -136,6 +136,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.memory.MemoryCache
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.size.Size
 import com.tgdrive.core.common.FileBucket
@@ -766,6 +768,16 @@ fun FolderScreen(
                 )
             }
 
+            if (state.syncingHistory) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.surfaceContainer,
+                )
+            }
+
             if (state.childVirtualFolders.isNotEmpty()) {
                 VirtualSubfoldersRow(
                     currentVirtualPath = state.currentVirtualPath,
@@ -773,9 +785,11 @@ fun FolderScreen(
                     thumbItemsByFolder = state.childVirtualFolderThumbs,
                     encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                     thumbRefreshNonce = state.thumbRefreshNonce,
+                    thumbReadyVersions = state.thumbReadyVersions,
                     onOpenSubfolder = vm::openVirtualFolder,
                     onRenameSubfolder = { path -> renameSubfolderTarget = path },
                     onDeleteSubfolder = { path -> deleteSubfolderTarget = vm.computeSubfolderStats(path) },
+                    onRetryThumb = vm::requestSubfolderThumb,
                 )
             }
 
@@ -805,12 +819,25 @@ fun FolderScreen(
                                 },
                             )
                         } else if (state.childVirtualFolders.isNotEmpty()) {
-                            Text(
-                                text = stringResource(R.string.browser_subfolder_empty_files_hint),
-                                style = TgTypography.Display.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.padding(horizontal = 24.dp),
-                            )
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.browser_subfolder_empty_files_hint),
+                                    style = TgTypography.Display.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                if (state.hasMoreMessages) {
+                                    TextButton(
+                                        onClick = { vm.loadMore() },
+                                        enabled = !state.loading,
+                                    ) {
+                                        Text(stringResource(R.string.browser_load_older_files))
+                                    }
+                                }
+                            }
                         } else {
                             EditorialEmptyState(
                                 icon = Icons.Filled.InsertDriveFile,
@@ -826,6 +853,7 @@ fun FolderScreen(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 thumbRefreshNonce = state.thumbRefreshNonce,
+                                thumbReadyVersions = state.thumbReadyVersions,
                                 selectedIds = state.selectedIds,
                                 onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
@@ -861,6 +889,7 @@ fun FolderScreen(
                                 items = state.items,
                                 encryptedPreviewFingerprint = state.encryptedPreviewFingerprint,
                                 thumbRefreshNonce = state.thumbRefreshNonce,
+                                thumbReadyVersions = state.thumbReadyVersions,
                                 selectedIds = state.selectedIds,
                                 onRequestThumbnail = vm::requestThumbnail,
                                 onLongClick = { id ->
@@ -1847,6 +1876,7 @@ private fun FileGrid(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
     thumbRefreshNonce: Int = 0,
+    thumbReadyVersions: Map<Long, Int> = emptyMap(),
     selectedIds: Set<Long>,
     onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
@@ -1883,6 +1913,7 @@ private fun FileGrid(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 thumbRefreshNonce = thumbRefreshNonce,
+                thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
                 isSelected = item.messageId in selectedIds,
                 onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
@@ -1915,6 +1946,7 @@ private fun FileGridCell(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
     thumbRefreshNonce: Int = 0,
+    thumbVersion: Int = 0,
     isSelected: Boolean,
     onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
@@ -1955,21 +1987,41 @@ private fun FileGridCell(
         item.thumbnailPath,
         encryptedPreviewFingerprint,
         thumbRefreshNonce,
+        thumbVersion,
     ) { mutableStateOf(false) }
-    val encThumbRequest =
-        remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
-        if (isEnc && encryptedPreviewFingerprint != null) {
-            EncryptedThumbRequest(
-                chatId = item.chatId,
-                messageId = item.messageId,
-                localPath = item.thumbnailPath,
-                passphraseFingerprint = encryptedPreviewFingerprint,
-            )
-        } else {
-            null
-        }
+    var lastGoodMemoryKey by remember(item.chatId, item.messageId) {
+        mutableStateOf<MemoryCache.Key?>(null)
     }
-    val thumbRequest = remember(item.thumbnailPath, isEnc, context) {
+    val encThumbRequest =
+        remember(
+            item.chatId,
+            item.messageId,
+            item.thumbnailPath,
+            isEnc,
+            encryptedPreviewFingerprint,
+            thumbRefreshNonce,
+            thumbVersion,
+            context,
+        ) {
+            if (isEnc && encryptedPreviewFingerprint != null) {
+                val data = EncryptedThumbRequest(
+                    chatId = item.chatId,
+                    messageId = item.messageId,
+                    localPath = item.thumbnailPath,
+                    passphraseFingerprint = encryptedPreviewFingerprint,
+                    retryVersion = thumbRefreshNonce + thumbVersion,
+                )
+                ImageRequest.Builder(context)
+                    .data(data)
+                    .size(Size(360, 360))
+                    .diskCachePolicy(CachePolicy.DISABLED)
+                    .crossfade(false)
+                    .build()
+            } else {
+                null
+            }
+        }
+    val thumbRequest = remember(item.thumbnailPath, isEnc, thumbVersion, lastGoodMemoryKey, context) {
         if (isEnc) {
             null
         } else {
@@ -1979,6 +2031,13 @@ private fun FileGridCell(
                     ImageRequest.Builder(context)
                         .data(File(path))
                         .size(Size(360, 360))
+                        .diskCachePolicy(CachePolicy.DISABLED)
+                        .apply {
+                            if (thumbVersion > 0) {
+                                memoryCacheKey("$path#v$thumbVersion")
+                            }
+                            lastGoodMemoryKey?.let { placeholderMemoryCacheKey(it) }
+                        }
                         .crossfade(false)
                         .build()
                 }
@@ -2025,6 +2084,7 @@ private fun FileGridCell(
                         model = model,
                         contentDescription = item.fileName,
                         contentScale = ContentScale.Crop,
+                        onSuccess = { res -> lastGoodMemoryKey = res.result.memoryCacheKey },
                         onError = {
                             loadFailed = true
                             onRequestThumbnail(true)
@@ -2163,6 +2223,7 @@ private fun FileList(
     items: List<FileCacheEntity>,
     encryptedPreviewFingerprint: String? = null,
     thumbRefreshNonce: Int = 0,
+    thumbReadyVersions: Map<Long, Int> = emptyMap(),
     selectedIds: Set<Long>,
     onRequestThumbnail: (FileCacheEntity, Boolean) -> Unit = { _, _ -> },
     onClick: (Long) -> Unit,
@@ -2197,6 +2258,7 @@ private fun FileList(
                 item = item,
                 encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                 thumbRefreshNonce = thumbRefreshNonce,
+                thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
                 isSelected = item.messageId in selectedIds,
                 onRequestThumbnail = { force -> onRequestThumbnail(item, force) },
                 onClick = { onClick(item.messageId) },
@@ -2229,6 +2291,7 @@ private fun FileListRow(
     item: FileCacheEntity,
     encryptedPreviewFingerprint: String? = null,
     thumbRefreshNonce: Int = 0,
+    thumbVersion: Int = 0,
     isSelected: Boolean,
     onRequestThumbnail: (Boolean) -> Unit = {},
     onClick: () -> Unit,
@@ -2269,21 +2332,38 @@ private fun FileListRow(
         item.thumbnailPath,
         encryptedPreviewFingerprint,
         thumbRefreshNonce,
+        thumbVersion,
     ) { mutableStateOf(false) }
     val encThumbRequest =
-        remember(item.chatId, item.messageId, item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
-        if (isEnc && encryptedPreviewFingerprint != null) {
-            EncryptedThumbRequest(
-                chatId = item.chatId,
-                messageId = item.messageId,
-                localPath = item.thumbnailPath,
-                passphraseFingerprint = encryptedPreviewFingerprint,
-            )
-        } else {
-            null
+        remember(
+            item.chatId,
+            item.messageId,
+            item.thumbnailPath,
+            isEnc,
+            encryptedPreviewFingerprint,
+            thumbRefreshNonce,
+            thumbVersion,
+            context,
+        ) {
+            if (isEnc && encryptedPreviewFingerprint != null) {
+                val data = EncryptedThumbRequest(
+                    chatId = item.chatId,
+                    messageId = item.messageId,
+                    localPath = item.thumbnailPath,
+                    passphraseFingerprint = encryptedPreviewFingerprint,
+                    retryVersion = thumbRefreshNonce + thumbVersion,
+                )
+                ImageRequest.Builder(context)
+                    .data(data)
+                    .size(Size(160, 160))
+                    .diskCachePolicy(CachePolicy.DISABLED)
+                    .crossfade(false)
+                    .build()
+            } else {
+                null
+            }
         }
-    }
-    val thumbRequest = remember(item.thumbnailPath, isEnc, context) {
+    val thumbRequest = remember(item.thumbnailPath, isEnc, thumbVersion, context) {
         if (isEnc) {
             null
         } else {
@@ -2293,6 +2373,12 @@ private fun FileListRow(
                     ImageRequest.Builder(context)
                         .data(File(path))
                         .size(Size(160, 160))
+                        .diskCachePolicy(CachePolicy.DISABLED)
+                        .apply {
+                            if (thumbVersion > 0) {
+                                memoryCacheKey("$path#v$thumbVersion")
+                            }
+                        }
                         .crossfade(false)
                         .build()
                 }
@@ -2683,11 +2769,25 @@ private fun SubfolderCoverTile(
     thumb: SubfolderThumbItem,
     encryptedPreviewFingerprint: String?,
     thumbRefreshNonce: Int,
+    thumbVersion: Int = 0,
+    onRetryThumb: (SubfolderThumbItem) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    var loadFailed by remember(thumb, encryptedPreviewFingerprint, thumbRefreshNonce) { mutableStateOf(false) }
-    val model = remember(thumb, encryptedPreviewFingerprint, loadFailed, context) {
+    var loadFailed by remember(
+        thumb,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+        thumbVersion,
+    ) { mutableStateOf(false) }
+    val model = remember(
+        thumb,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+        thumbVersion,
+        loadFailed,
+        context,
+    ) {
         if (loadFailed) {
             null
         } else if (thumb.isEncrypted) {
@@ -2697,10 +2797,12 @@ private fun SubfolderCoverTile(
                     messageId = thumb.messageId,
                     localPath = thumb.localPath,
                     passphraseFingerprint = encryptedPreviewFingerprint,
+                    retryVersion = thumbRefreshNonce + thumbVersion,
                 )
                 ImageRequest.Builder(context)
                     .data(req)
                     .size(Size(120, 120))
+                    .diskCachePolicy(CachePolicy.DISABLED)
                     .crossfade(false)
                     .build()
             } else {
@@ -2711,6 +2813,12 @@ private fun SubfolderCoverTile(
                 ImageRequest.Builder(context)
                     .data(File(path))
                     .size(Size(120, 120))
+                    .diskCachePolicy(CachePolicy.DISABLED)
+                    .apply {
+                        if (thumbVersion > 0) {
+                            memoryCacheKey("$path#v$thumbVersion")
+                        }
+                    }
                     .crossfade(false)
                     .build()
             }
@@ -2721,7 +2829,10 @@ private fun SubfolderCoverTile(
             model = model,
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            onError = { loadFailed = true },
+            onError = {
+                loadFailed = true
+                onRetryThumb(thumb)
+            },
             modifier = modifier,
         )
     } else {
@@ -2747,9 +2858,11 @@ private fun VirtualSubfoldersRow(
     thumbItemsByFolder: Map<String, List<SubfolderThumbItem>> = emptyMap(),
     encryptedPreviewFingerprint: String? = null,
     thumbRefreshNonce: Int = 0,
+    thumbReadyVersions: Map<Long, Int> = emptyMap(),
     onOpenSubfolder: (String) -> Unit,
     onRenameSubfolder: (String) -> Unit = {},
     onDeleteSubfolder: (String) -> Unit = {},
+    onRetryThumb: (SubfolderThumbItem) -> Unit = {},
 ) {
     LazyRow(
         modifier = Modifier
@@ -2791,6 +2904,8 @@ private fun VirtualSubfoldersRow(
                                         thumb = item,
                                         encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                                         thumbRefreshNonce = thumbRefreshNonce,
+                                        thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
+                                        onRetryThumb = onRetryThumb,
                                         modifier = Modifier.weight(1f).fillMaxSize(),
                                     )
                                 }
@@ -2799,6 +2914,8 @@ private fun VirtualSubfoldersRow(
                                         thumb = item,
                                         encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                                         thumbRefreshNonce = thumbRefreshNonce,
+                                        thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
+                                        onRetryThumb = onRetryThumb,
                                         modifier = Modifier.weight(1f).fillMaxSize(),
                                     )
                                 }
@@ -2813,6 +2930,8 @@ private fun VirtualSubfoldersRow(
                                             thumb = item,
                                             encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                                             thumbRefreshNonce = thumbRefreshNonce,
+                                            thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
+                                            onRetryThumb = onRetryThumb,
                                             modifier = Modifier.weight(1f).fillMaxSize(),
                                         )
                                     }
@@ -2821,6 +2940,8 @@ private fun VirtualSubfoldersRow(
                                             thumb = item,
                                             encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                                             thumbRefreshNonce = thumbRefreshNonce,
+                                            thumbVersion = thumbReadyVersions[item.messageId] ?: 0,
+                                            onRetryThumb = onRetryThumb,
                                             modifier = Modifier.weight(1f).fillMaxSize(),
                                         )
                                     }
@@ -2828,10 +2949,13 @@ private fun VirtualSubfoldersRow(
                             }
                         }
                     } else if (thumbItems.size == 1) {
+                        val only = thumbItems[0]
                         SubfolderCoverTile(
-                            thumb = thumbItems[0],
+                            thumb = only,
                             encryptedPreviewFingerprint = encryptedPreviewFingerprint,
                             thumbRefreshNonce = thumbRefreshNonce,
+                            thumbVersion = thumbReadyVersions[only.messageId] ?: 0,
+                            onRetryThumb = onRetryThumb,
                             modifier = Modifier
                                 .size(36.dp)
                                 .clip(RoundedCornerShape(8.dp)),

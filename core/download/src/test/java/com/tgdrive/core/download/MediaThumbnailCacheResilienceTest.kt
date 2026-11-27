@@ -20,6 +20,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -119,8 +120,10 @@ class MediaThumbnailCacheResilienceTest {
             coVerify(exactly = 1) { cloudSyncManager.restoreEncryptedThumbBytes(10L, 200L) }
 
             cache.clearThumbnailFailure(10L, 200L)
+            val readyDeferred = async { cache.thumbnailReady.first { it == (10L to 200L) } }
             val recovered = cache.restoreEncryptedThumbFromCloud(10L, 200L)
             assertThat(recovered).isNotNull()
+            assertThat(readyDeferred.await()).isEqualTo(10L to 200L)
             coVerify(exactly = 2) { cloudSyncManager.restoreEncryptedThumbBytes(10L, 200L) }
         }
 
@@ -151,8 +154,10 @@ class MediaThumbnailCacheResilienceTest {
             assertThat(cache.ensureThumbnail(entity, force = false)).isNull()
             coVerify(exactly = 1) { telegramClient.requestMessageThumbnail(10L, 300L) }
 
+            val readyDeferred = async { cache.thumbnailReady.first { it == (10L to 300L) } }
             val recovered = cache.ensureThumbnail(entity, force = true)
             assertThat(recovered).isEqualTo(validThumb.absolutePath)
+            assertThat(readyDeferred.await()).isEqualTo(10L to 300L)
             coVerify(exactly = 2) { telegramClient.requestMessageThumbnail(10L, 300L) }
         }
 }

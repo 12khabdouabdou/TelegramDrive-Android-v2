@@ -66,6 +66,9 @@ class CloudSyncManager @Inject constructor(
     private val _syncing = MutableStateFlow(false)
     val syncing: StateFlow<Boolean> = _syncing.asStateFlow()
 
+    private val _cloudMetaVersion = MutableStateFlow(0)
+    val cloudMetaVersion: StateFlow<Int> = _cloudMetaVersion.asStateFlow()
+
     @Volatile private var pushMetaJob: Job? = null
     @Volatile private var pushSearchJob: Job? = null
     @Volatile private var pushVaultJob: Job? = null
@@ -913,37 +916,53 @@ class CloudSyncManager @Inject constructor(
             }
         }
 
+        val playbackUpdates = ArrayList<FileCacheDao.PlaybackPositionUpdate>()
         merged.playbackPositions.forEach { pos ->
             localPlaybackTimestamps[pos.chatId to pos.messageId] = pos
             val local = existingByKey[pos.chatId to pos.messageId]
             if (local != null && local.playbackPositionMs != pos.positionMs) {
-                runCatching { fileCacheDao.updatePlaybackPosition(pos.chatId, pos.messageId, pos.positionMs) }
+                playbackUpdates.add(FileCacheDao.PlaybackPositionUpdate(pos.chatId, pos.messageId, pos.positionMs))
             }
         }
+        if (playbackUpdates.isNotEmpty()) {
+            runCatching { fileCacheDao.updatePlaybackPositions(playbackUpdates) }
+        }
 
+        val virtualPathUpdates = ArrayList<FileCacheDao.VirtualPathUpdate>()
         merged.virtualPaths.forEach { vp ->
             localVirtualPathTimestamps[vp.chatId to vp.messageId] = vp
             val local = existingByKey[vp.chatId to vp.messageId]
             if (local != null && local.virtualPath != vp.virtualPath) {
-                runCatching { fileCacheDao.updateVirtualPath(vp.chatId, vp.messageId, vp.virtualPath) }
+                virtualPathUpdates.add(FileCacheDao.VirtualPathUpdate(vp.chatId, vp.messageId, vp.virtualPath))
             }
+        }
+        if (virtualPathUpdates.isNotEmpty()) {
+            runCatching { fileCacheDao.updateVirtualPaths(virtualPathUpdates) }
         }
         persistVirtualPathOverlayToDisk()
 
+        val lockUpdates = ArrayList<FileCacheDao.LockUpdate>()
         merged.lockedFlags.forEach { lk ->
             localLockTimestamps[lk.chatId to lk.messageId] = lk
             val local = existingByKey[lk.chatId to lk.messageId]
             if (local != null && local.isLocked != lk.isLocked) {
-                runCatching { fileCacheDao.setLocked(lk.chatId, lk.messageId, lk.isLocked) }
+                lockUpdates.add(FileCacheDao.LockUpdate(lk.chatId, lk.messageId, lk.isLocked))
             }
         }
+        if (lockUpdates.isNotEmpty()) {
+            runCatching { fileCacheDao.setLockedBatch(lockUpdates) }
+        }
 
+        val noteUpdates = ArrayList<FileCacheDao.UserNoteUpdate>()
         merged.notes.forEach { nt ->
             localNoteTimestamps[nt.chatId to nt.messageId] = nt
             val local = existingByKey[nt.chatId to nt.messageId]
             if (local != null && local.userNote != nt.note) {
-                runCatching { fileCacheDao.updateUserNote(nt.chatId, nt.messageId, nt.note) }
+                noteUpdates.add(FileCacheDao.UserNoteUpdate(nt.chatId, nt.messageId, nt.note))
             }
+        }
+        if (noteUpdates.isNotEmpty()) {
+            runCatching { fileCacheDao.updateUserNotes(noteUpdates) }
         }
 
         val activeAlbumIds = HashSet<String>()
@@ -989,6 +1008,7 @@ class CloudSyncManager @Inject constructor(
         merged.encryptedThumbs.forEach { rec ->
             localEncryptedThumbTimestamps[rec.chatId to rec.messageId] = rec
         }
+        _cloudMetaVersion.value += 1
     }
 
     private suspend fun applyMergedSearchIndex(merged: CloudSyncCodec.CloudSearchIndexSnapshot) {

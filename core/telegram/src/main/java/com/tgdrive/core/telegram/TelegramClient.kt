@@ -45,6 +45,17 @@ interface TelegramClient : TelegramAuthObserver {
 
     // File / chat
     suspend fun fetchMessages(chatId: Long, fromMessageId: Long, limit: Int): List<TelegramMessage>
+    suspend fun fetchMessagesPage(chatId: Long, fromMessageId: Long, limit: Int): MessagePage {
+        val msgs = fetchMessages(chatId, fromMessageId, limit)
+        return MessagePage(
+            messages = msgs,
+            nextFromMessageId = msgs.minOfOrNull { it.id } ?: 0L,
+            reachedEnd = msgs.isEmpty(),
+        )
+    }
+    val newMessages: kotlinx.coroutines.flow.SharedFlow<TelegramMessage>
+        get() = EMPTY_NEW_MESSAGES
+    fun getCompletedThumbnailPath(chatId: Long, messageId: Long): String? = null
     suspend fun searchMessages(chatId: Long, query: String, limit: Int = 50): List<TelegramMessage>
 
     /**
@@ -116,6 +127,16 @@ interface TelegramClient : TelegramAuthObserver {
 
 private val EMPTY_THUMBNAIL_UPDATES: kotlinx.coroutines.flow.SharedFlow<ThumbnailUpdate> =
     MutableSharedFlow<ThumbnailUpdate>().asSharedFlow()
+
+private val EMPTY_NEW_MESSAGES: kotlinx.coroutines.flow.SharedFlow<TelegramMessage> =
+    MutableSharedFlow<TelegramMessage>().asSharedFlow()
+
+/** Paginated message batch preserving the raw oldest TDLib message ID for reliable cursor paging. */
+data class MessagePage(
+    val messages: List<TelegramMessage>,
+    val nextFromMessageId: Long,
+    val reachedEnd: Boolean,
+)
 
 /** Fired when a Telegram thumbnail download completes with a verified local path. */
 data class ThumbnailUpdate(

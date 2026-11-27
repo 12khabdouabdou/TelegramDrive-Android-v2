@@ -12,7 +12,7 @@ class AppPreferencesDataTest {
         assertThat(d.biometricLockEnabled).isFalse()
         assertThat(d.fileViewMode).isEqualTo(FileViewMode.GRID)
         assertThat(d.cacheLimitBytes).isEqualTo(500L * 1024 * 1024)
-        assertThat(d.thumbnailCacheLimitBytes).isEqualTo(50L * 1024 * 1024)
+        assertThat(d.thumbnailCacheLimitBytes).isEqualTo(128L * 1024 * 1024)
         assertThat(d.backupEnabled).isFalse()
         assertThat(d.backupFolderUris).isEmpty()
         assertThat(d.backupTargetFolderId).isEqualTo(-1L)
