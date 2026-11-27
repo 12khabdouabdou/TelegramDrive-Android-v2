@@ -1095,9 +1095,9 @@ class FolderViewModel
                                             .take(60)
                                     }
                                     val allDone = checkSlice.any() && checkSlice.all { item ->
+                                        val tp = item.thumbnailPath
                                         !hasThumbnailableKind(item) ||
-                                            (!item.thumbnailPath.isNullOrBlank() &&
-                                                !item.thumbnailPath.contains("/minithumbs/"))
+                                            (!tp.isNullOrBlank() && !tp.contains("/minithumbs/"))
                                     }
                                     if (allDone) {
                                         break
