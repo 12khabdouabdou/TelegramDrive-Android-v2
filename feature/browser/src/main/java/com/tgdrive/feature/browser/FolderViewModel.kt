@@ -2584,13 +2584,14 @@ class FolderViewModel
         }
 
         private fun TelegramMessage.toCacheEntity(chatId: Long): FileCacheEntity {
+            val tp = thumbnailPath
             val resolvedThumb =
-                if (thumbnailPath == null || thumbnailPath.contains("/minithumbs/")) {
+                if (tp == null || tp.contains("/minithumbs/")) {
                     telegramClient.getCompletedThumbnailPath(chatId, id)
                         ?: mediaThumbnailCache.getCachedThumbnailPath(chatId, id)
-                        ?: thumbnailPath
+                        ?: tp
                 } else {
-                    thumbnailPath
+                    tp
                 }
             return FileCacheEntity(
                 messageId = id,
