@@ -235,6 +235,7 @@ class FolderSubfolderLogicTest {
         virtualPath: String = "",
         thumbPath: String? = null,
         isEncrypted: Boolean = false,
+        isPinnedOffline: Boolean = false,
         mimeType: String? = if (isEncrypted) "application/octet-stream" else "image/jpeg",
     ) = FileCacheEntity(
         messageId = id,
@@ -247,6 +248,7 @@ class FolderSubfolderLogicTest {
         date = 1_000L + id,
         virtualPath = virtualPath,
         isEncryptedVault = isEncrypted,
+        isPinnedOffline = isPinnedOffline,
     )
 
     @Test
@@ -320,8 +322,8 @@ class FolderSubfolderLogicTest {
             dbItemsFlow.value =
                 listOf(
                     sampleItem(10L, "root.jpg", virtualPath = ""),
-                    sampleItem(11L, "doc1.pdf", virtualPath = "Docs/Tax"),
-                    sampleItem(12L, "doc2.pdf", virtualPath = "Docs/Tax/2026"),
+                    sampleItem(11L, "doc1.pdf", virtualPath = "Docs/Tax", isPinnedOffline = true),
+                    sampleItem(12L, "doc2.pdf", virtualPath = "Docs/Tax/2026", isPinnedOffline = true),
                 )
             vm.bind(chatId)
             vm.openVirtualFolder("Docs/Tax")
