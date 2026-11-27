@@ -102,6 +102,16 @@ interface FileCacheDao {
     @Query("DELETE FROM file_cache WHERE message_id = :messageId AND chat_id = :chatId")
     suspend fun deleteById(chatId: Long, messageId: Long)
 
+    @Query("DELETE FROM file_cache WHERE chat_id = :chatId AND message_id IN (:messageIds)")
+    suspend fun deleteByIdsRaw(chatId: Long, messageIds: List<Long>)
+
+    @Transaction
+    suspend fun deleteByIds(chatId: Long, messageIds: List<Long>) {
+        messageIds.chunked(500).forEach { batch ->
+            deleteByIdsRaw(chatId, batch)
+        }
+    }
+
     @Query("DELETE FROM file_cache WHERE chat_id = :chatId")
     suspend fun deleteForChat(chatId: Long)
 

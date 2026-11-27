@@ -1,6 +1,7 @@
 package com.tgdrive.feature.browser
 
 import android.content.Context
+import androidx.lifecycle.viewModelScope
 import com.google.common.truth.Truth.assertThat
 import com.tgdrive.core.audio.AudioPlayerController
 import com.tgdrive.core.common.DispatchersProvider
@@ -9,6 +10,7 @@ import com.tgdrive.core.datastore.AppPreferencesData
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
+import com.tgdrive.core.download.BulkDeleteManager
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadQueueState
 import com.tgdrive.core.download.MediaThumbnailCache
@@ -33,6 +35,7 @@ import io.mockk.verify
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -67,6 +70,7 @@ class FolderSubfolderLogicTest {
     private lateinit var trashEntryDao: TrashEntryDao
     private lateinit var cloudSyncManager: CloudSyncManager
     private lateinit var mediaThumbnailCache: MediaThumbnailCache
+    private lateinit var bulkDeleteManager: BulkDeleteManager
     private lateinit var appContext: Context
     private lateinit var testDispatcher: TestDispatcher
     private lateinit var dispatchers: DispatchersProvider
@@ -155,6 +159,10 @@ class FolderSubfolderLogicTest {
             val msgId = secondArg<Long>()
             dbItemsFlow.value = dbItemsFlow.value.filterNot { it.messageId == msgId }
         }
+        coEvery { fileCacheDao.deleteByIds(chatId, any()) } answers {
+            val ids = secondArg<List<Long>>().toSet()
+            dbItemsFlow.value = dbItemsFlow.value.filterNot { it.messageId in ids }
+        }
         coEvery { fileCacheDao.updateVirtualPath(chatId, any(), any()) } answers {
             val msgId = secondArg<Long>()
             val vpath = thirdArg<String>()
@@ -163,14 +171,40 @@ class FolderSubfolderLogicTest {
                     if (item.messageId == msgId) item.copy(virtualPath = vpath) else item
                 }
         }
+        coEvery { fileCacheDao.updateVirtualPaths(any()) } answers {
+            val updates = firstArg<List<FileCacheDao.VirtualPathUpdate>>().associateBy { it.messageId }
+            dbItemsFlow.value =
+                dbItemsFlow.value.map { item ->
+                    updates[item.messageId]?.let { item.copy(virtualPath = it.virtualPath) } ?: item
+                }
+        }
+        coEvery { telegramClient.deleteMessages(any(), any()) } coAnswers {
+            val cid = firstArg<Long>()
+            val ids = secondArg<List<Long>>()
+            for (id in ids) {
+                telegramClient.deleteMessage(cid, id)
+            }
+        }
         coEvery { trashEntryDao.upsertAll(any()) } just Runs
         coEvery { fileCacheDao.updateThumbnailPaths(any()) } just Runs
         every { mediaThumbnailCache.needsThumbnailUpgrade(any()) } returns false
         every { mediaThumbnailCache.getEncryptedThumbnailPath(any(), any()) } returns null
+
+        bulkDeleteManager =
+            BulkDeleteManager(
+                appContext = appContext,
+                telegramClient = telegramClient,
+                fileCacheDao = fileCacheDao,
+                trashEntryDao = trashEntryDao,
+                offlinePinStore = offlinePinStore,
+                cloudSyncManager = cloudSyncManager,
+                dispatchers = dispatchers,
+            )
     }
 
     @AfterEach
     fun tearDown() {
+        bulkDeleteManager.cancelAll()
         Dispatchers.resetMain()
     }
 
@@ -191,6 +225,7 @@ class FolderSubfolderLogicTest {
             trashEntryDao = trashEntryDao,
             cloudSyncManager = cloudSyncManager,
             mediaThumbnailCache = mediaThumbnailCache,
+            bulkDeleteManager = bulkDeleteManager,
             appContext = appContext,
         )
 
@@ -548,5 +583,28 @@ class FolderSubfolderLogicTest {
 
             assertThat(vm.state.value.items.map { it.messageId }).contains(999L)
             collectJob.cancel()
+        }
+
+    @Test
+    fun `deleting large subfolder completes in BulkDeleteManager even after viewModelScope cancels`() =
+        runTest(testDispatcher) {
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            val bulkItems =
+                (1L..250L).map { id ->
+                    sampleItem(id, "vac_$id.jpg", virtualPath = "Vacation/Raw")
+                }
+            dbItemsFlow.value = bulkItems + sampleItem(900L, "keep.jpg", virtualPath = "Work")
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            vm.deleteVirtualFolder("Vacation", permanent = true)
+            vm.viewModelScope.cancel()
+            collectJob.cancel()
+            advanceUntilIdle()
+
+            assertThat(dbItemsFlow.value.map { it.messageId }).containsExactly(900L)
+            coVerify(exactly = 3) { telegramClient.deleteMessages(chatId, any()) }
+            coVerify(exactly = 3) { fileCacheDao.deleteByIds(chatId, any()) }
         }
 }

@@ -1237,16 +1237,24 @@ class TdLibTelegramClient(
     }
 
     override suspend fun deleteMessage(chatId: Long, messageId: Long) = withContext(dispatchers.io) {
+        deleteMessages(chatId, listOf(messageId))
+    }
+
+    override suspend fun deleteMessages(chatId: Long, messageIds: List<Long>) = withContext(dispatchers.io) {
+        if (messageIds.isEmpty()) return@withContext
         val selfId = try { myUserId() } catch (_: Throwable) { 0L }
         val revoke = chatId != selfId
-        Log.i("deleteMessage: chatId=$chatId, msgId=$messageId, revoke=$revoke")
-        try {
-            send<TdApi.Ok>(TdApi.DeleteMessages(chatId, longArrayOf(messageId), revoke))
-        } catch (t: Throwable) {
-            Log.w("deleteMessage: retrying with revoke=false", t)
-            send<TdApi.Ok>(TdApi.DeleteMessages(chatId, longArrayOf(messageId), false))
+        for (chunk in messageIds.chunked(100)) {
+            Log.i("deleteMessages: chatId=$chatId, count=${chunk.size}, revoke=$revoke")
+            try {
+                send<TdApi.Ok>(TdApi.DeleteMessages(chatId, chunk.toLongArray(), revoke))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Log.w("deleteMessages: retrying chunk with revoke=false", t)
+                send<TdApi.Ok>(TdApi.DeleteMessages(chatId, chunk.toLongArray(), false))
+            }
         }
-        Unit
     }
 
     override suspend fun renameFile(chatId: Long, messageId: Long, newFileName: String) = withContext(dispatchers.io) {

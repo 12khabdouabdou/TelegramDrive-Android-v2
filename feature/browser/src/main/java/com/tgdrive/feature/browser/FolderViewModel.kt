@@ -18,6 +18,8 @@ import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.TrashEntryEntity
+import com.tgdrive.core.download.BulkDeleteManager
+import com.tgdrive.core.download.BulkDeleteProgress
 import com.tgdrive.core.download.DecryptOutcome
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
@@ -140,6 +142,7 @@ data class FolderUiState(
     val encryptedPreviewFingerprint: String? = null,
     val thumbRefreshNonce: Int = 0,
     val thumbReadyVersions: Map<Long, Int> = emptyMap(),
+    val activeBulkDeletes: List<BulkDeleteProgress> = emptyList(),
     val isFolderLockedByPref: Boolean = false,
     val isFolderLockRequired: Boolean = false,
     val isFolderUnlocked: Boolean = true,
@@ -192,6 +195,7 @@ class FolderViewModel
         private val trashEntryDao: TrashEntryDao,
         private val cloudSyncManager: CloudSyncManager,
         private val mediaThumbnailCache: MediaThumbnailCache,
+        private val bulkDeleteManager: BulkDeleteManager,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
         private data class PendingThumbRequest(
@@ -374,6 +378,24 @@ class FolderViewModel
                                 fileCacheDao.upsertAll(filtered.map { it.toCacheEntity(chatId) })
                             }
                         }
+                    }
+                }
+            }
+            viewModelScope.launch(dispatchers.io) {
+                bulkDeleteManager.completions.collect { comp ->
+                    if (comp.chatId != currentChatId) return@collect
+                    if (comp.error != null) {
+                        _error.value = comp.error
+                    }
+                    if (!comp.permanent && comp.trashedEntries.isNotEmpty()) {
+                        lastTrashedBatch = comp.trashedEntries
+                        _snackbarEvent.value = FolderSnackbarEvent(
+                            id = System.nanoTime(),
+                            message = "Moved ${comp.deletedCount} item(s) to Trash",
+                            canUndoTrash = true,
+                        )
+                    } else if (comp.deletedCount > 0) {
+                        showSnackbar("Deleted ${comp.deletedCount} item(s)")
                     }
                 }
             }
@@ -766,13 +788,20 @@ class FolderViewModel
                 derivedFolderFlow,
                 statusChromeFlow,
                 overlayFlow,
-                combine(uploadManager.uploads, _batchDecryptProgress, _thumbRefreshNonce, _thumbReadyVersions) {
+                combine(
+                    uploadManager.uploads,
+                    _batchDecryptProgress,
+                    _thumbRefreshNonce,
+                    _thumbReadyVersions,
+                    bulkDeleteManager.activeJobs,
+                ) {
                         uploads,
                         batchProgress,
                         nonce,
                         readyVersions,
+                        bulkDeletes,
                     ->
-                    listOf(uploads, batchProgress, nonce, readyVersions)
+                    listOf(uploads, batchProgress, nonce, readyVersions, bulkDeletes)
                 },
             ) { derived, chrome, overlays, fastTail ->
                 val uploadQueue = fastTail[0] as com.tgdrive.core.download.UploadQueueState
@@ -781,9 +810,14 @@ class FolderViewModel
                 val thumbRefreshNonce = fastTail[2] as Int
                 @Suppress("UNCHECKED_CAST")
                 val thumbReadyVersions = fastTail[3] as Map<Long, Int>
+                @Suppress("UNCHECKED_CAST")
+                val allBulkDeletes = fastTail[4] as List<BulkDeleteProgress>
                 val boundId = derived.boundId
                 val chatUploads = uploadQueue.items.filter {
                     boundId == null || it.chatId == boundId || it.chatId == 0L
+                }
+                val chatBulkDeletes = allBulkDeletes.filter {
+                    boundId == null || it.chatId == boundId
                 }
                 FolderUiState(
                     items = derived.items,
@@ -814,6 +848,7 @@ class FolderViewModel
                     encryptedPreviewFingerprint = derived.encryptedPreviewFingerprint,
                     thumbRefreshNonce = thumbRefreshNonce,
                     thumbReadyVersions = thumbReadyVersions,
+                    activeBulkDeletes = chatBulkDeletes,
                     isFolderLockedByPref = derived.isFolderLockedByPref,
                     isFolderLockRequired = derived.isFolderLockRequired,
                     isFolderUnlocked = derived.isFolderUnlocked,
@@ -1533,37 +1568,18 @@ class FolderViewModel
         ) {
             viewModelScope.launch(dispatchers.io) {
                 try {
-                    val now = System.currentTimeMillis()
                     val byId = _items.value.associateBy { it.messageId }
                     val entities = ids.mapNotNull { id -> byId[id] ?: fileCacheDao.getById(chatId, id) }
                     if (entities.isEmpty()) return@launch
-
-                    val trashed = entities.map { item ->
-                        lastTrashedVirtualPaths[item.chatId to item.messageId] = item.virtualPath
-                        TrashEntryEntity(
-                            messageId = item.messageId,
-                            chatId = item.chatId,
-                            fileName = item.fileName,
-                            fileSize = item.fileSize,
-                            mimeType = item.mimeType,
-                            thumbnailPath = item.thumbnailPath,
-                            remoteId = item.remoteId,
-                            originalDate = item.date,
-                            isStarred = item.isStarred,
-                            deletedAt = now,
-                        )
-                    }
-                    trashEntryDao.upsertAll(trashed)
                     for (item in entities) {
-                        fileCacheDao.deleteById(chatId, item.messageId)
+                        lastTrashedVirtualPaths[item.chatId to item.messageId] = item.virtualPath
                     }
                     _selected.update { current -> current - ids.toSet() }
-                    lastTrashedBatch = trashed
-                    cloudSyncManager.schedulePushMetadata()
-                    _snackbarEvent.value = FolderSnackbarEvent(
-                        id = System.nanoTime(),
-                        message = appContext.getString(R.string.trash_moved_snackbar, trashed.size),
-                        canUndoTrash = true,
+                    bulkDeleteManager.enqueueDelete(
+                        chatId = chatId,
+                        label = "${entities.size} item(s)",
+                        targets = entities,
+                        permanent = false,
                     )
                 } catch (e: CancellationException) {
                     throw e
@@ -2094,58 +2110,17 @@ class FolderViewModel
                     }
 
                     if (!permanent) {
-                        val now = System.currentTimeMillis()
-                        val trashed = targets.map { item ->
+                        for (item in targets) {
                             lastTrashedVirtualPaths[item.chatId to item.messageId] = item.virtualPath
-                            TrashEntryEntity(
-                                messageId = item.messageId,
-                                chatId = item.chatId,
-                                fileName = item.fileName,
-                                fileSize = item.fileSize,
-                                mimeType = item.mimeType,
-                                thumbnailPath = item.thumbnailPath,
-                                remoteId = item.remoteId,
-                                originalDate = item.date,
-                                isStarred = item.isStarred,
-                                deletedAt = now,
-                            )
-                        }
-                        trashEntryDao.upsertAll(trashed)
-                        for (item in targets) {
-                            fileCacheDao.deleteById(chatId, item.messageId)
-                        }
-                        _selected.update { current -> current - targets.mapTo(HashSet()) { it.messageId } }
-                        lastTrashedBatch = trashed
-                        cloudSyncManager.schedulePushMetadata()
-                        _snackbarEvent.value = FolderSnackbarEvent(
-                            id = System.nanoTime(),
-                            message = appContext.getString(R.string.trash_moved_snackbar, trashed.size),
-                            canUndoTrash = true,
-                        )
-                    } else {
-                        var deletedCount = 0
-                        var lastErr: String? = null
-                        for (item in targets) {
-                            try {
-                                telegramClient.deleteMessage(chatId, item.messageId)
-                                fileCacheDao.deleteById(chatId, item.messageId)
-                                runCatching { offlinePinStore.unpinFile(chatId, item.messageId) }
-                                deletedCount++
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (t: Throwable) {
-                                lastErr = t.message
-                                Log.w("deleteVirtualFolder: failed deleting msg=${item.messageId}", t)
-                            }
-                        }
-                        _selected.update { current -> current - targets.mapTo(HashSet()) { it.messageId } }
-                        cloudSyncManager.schedulePushMetadata()
-                        if (lastErr != null && deletedCount < targets.size) {
-                            _error.value = "Deleted $deletedCount/${targets.size} file(s) from $displayName: $lastErr"
-                        } else {
-                            showSnackbar("Deleted $displayName ($deletedCount file(s))")
                         }
                     }
+                    _selected.update { current -> current - targets.mapTo(HashSet()) { it.messageId } }
+                    bulkDeleteManager.enqueueDelete(
+                        chatId = chatId,
+                        label = displayName,
+                        targets = targets,
+                        permanent = permanent,
+                    )
                 } catch (e: CancellationException) {
                     throw e
                 } catch (t: Throwable) {
@@ -2172,19 +2147,18 @@ class FolderViewModel
                     val allInChat =
                         (runCatching { fileCacheDao.forChat(chatId) }.getOrDefault(emptyList()) + _items.value)
                             .distinctBy { it.messageId }
-                    var updatedCount = 0
+                    val pathUpdates = ArrayList<FileCacheDao.VirtualPathUpdate>()
                     for (item in allInChat) {
                         val itemPath = normalizeVirtualPath(item.virtualPath)
                         if (matchesSubfolderPrefix(itemPath, oldNorm)) {
                             val rewritten = rewriteSubfolderPrefix(itemPath, oldNorm, newNorm)
-                            fileCacheDao.updateVirtualPath(chatId, item.messageId, rewritten)
+                            pathUpdates.add(FileCacheDao.VirtualPathUpdate(chatId, item.messageId, rewritten))
                             cloudSyncManager.noteVirtualPathChanged(
                                 chatId = chatId,
                                 messageId = item.messageId,
                                 virtualPath = rewritten,
                                 schedulePush = false,
                             )
-                            updatedCount++
                         }
                     }
 
@@ -2206,8 +2180,8 @@ class FolderViewModel
                     if (matchesSubfolderPrefix(curVpath, oldNorm)) {
                         _virtualPath.value = rewriteSubfolderPrefix(curVpath, oldNorm, newNorm)
                     }
-                    if (updatedCount > 0) {
-                        cloudSyncManager.schedulePushMetadata()
+                    if (pathUpdates.isNotEmpty()) {
+                        bulkDeleteManager.enqueueRenameVirtualPath(chatId, pathUpdates)
                     }
                     showSnackbar("Renamed subfolder to $cleanSeg")
                 } catch (e: CancellationException) {

@@ -82,6 +82,11 @@ interface TelegramClient : TelegramAuthObserver {
     ): UploadResult
 
     suspend fun deleteMessage(chatId: Long, messageId: Long)
+    suspend fun deleteMessages(chatId: Long, messageIds: List<Long>) {
+        for (id in messageIds) {
+            deleteMessage(chatId, id)
+        }
+    }
     suspend fun moveFile(fromChatId: Long, messageId: Long, toChatId: Long): Long
     suspend fun renameFile(chatId: Long, messageId: Long, newFileName: String)
     fun downloadFile(remoteId: String, localPath: String): Flow<DownloadUpdate>

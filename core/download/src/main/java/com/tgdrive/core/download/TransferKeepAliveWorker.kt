@@ -31,6 +31,7 @@ class TransferKeepAliveWorker @AssistedInject constructor(
     @Assisted params: WorkerParameters,
     private val downloadManager: DownloadManager,
     private val uploadTracker: UploadTracker,
+    private val bulkDeleteManager: BulkDeleteManager,
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
@@ -44,17 +45,28 @@ class TransferKeepAliveWorker @AssistedInject constructor(
         delay(250L)
         var lastUpdateMs = 0L
         var lastActiveCount = -1
-        combine(downloadManager.state, uploadTracker.state) { dlState, ulState ->
+        combine(
+            downloadManager.state,
+            uploadTracker.state,
+            bulkDeleteManager.activeJobs,
+        ) { dlState, ulState, activeDeletes ->
             val activeDl = dlState.items.filter {
                 it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING
             }
             val activeUl = ulState.items.filter { it.status.isActive }
-            val activeCount = activeDl.size + activeUl.size
+            val activeCount = activeDl.size + activeUl.size + activeDeletes.size
             val now = System.currentTimeMillis()
             if (activeCount > 0 && (activeCount != lastActiveCount || now - lastUpdateMs >= 400L)) {
                 lastUpdateMs = now
                 lastActiveCount = activeCount
-                val (label, progressPct) = formatTransferSummary(activeUl, activeDl)
+                val (label, progressPct) = if (activeUl.isEmpty() && activeDl.isEmpty() && activeDeletes.isNotEmpty()) {
+                    val first = activeDeletes.first()
+                    val pct = ((first.completed * 100) / first.total.coerceAtLeast(1)).coerceIn(0, 100)
+                    val verb = if (first.permanent) "Deleting" else "Moving to Trash"
+                    "$verb ${first.label} (${first.completed}/${first.total})…" to pct
+                } else {
+                    formatTransferSummary(activeUl, activeDl)
+                }
                 runCatching {
                     setForeground(
                         buildForegroundInfo(

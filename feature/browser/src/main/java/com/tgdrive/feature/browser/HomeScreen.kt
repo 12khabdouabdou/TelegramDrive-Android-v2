@@ -59,6 +59,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
@@ -318,6 +319,35 @@ fun HomeScreen(
                                 contentDescription = stringResource(R.string.browser_dismiss),
                                 tint = MaterialTheme.colorScheme.onErrorContainer,
                                 modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (state.activeBulkDeletes.isNotEmpty()) {
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp)
+                            .clip(TgShapes.Large)
+                            .background(MaterialTheme.colorScheme.surfaceContainer)
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        for (job in state.activeBulkDeletes) {
+                            val verb = if (job.permanent) "Deleting" else "Moving to Trash"
+                            Text(
+                                text = "$verb \"${job.label}\": ${job.completed} / ${job.total}",
+                                style = TgTypography.Display.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                            )
+                            val frac = (job.completed.toFloat() / job.total.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            LinearProgressIndicator(
+                                progress = { frac },
+                                modifier = Modifier.fillMaxWidth(),
                             )
                         }
                     }

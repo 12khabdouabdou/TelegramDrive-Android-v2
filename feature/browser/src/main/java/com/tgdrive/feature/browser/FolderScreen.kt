@@ -778,6 +778,34 @@ fun FolderScreen(
                 )
             }
 
+            if (state.activeBulkDeletes.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainer)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    for (job in state.activeBulkDeletes) {
+                        val verb = if (job.permanent) "Deleting" else "Moving to Trash"
+                        Text(
+                            text = "$verb \"${job.label}\": ${job.completed} / ${job.total}",
+                            style = TgTypography.Display.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        val frac = (job.completed.toFloat() / job.total.coerceAtLeast(1)).coerceIn(0f, 1f)
+                        LinearProgressIndicator(
+                            progress = { frac },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+
             if (state.childVirtualFolders.isNotEmpty()) {
                 VirtualSubfoldersRow(
                     currentVirtualPath = state.currentVirtualPath,

@@ -19,6 +19,8 @@ import com.tgdrive.core.db.dao.FolderDao
 import com.tgdrive.core.db.dao.TrashEntryDao
 import com.tgdrive.core.db.entity.FileCacheEntity
 import com.tgdrive.core.db.entity.FolderEntity
+import com.tgdrive.core.download.BulkDeleteManager
+import com.tgdrive.core.download.BulkDeleteProgress
 import com.tgdrive.core.download.DownloadItem
 import com.tgdrive.core.download.DownloadManager
 import com.tgdrive.core.download.DownloadStatus
@@ -84,6 +86,7 @@ data class HomeUiState(
     val hasAccessPassword: Boolean = false,
     val accessLockBiometricEnabled: Boolean = true,
     val biometricAvailable: Boolean = false,
+    val activeBulkDeletes: List<BulkDeleteProgress> = emptyList(),
 )
 
 private data class HomeDashboardStats(
@@ -119,6 +122,7 @@ class HomeViewModel
         private val accessLockManager: AccessLockManager,
         private val biometricHelper: BiometricHelper,
         private val preferences: AppPreferences,
+        private val bulkDeleteManager: BulkDeleteManager,
         private val dispatchers: DispatchersProvider,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
@@ -154,8 +158,14 @@ class HomeViewModel
                     trashEntryDao.observeCount(),
                     fileCacheDao.observeEncryptedVaultCount(),
                     cloudSyncManager.syncing,
-                ) { trash, vaultCount, syncing -> Triple(trash, vaultCount, syncing) },
-            ) { (folders, prefs), mid, (trashCount, vaultCount, syncing) ->
+                    bulkDeleteManager.activeJobs,
+                ) { trash, vaultCount, syncing, bulkDeletes -> listOf(trash, vaultCount, syncing, bulkDeletes) },
+            ) { (folders, prefs), mid, right ->
+                val trashCount = right[0] as Int
+                val vaultCount = right[1] as Int
+                val syncing = right[2] as Boolean
+                @Suppress("UNCHECKED_CAST")
+                val bulkDeletes = right[3] as List<BulkDeleteProgress>
                 val loading = mid[0] as Boolean
                 val error = mid[1] as String?
                 val savedId = mid[2] as Long
@@ -204,6 +214,7 @@ class HomeViewModel
                     hasAccessPassword = accessLockManager.hasPassword(),
                     accessLockBiometricEnabled = prefs.accessLockBiometricEnabled,
                     biometricAvailable = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE,
+                    activeBulkDeletes = bulkDeletes,
                 )
             }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUiState())
 
@@ -214,6 +225,22 @@ class HomeViewModel
             viewModelScope.launch(dispatchers.io) {
                 uploadManager.completedChatEvents.collect {
                     refreshDashboard()
+                }
+            }
+            viewModelScope.launch(dispatchers.io) {
+                bulkDeleteManager.completions.collect { comp ->
+                    refreshDashboard()
+                    if (comp.error != null && comp.deletedCount < comp.totalCount) {
+                        _error.value =
+                            "Deleted ${comp.deletedCount}/${comp.totalCount} file(s) from ${comp.label}: ${comp.error}"
+                    } else if (comp.deletedCount > 0) {
+                        val msg = if (comp.permanent) {
+                            "Deleted ${comp.label} (${comp.deletedCount} file(s))"
+                        } else {
+                            "Moved ${comp.deletedCount} file(s) from ${comp.label} to Trash"
+                        }
+                        _snackbar.value = msg
+                    }
                 }
             }
         }
