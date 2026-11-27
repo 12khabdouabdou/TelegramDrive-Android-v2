@@ -35,6 +35,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -317,9 +318,11 @@ class CloudSyncManager @Inject constructor(
         val remoteId = getCloudEncryptedThumbRemoteId(chatId, messageId)?.takeIf { it.isNotBlank() }
             ?: return@withContext null
         try {
-            val terminal = telegramClient.downloadFile(remoteId, "")
-                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-                .first()
+            val terminal = withTimeoutOrNull(15_000L) {
+                telegramClient.downloadFile(remoteId, "")
+                    .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                    .first()
+            } ?: return@withContext null
             if (terminal !is DownloadUpdate.Done) return@withContext null
             val f = File(terminal.localPath)
             if (f.isFile && f.length() > 0L) f.readBytes() else null

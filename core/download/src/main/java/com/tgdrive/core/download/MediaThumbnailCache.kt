@@ -41,6 +41,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -93,6 +94,10 @@ class MediaThumbnailCache @Inject constructor(
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
+    private val dbThumbBatchLock = Any()
+    private val pendingDbThumbUpdates = LinkedHashMap<Pair<Long, Long>, String>()
+    private val dbThumbFlushSignal = Channel<Unit>(Channel.CONFLATED)
+
     init {
         scope.launch {
             runCatching {
@@ -112,11 +117,48 @@ class MediaThumbnailCache @Inject constructor(
                 delay(150L)
             }
         }
+        scope.launch {
+            for (sig in dbThumbFlushSignal) {
+                delay(200L)
+                val batch = synchronized(dbThumbBatchLock) {
+                    if (pendingDbThumbUpdates.isEmpty()) {
+                        emptyList()
+                    } else {
+                        pendingDbThumbUpdates.entries.map { (k, path) ->
+                            FileCacheDao.ThumbnailPathUpdate(
+                                chatId = k.first,
+                                messageId = k.second,
+                                thumbnailPath = path,
+                            )
+                        }.also { pendingDbThumbUpdates.clear() }
+                    }
+                }
+                if (batch.isNotEmpty()) {
+                    runCatching { fileCacheDao.updateThumbnailPaths(batch) }
+                }
+            }
+        }
     }
 
-    private val semaphore = Semaphore(2)
+    private val fastThumbSemaphore = Semaphore(6)
+    private val heavyFallbackSemaphore = Semaphore(2)
     private val inFlight = ConcurrentHashMap<Pair<Long, Long>, Deferred<String?>>()
     private val failedAtMs = ConcurrentHashMap<Pair<Long, Long>, Long>()
+    private val encInFlight = ConcurrentHashMap<Pair<Long, Long>, Deferred<String?>>()
+    private val encFailedAtMs = ConcurrentHashMap<Pair<Long, Long>, Long>()
+
+    fun clearThumbnailFailure(chatId: Long, messageId: Long) {
+        val key = chatId to messageId
+        failedAtMs.remove(key)
+        encFailedAtMs.remove(key)
+    }
+
+    private fun enqueueDbThumbUpdate(chatId: Long, messageId: Long, path: String) {
+        synchronized(dbThumbBatchLock) {
+            pendingDbThumbUpdates[chatId to messageId] = path
+        }
+        dbThumbFlushSignal.trySend(Unit)
+    }
 
     fun clearDecryptedMemoryCache() {
         decryptedThumbCache.evictAll()
@@ -323,10 +365,44 @@ class MediaThumbnailCache @Inject constructor(
         messageId: Long,
     ): String? = withContext(dispatchers.io) {
         getEncryptedThumbnailPath(chatId, messageId)?.let { return@withContext it }
-        val bytes = cloudSyncManager.restoreEncryptedThumbBytes(chatId, messageId) ?: return@withContext null
-        val path = saveEncryptedThumbnailBytes(chatId, messageId, bytes) ?: return@withContext null
-        runCatching { fileCacheDao.updateThumbnailPath(chatId, messageId, path) }
-        path
+        val key = chatId to messageId
+        val prevFail = encFailedAtMs[key]
+        if (prevFail != null && System.currentTimeMillis() - prevFail < FAIL_COOLDOWN_MS) {
+            return@withContext null
+        }
+        encInFlight[key]?.let { existing ->
+            return@withContext existing.await()
+        }
+        val deferred = CompletableDeferred<String?>()
+        val race = encInFlight.putIfAbsent(key, deferred)
+        if (race != null) {
+            return@withContext race.await()
+        }
+        try {
+            val path = fastThumbSemaphore.withPermit {
+                val bytes = withTimeoutOrNull(15_000L) {
+                    cloudSyncManager.restoreEncryptedThumbBytes(chatId, messageId)
+                } ?: return@withPermit null
+                saveEncryptedThumbnailBytes(chatId, messageId, bytes)
+            }
+            if (path != null) {
+                encFailedAtMs.remove(key)
+                enqueueDbThumbUpdate(chatId, messageId, path)
+            } else {
+                encFailedAtMs[key] = System.currentTimeMillis()
+            }
+            deferred.complete(path)
+            path
+        } catch (e: CancellationException) {
+            deferred.cancel(e)
+            throw e
+        } catch (_: Throwable) {
+            encFailedAtMs[key] = System.currentTimeMillis()
+            deferred.complete(null)
+            null
+        } finally {
+            encInFlight.remove(key, deferred)
+        }
     }
 
     private fun decodeZipPreviewCollage(zipPath: String, password: String?): Bitmap? {
@@ -401,7 +477,7 @@ class MediaThumbnailCache @Inject constructor(
 
         getCachedThumbnailPath(entity.chatId, entity.messageId)?.let { cached ->
             if (entity.thumbnailPath != cached) {
-                runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, cached) }
+                enqueueDbThumbUpdate(entity.chatId, entity.messageId, cached)
             }
             return cached
         }
@@ -477,11 +553,15 @@ class MediaThumbnailCache @Inject constructor(
             entity.chatId != 0L &&
             entity.messageId != 0L
         ) {
-            val serverThumb = runCatching {
-                telegramClient.requestMessageThumbnail(entity.chatId, entity.messageId)
-            }.getOrNull()
+            val serverThumb = fastThumbSemaphore.withPermit {
+                withTimeoutOrNull(10_000L) {
+                    runCatching {
+                        telegramClient.requestMessageThumbnail(entity.chatId, entity.messageId)
+                    }.getOrNull()
+                }
+            }
             if (serverThumb != null && isValidThumbnailPath(serverThumb)) {
-                runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, serverThumb) }
+                enqueueDbThumbUpdate(entity.chatId, entity.messageId, serverThumb)
                 if (!serverThumb.contains("/minithumbs/")) {
                     return@withContext serverThumb
                 }
@@ -491,32 +571,36 @@ class MediaThumbnailCache @Inject constructor(
         return@withContext when (bucket) {
             FileBucket.IMAGES -> {
                 if (entity.fileSize > MAX_REMOTE_IMAGE_BYTES) return@withContext null
-                semaphore.withPermit {
+                heavyFallbackSemaphore.withPermit {
                     var activeRemoteId = entity.remoteId
-                    var terminal = telegramClient.downloadFile(activeRemoteId, "")
-                        .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-                        .first()
+                    var terminal = withTimeoutOrNull(20_000L) {
+                        telegramClient.downloadFile(activeRemoteId, "")
+                            .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                            .first()
+                    }
                     if (terminal !is DownloadUpdate.Done && entity.chatId != 0L && entity.messageId != 0L) {
                         val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
                         if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
                             activeRemoteId = refreshed
-                            terminal = telegramClient.downloadFile(activeRemoteId, "")
-                                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-                                .first()
+                            terminal = withTimeoutOrNull(20_000L) {
+                                telegramClient.downloadFile(activeRemoteId, "")
+                                    .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                                    .first()
+                            }
                         }
                     }
-                    if (terminal !is DownloadUpdate.Done) return@withPermit null
+                    val done = terminal as? DownloadUpdate.Done ?: return@withPermit null
                     generateFromLocalFile(
                         entity.chatId,
                         entity.messageId,
-                        terminal.localPath,
+                        done.localPath,
                         entity.mimeType,
                         entity.fileName,
                     )
                 }
             }
             FileBucket.VIDEOS -> {
-                semaphore.withPermit {
+                heavyFallbackSemaphore.withPermit {
                     var activeRemoteId = entity.remoteId
                     var streamInfo = telegramClient.openStreamFile(activeRemoteId)
                     if (streamInfo == null && entity.chatId != 0L && entity.messageId != 0L) {
@@ -528,40 +612,46 @@ class MediaThumbnailCache @Inject constructor(
                     }
                     if (streamInfo != null && streamInfo.size > 0L) {
                         val dsFrame = try {
-                            decodeVideoFrameFromDataSource(
-                                TdLibRangeMediaDataSource(
-                                    telegramClient = telegramClient,
-                                    fileId = streamInfo.fileId,
-                                    fileSize = streamInfo.size,
-                                    ioDispatcher = dispatchers.io,
-                                ),
-                            )
+                            withTimeoutOrNull(12_000L) {
+                                decodeVideoFrameFromDataSource(
+                                    TdLibRangeMediaDataSource(
+                                        telegramClient = telegramClient,
+                                        fileId = streamInfo.fileId,
+                                        fileSize = streamInfo.size,
+                                        ioDispatcher = dispatchers.io,
+                                    ),
+                                )
+                            }
                         } finally {
                             runCatching { telegramClient.cancelFileStream(streamInfo.fileId) }
                         }
                         if (dsFrame != null) {
                             val saved = writeThumbnailJpeg(entity.chatId, entity.messageId, dsFrame)
                             if (saved != null) {
-                                runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, saved) }
+                                enqueueDbThumbUpdate(entity.chatId, entity.messageId, saved)
                                 return@withPermit saved
                             }
                         }
                     }
 
-                    var bytes = telegramClient.downloadFileRangeBytes(
-                        remoteId = activeRemoteId,
-                        offset = 0L,
-                        length = VIDEO_PEEK_BYTES,
-                    )
+                    var bytes = withTimeoutOrNull(15_000L) {
+                        telegramClient.downloadFileRangeBytes(
+                            remoteId = activeRemoteId,
+                            offset = 0L,
+                            length = VIDEO_PEEK_BYTES,
+                        )
+                    }
                     if ((bytes == null || bytes.isEmpty()) && entity.chatId != 0L && entity.messageId != 0L) {
                         val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
                         if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
                             activeRemoteId = refreshed
-                            bytes = telegramClient.downloadFileRangeBytes(
-                                remoteId = activeRemoteId,
-                                offset = 0L,
-                                length = VIDEO_PEEK_BYTES,
-                            )
+                            bytes = withTimeoutOrNull(15_000L) {
+                                telegramClient.downloadFileRangeBytes(
+                                    remoteId = activeRemoteId,
+                                    offset = 0L,
+                                    length = VIDEO_PEEK_BYTES,
+                                )
+                            }
                         }
                     }
                     if (bytes == null || bytes.isEmpty()) return@withPermit null
@@ -576,7 +666,7 @@ class MediaThumbnailCache @Inject constructor(
                         val frame = decodeVideoFrame(tmpVideo.absolutePath) ?: return@withPermit null
                         val saved = writeThumbnailJpeg(entity.chatId, entity.messageId, frame)
                         if (saved != null) {
-                            runCatching { fileCacheDao.updateThumbnailPath(entity.chatId, entity.messageId, saved) }
+                            enqueueDbThumbUpdate(entity.chatId, entity.messageId, saved)
                         }
                         saved
                     } finally {
@@ -586,25 +676,29 @@ class MediaThumbnailCache @Inject constructor(
             }
             FileBucket.PDF -> {
                 if (entity.fileSize > MAX_REMOTE_PDF_BYTES) return@withContext null
-                semaphore.withPermit {
+                heavyFallbackSemaphore.withPermit {
                     var activeRemoteId = entity.remoteId
-                    var terminal = telegramClient.downloadFile(activeRemoteId, "")
-                        .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-                        .first()
+                    var terminal = withTimeoutOrNull(20_000L) {
+                        telegramClient.downloadFile(activeRemoteId, "")
+                            .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                            .first()
+                    }
                     if (terminal !is DownloadUpdate.Done && entity.chatId != 0L && entity.messageId != 0L) {
                         val refreshed = telegramClient.refreshMessageRemoteId(entity.chatId, entity.messageId)
                         if (!refreshed.isNullOrBlank() && refreshed != activeRemoteId) {
                             activeRemoteId = refreshed
-                            terminal = telegramClient.downloadFile(activeRemoteId, "")
-                                .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
-                                .first()
+                            terminal = withTimeoutOrNull(20_000L) {
+                                telegramClient.downloadFile(activeRemoteId, "")
+                                    .filter { it is DownloadUpdate.Done || it is DownloadUpdate.Failed }
+                                    .first()
+                            }
                         }
                     }
-                    if (terminal !is DownloadUpdate.Done) return@withPermit null
+                    val done = terminal as? DownloadUpdate.Done ?: return@withPermit null
                     generateFromLocalFile(
                         entity.chatId,
                         entity.messageId,
-                        terminal.localPath,
+                        done.localPath,
                         entity.mimeType,
                         entity.fileName,
                     )
@@ -782,7 +876,9 @@ class MediaThumbnailCache @Inject constructor(
             val wantLen = minOf(BLOCK_SIZE.toLong(), fileSize - blockOffset)
             val state = runCatching {
                 runBlocking(ioDispatcher) {
-                    telegramClient.ensureFileRangeDownloaded(fileId, blockOffset, wantLen)
+                    withTimeoutOrNull(4_000L) {
+                        telegramClient.ensureFileRangeDownloaded(fileId, blockOffset, wantLen)
+                    }
                 }
             }.getOrNull() ?: return null
             if (state.localPath.isEmpty()) return null
@@ -823,10 +919,10 @@ class MediaThumbnailCache @Inject constructor(
     companion object {
         const val ENCRYPTED_THUMB_EXT = ".tgethumb"
         private const val TARGET_MAX_PX = 360
-        private const val MAX_REMOTE_IMAGE_BYTES = 25L * 1024 * 1024
+        private const val MAX_REMOTE_IMAGE_BYTES = 20L * 1024 * 1024
         private const val MAX_REMOTE_PDF_BYTES = 25L * 1024 * 1024
         private const val VIDEO_PEEK_BYTES = 2L * 1024 * 1024
-        private const val FAIL_COOLDOWN_MS = 5L * 60 * 1000L
+        private const val FAIL_COOLDOWN_MS = 45_000L
         private const val DEFAULT_DISK_LIMIT_BYTES = 50L * 1024 * 1024
         private const val MIN_DISK_LIMIT_BYTES = 10L * 1024 * 1024
         private const val EVICT_WRITE_STRIDE = 20

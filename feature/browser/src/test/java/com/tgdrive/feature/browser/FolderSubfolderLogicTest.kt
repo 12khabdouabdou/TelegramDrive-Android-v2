@@ -148,7 +148,9 @@ class FolderSubfolderLogicTest {
                 }
         }
         coEvery { trashEntryDao.upsertAll(any()) } just Runs
+        coEvery { fileCacheDao.updateThumbnailPaths(any()) } just Runs
         every { mediaThumbnailCache.needsThumbnailUpgrade(any()) } returns false
+        every { mediaThumbnailCache.getEncryptedThumbnailPath(any(), any()) } returns null
     }
 
     @AfterEach
@@ -346,7 +348,7 @@ class FolderSubfolderLogicTest {
             every { backupCrypto.hasVaultPassphrase() } returns true
             every { backupCrypto.passphraseFingerprint() } returns "fp-abc"
 
-            val thumbFile = File(tempDir.toFile(), "31.tgthumb").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val thumbFile = File(tempDir.toFile(), "41.tgethumb").apply { writeBytes(byteArrayOf(1, 2, 3)) }
             dbItemsFlow.value =
                 listOf(
                     sampleItem(
@@ -373,6 +375,64 @@ class FolderSubfolderLogicTest {
 
             assertThat(vm.state.value.encryptedPreviewFingerprint).isNull()
             assertThat(vm.state.value.childVirtualFolderThumbs["Private"].orEmpty()).isEmpty()
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `opening subfolder warms all its items immediately after large root warm`() =
+        runTest {
+            every { mediaThumbnailCache.needsThumbnailUpgrade(null) } returns true
+            val rootItems =
+                (1L..200L).map { id ->
+                    sampleItem(id = id, name = "root_$id.jpg", virtualPath = "")
+                }
+            val deepItems =
+                (1001L..1005L).map { id ->
+                    sampleItem(id = id, name = "deep_$id.jpg", virtualPath = "DeepSub")
+                }
+            dbItemsFlow.value = rootItems + deepItems
+
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            vm.openVirtualFolder("DeepSub")
+            advanceUntilIdle()
+
+            for (id in 1001L..1005L) {
+                coVerify(atLeast = 1) {
+                    mediaThumbnailCache.ensureThumbnail(match { it.messageId == id }, any())
+                }
+            }
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `large 1500 item folder caps subfolder cover thumbs at 4 per subfolder`() =
+        runTest {
+            val largeList =
+                (0 until 1500).map { idx ->
+                    val folderIdx = idx / 30
+                    val msgId = idx.toLong() + 1L
+                    sampleItem(
+                        id = msgId,
+                        name = "img_$msgId.jpg",
+                        virtualPath = "Sub${folderIdx.toString().padStart(2, '0')}",
+                        thumbPath = "/cache/t_$msgId.webp",
+                    )
+                }
+            dbItemsFlow.value = largeList
+
+            val vm = newVm()
+            val collectJob = backgroundScope.launch { vm.state.collect {} }
+            vm.bind(chatId)
+            advanceUntilIdle()
+
+            assertThat(vm.state.value.childVirtualFolders).hasSize(50)
+            assertThat(vm.state.value.childVirtualFolders.first().second).isEqualTo(30)
+            assertThat(vm.state.value.childVirtualFolderThumbs["Sub00"].orEmpty()).hasSize(4)
+            assertThat(vm.state.value.childVirtualFolderThumbs["Sub49"].orEmpty()).hasSize(4)
             collectJob.cancel()
         }
 }

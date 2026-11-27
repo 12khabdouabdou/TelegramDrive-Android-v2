@@ -1928,8 +1928,26 @@ private fun FileGridCell(
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
-    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath, encryptedPreviewFingerprint, thumbRefreshNonce) {
-        onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
+    val needsInitialThumb = remember(item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+        val p = item.thumbnailPath
+        if (isEnc) {
+            encryptedPreviewFingerprint != null &&
+                (p.isNullOrBlank() || !p.endsWith(".tgethumb", ignoreCase = true))
+        } else {
+            p.isNullOrBlank() || p.contains("/minithumbs/")
+        }
+    }
+    LaunchedEffect(
+        item.chatId,
+        item.messageId,
+        item.thumbnailPath,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+        needsInitialThumb,
+    ) {
+        if (needsInitialThumb || (thumbRefreshNonce > 0 && (!isEnc || encryptedPreviewFingerprint != null))) {
+            onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
+        }
     }
     var loadFailed by remember(
         item.chatId,
@@ -2224,8 +2242,26 @@ private fun FileListRow(
             BackupCrypto.isEncryptedFileName(item.fileName) ||
             item.thumbnailPath?.endsWith(".tgethumb", ignoreCase = true) == true
     }
-    LaunchedEffect(item.chatId, item.messageId, item.thumbnailPath, encryptedPreviewFingerprint, thumbRefreshNonce) {
-        onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
+    val needsInitialThumb = remember(item.thumbnailPath, isEnc, encryptedPreviewFingerprint) {
+        val p = item.thumbnailPath
+        if (isEnc) {
+            encryptedPreviewFingerprint != null &&
+                (p.isNullOrBlank() || !p.endsWith(".tgethumb", ignoreCase = true))
+        } else {
+            p.isNullOrBlank() || p.contains("/minithumbs/")
+        }
+    }
+    LaunchedEffect(
+        item.chatId,
+        item.messageId,
+        item.thumbnailPath,
+        encryptedPreviewFingerprint,
+        thumbRefreshNonce,
+        needsInitialThumb,
+    ) {
+        if (needsInitialThumb || (thumbRefreshNonce > 0 && (!isEnc || encryptedPreviewFingerprint != null))) {
+            onRequestThumbnail(thumbRefreshNonce > 0 && isEnc)
+        }
     }
     var loadFailed by remember(
         item.chatId,

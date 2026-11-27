@@ -49,7 +49,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,21 +56,23 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Collections
 import javax.inject.Inject
 
 private const val MAX_FOLDER_DECRYPTED_THUMBS = 60
+private const val MAX_PENDING_THUMBS = 160
 
 private val THUMBNAILABLE_EXTS =
     setOf(
@@ -189,12 +190,18 @@ class FolderViewModel
         private val mediaThumbnailCache: MediaThumbnailCache,
         @ApplicationContext private val appContext: Context,
     ) : ViewModel() {
-        private val attemptedThumbKeys = Collections.synchronizedSet(HashSet<Pair<Long, Long>>())
-        private val thumbRequests = Channel<Pair<FileCacheEntity, Boolean>>(
-            capacity = 64,
-            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        private data class PendingThumbRequest(
+            val entity: FileCacheEntity,
+            val force: Boolean,
         )
-        private val thumbSemaphore = Semaphore(2)
+
+        private val thumbQueueLock = Any()
+        private val thumbDeque = ArrayDeque<PendingThumbRequest>()
+        private val queuedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val inFlightThumbKeys = HashSet<Pair<Long, Long>>()
+        private val completedThumbKeys = HashSet<Pair<Long, Long>>()
+        private val thumbWakeSignal = Channel<Unit>(Channel.CONFLATED)
+        private val scannedLocalThumbIds = Collections.synchronizedSet(HashSet<Long>())
         private val _selected = MutableStateFlow<Set<Long>>(emptySet())
         private val _loading = MutableStateFlow(false)
         private val _refreshing = MutableStateFlow(false)
@@ -216,6 +223,8 @@ class FolderViewModel
         private val _folderLockReady = MutableStateFlow(false)
         private val _lockError = MutableStateFlow<String?>(null)
         private val _lockConfigVersion = MutableStateFlow(0)
+        private val _biometricAvailable = MutableStateFlow(false)
+        private val _hasAccessPassword = MutableStateFlow(false)
         private val _thumbRefreshNonce = MutableStateFlow(0)
         private val _passphraseVersion = MutableStateFlow(0)
 
@@ -245,6 +254,8 @@ class FolderViewModel
         private var bindJob: Job? = null
         private var pdfWatchJob: Job? = null
         private var refreshJob: Job? = null
+        private var warmThumbsJob: Job? = null
+        private var localThumbScanJob: Job? = null
         private var searchJob: Job? = null
         private var audioPlayWaitJob: Job? = null
         private var zipInspectJob: Job? = null
@@ -260,6 +271,8 @@ class FolderViewModel
         init {
             viewModelScope.launch(dispatchers.io) {
                 loadCustomVirtualFoldersFromDisk()
+                _biometricAvailable.value = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
+                _hasAccessPassword.value = runCatching { accessLockManager.hasPassword() }.getOrDefault(false)
             }
             viewModelScope.launch(dispatchers.io) {
                 uploadManager.completedChatEvents.collect { doneChatId ->
@@ -268,27 +281,136 @@ class FolderViewModel
                     }
                 }
             }
-            viewModelScope.launch(dispatchers.io) {
-                for ((entity, force) in thumbRequests) {
-                    launch {
-                        thumbSemaphore.withPermit {
-                            try {
-                                val isEncrypted = isEncryptedEntity(entity)
-                                if (isEncrypted) {
-                                    if (backupCrypto.hasVaultPassphrase()) {
-                                        mediaThumbnailCache.restoreEncryptedThumbFromCloud(
-                                            entity.chatId,
-                                            entity.messageId,
-                                        )
-                                    }
-                                } else {
-                                    mediaThumbnailCache.ensureThumbnail(entity, force = force)
-                                }
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (_: Throwable) {
+            repeat(6) {
+                viewModelScope.launch(dispatchers.io) {
+                    while (isActive) {
+                        var hasMore = false
+                        val next = synchronized(thumbQueueLock) {
+                            thumbDeque.removeFirstOrNull()?.also { req ->
+                                val k = req.entity.chatId to req.entity.messageId
+                                queuedThumbKeys.remove(k)
+                                inFlightThumbKeys.add(k)
+                                hasMore = thumbDeque.isNotEmpty()
                             }
                         }
+                        if (next == null) {
+                            thumbWakeSignal.receive()
+                            continue
+                        }
+                        if (hasMore) {
+                            thumbWakeSignal.trySend(Unit)
+                        }
+                        val key = next.entity.chatId to next.entity.messageId
+                        try {
+                            if (isEncryptedEntity(next.entity)) {
+                                if (backupCrypto.hasVaultPassphrase()) {
+                                    if (next.force) {
+                                        mediaThumbnailCache.clearThumbnailFailure(
+                                            next.entity.chatId,
+                                            next.entity.messageId,
+                                        )
+                                    }
+                                    mediaThumbnailCache.restoreEncryptedThumbFromCloud(
+                                        next.entity.chatId,
+                                        next.entity.messageId,
+                                    )
+                                }
+                            } else {
+                                mediaThumbnailCache.ensureThumbnail(next.entity, force = next.force)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Throwable) {
+                        } finally {
+                            synchronized(thumbQueueLock) {
+                                inFlightThumbKeys.remove(key)
+                                if (isActive) {
+                                    completedThumbKeys.add(key)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun enqueueThumbRequest(
+            entity: FileCacheEntity,
+            force: Boolean,
+            highPriority: Boolean,
+        ) {
+            val key = entity.chatId to entity.messageId
+            val shouldWake = synchronized(thumbQueueLock) {
+                if (force) {
+                    completedThumbKeys.remove(key)
+                }
+                if (key in inFlightThumbKeys || (!force && key in completedThumbKeys)) {
+                    return@synchronized false
+                }
+                if (key in queuedThumbKeys) {
+                    if (highPriority || force) {
+                        val existing = thumbDeque.firstOrNull {
+                            it.entity.chatId == entity.chatId && it.entity.messageId == entity.messageId
+                        }
+                        if (existing != null) {
+                            thumbDeque.remove(existing)
+                        }
+                        val mergedForce = force || existing?.force == true
+                        thumbDeque.addFirst(PendingThumbRequest(entity, mergedForce))
+                    }
+                    return@synchronized true
+                }
+                if (highPriority) {
+                    thumbDeque.addFirst(PendingThumbRequest(entity, force))
+                    queuedThumbKeys.add(key)
+                    while (thumbDeque.size > MAX_PENDING_THUMBS) {
+                        val dropped = thumbDeque.removeLast()
+                        queuedThumbKeys.remove(dropped.entity.chatId to dropped.entity.messageId)
+                    }
+                    true
+                } else {
+                    if (thumbDeque.size >= MAX_PENDING_THUMBS) {
+                        return@synchronized false
+                    }
+                    thumbDeque.addLast(PendingThumbRequest(entity, force))
+                    queuedThumbKeys.add(key)
+                    true
+                }
+            }
+            if (shouldWake) {
+                thumbWakeSignal.trySend(Unit)
+            }
+        }
+
+        private fun clearPendingThumbQueue(clearCompleted: Boolean) {
+            synchronized(thumbQueueLock) {
+                thumbDeque.clear()
+                queuedThumbKeys.clear()
+                if (clearCompleted) {
+                    completedThumbKeys.clear()
+                }
+            }
+        }
+
+        private fun clearCompletedForSubfolder(
+            entities: List<FileCacheEntity>,
+            activeSubfolder: String,
+        ) {
+            val normSub = normalizeVirtualPath(activeSubfolder)
+            synchronized(thumbQueueLock) {
+                thumbDeque.clear()
+                queuedThumbKeys.clear()
+                for (entity in entities) {
+                    val itemPath = normalizeVirtualPath(entity.virtualPath)
+                    if (normSub.isNotEmpty() && !matchesSubfolderPrefix(itemPath, normSub)) continue
+                    val p = entity.thumbnailPath
+                    val needsThumb = if (isEncryptedEntity(entity)) {
+                        p.isNullOrBlank() || !p.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true)
+                    } else {
+                        p.isNullOrBlank() || p.contains("/minithumbs/")
+                    }
+                    if (needsThumb) {
+                        completedThumbKeys.remove(entity.chatId to entity.messageId)
                     }
                 }
             }
@@ -298,18 +420,19 @@ class FolderViewModel
             val isEncrypted = isEncryptedEntity(entity)
             if (isEncrypted) {
                 if (!backupCrypto.hasVaultPassphrase()) return
-                val hasLocal = entity.thumbnailPath?.let { path ->
-                    path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
+                if (!force) {
+                    val path = entity.thumbnailPath
+                    if (!path.isNullOrBlank() &&
+                        path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
                         mediaThumbnailCache.isValidThumbnailPath(path)
-                } == true
-                if (!force && hasLocal) return
+                    ) {
+                        return
+                    }
+                }
             } else {
                 if (!force && !mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)) return
             }
-            val key = entity.chatId to entity.messageId
-            if (force || attemptedThumbKeys.add(key)) {
-                thumbRequests.trySend(entity to force)
-            }
+            enqueueThumbRequest(entity, force = force, highPriority = true)
         }
 
         private data class FolderAuxTail(
@@ -411,8 +534,8 @@ class FolderViewModel
                 val customForChat = boundId?.let { auxTail.createdVirtualFolders[it] }.orEmpty()
 
                 val isLockedPref = boundId != null && prefs.isFolderLocked(boundId)
-                val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
-                val hasAccessPass = accessLockManager.hasPassword()
+                val bioAvail = _biometricAvailable.value
+                val hasAccessPass = _hasAccessPassword.value
                 val canUseBio = isLockedPref && bioAvail && prefs.accessLockBiometricEnabled
                 val lockRequired = isLockedPref && (hasAccessPass || canUseBio)
                 val isUnlockedNow = !lockRequired || auxTail.isFolderUnlocked
@@ -437,59 +560,58 @@ class FolderViewModel
                     val itemPath = normalizeVirtualPath(item.virtualPath)
                     if (itemPath.isNotEmpty()) allVPaths.add(itemPath)
 
-                    val isEnc = isEncryptedEntity(item)
-                    val candidateThumb: SubfolderThumbItem? = if (isEnc) {
-                        if (encFp != null) {
-                            val validLocal = item.thumbnailPath?.takeIf { path ->
-                                path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
-                                    File(path).let { f -> f.isFile && f.length() > 0L }
-                            } ?: mediaThumbnailCache.getEncryptedThumbnailPath(item.chatId, item.messageId)
-                            val hasCloud = validLocal != null ||
-                                cloudSyncManager.getCloudEncryptedThumbRemoteId(item.chatId, item.messageId) != null
-                            if (hasCloud) {
-                                SubfolderThumbItem(
-                                    chatId = item.chatId,
-                                    messageId = item.messageId,
-                                    localPath = validLocal,
-                                    isEncrypted = true,
-                                )
-                            } else {
-                                null
-                            }
-                        } else {
-                            null
-                        }
-                    } else {
-                        item.thumbnailPath?.takeIf { path ->
-                            !path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
-                                File(path).let { f -> f.isFile && f.length() > 0L }
-                        }?.let { path ->
-                            SubfolderThumbItem(
-                                chatId = item.chatId,
-                                messageId = item.messageId,
-                                localPath = path,
-                                isEncrypted = false,
-                            )
-                        }
+                    val childKey = when {
+                        rawVirtualPath.isEmpty() && itemPath.isNotEmpty() -> itemPath.substringBefore('/')
+                        rawVirtualPath.isNotEmpty() && itemPath.startsWith("$rawVirtualPath/") ->
+                            itemPath.removePrefix("$rawVirtualPath/").substringBefore('/')
+                        else -> ""
                     }
-
-                    if (rawVirtualPath.isEmpty()) {
-                        if (itemPath.isNotEmpty()) {
-                            val top = itemPath.substringBefore('/')
-                            childCounts[top] = (childCounts[top] ?: 0) + 1
-                            if (candidateThumb != null) {
-                                val list = childThumbs.getOrPut(top) { ArrayList(4) }
-                                if (list.size < 4) list.add(candidateThumb)
+                    if (childKey.isNotEmpty()) {
+                        childCounts[childKey] = (childCounts[childKey] ?: 0) + 1
+                        val existingThumbs = childThumbs[childKey]
+                        if ((existingThumbs?.size ?: 0) < 4) {
+                            val isEnc = isEncryptedEntity(item)
+                            val candidateThumb: SubfolderThumbItem? = if (isEnc) {
+                                if (encFp != null) {
+                                    val validLocal = item.thumbnailPath?.takeIf { path ->
+                                        path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true)
+                                    } ?: mediaThumbnailCache.getEncryptedThumbnailPath(item.chatId, item.messageId)
+                                    val hasCloud = validLocal != null ||
+                                        cloudSyncManager.getCloudEncryptedThumbRemoteId(
+                                            item.chatId,
+                                            item.messageId,
+                                        ) != null
+                                    if (hasCloud) {
+                                        SubfolderThumbItem(
+                                            chatId = item.chatId,
+                                            messageId = item.messageId,
+                                            localPath = validLocal,
+                                            isEncrypted = true,
+                                        )
+                                    } else {
+                                        null
+                                    }
+                                } else {
+                                    null
+                                }
+                            } else {
+                                item.thumbnailPath?.takeIf { path ->
+                                    path.isNotBlank() &&
+                                        !path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true)
+                                }?.let { path ->
+                                    SubfolderThumbItem(
+                                        chatId = item.chatId,
+                                        messageId = item.messageId,
+                                        localPath = path,
+                                        isEncrypted = false,
+                                    )
+                                }
                             }
-                        }
-                    } else if (itemPath.startsWith("$rawVirtualPath/")) {
-                        val rest = itemPath.removePrefix("$rawVirtualPath/")
-                        val directChild = rest.substringBefore('/')
-                        if (directChild.isNotEmpty()) {
-                            childCounts[directChild] = (childCounts[directChild] ?: 0) + 1
                             if (candidateThumb != null) {
-                                val list = childThumbs.getOrPut(directChild) { ArrayList(4) }
-                                if (list.size < 4) list.add(candidateThumb)
+                                val list = existingThumbs ?: ArrayList<SubfolderThumbItem>(4).also {
+                                    childThumbs[childKey] = it
+                                }
+                                list.add(candidateThumb)
                             }
                         }
                     }
@@ -650,6 +772,8 @@ class FolderViewModel
                 } else if (!newPassword.isNullOrBlank()) {
                     accessLockManager.setPassword(newPassword)
                 }
+                _hasAccessPassword.value = accessLockManager.hasPassword()
+                _biometricAvailable.value = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
                 preferences.update { prefs ->
                     val updated = prefs.copy(accessLockBiometricEnabled = biometricEnabled)
                     if (chatId != null && lockCurrentFolder) updated.withFolderLocked(chatId, true) else updated
@@ -702,7 +826,10 @@ class FolderViewModel
             bindJob?.cancel()
             pdfWatchJob?.cancel()
             refreshJob?.cancel()
-            attemptedThumbKeys.clear()
+            warmThumbsJob?.cancel()
+            localThumbScanJob?.cancel()
+            clearPendingThumbQueue(clearCompleted = true)
+            scannedLocalThumbIds.clear()
             _items.value = emptyList()
             _selected.value = emptySet()
             _lockError.value = null
@@ -715,6 +842,8 @@ class FolderViewModel
                 val prefs = runCatching { preferences.data.first() }.getOrNull()
                 val bioAvail = biometricHelper.availability() == BiometricHelper.Availability.AVAILABLE
                 val hasPass = accessLockManager.hasPassword()
+                _biometricAvailable.value = bioAvail
+                _hasAccessPassword.value = hasPass
                 val lockedByPref = prefs?.isFolderLocked(chatId) == true
                 val lockRequired = lockedByPref && (hasPass || (bioAvail && prefs?.accessLockBiometricEnabled != false))
                 _isFolderUnlocked.value = !lockRequired
@@ -726,11 +855,23 @@ class FolderViewModel
             }
             bindJob =
                 viewModelScope.launch(dispatchers.io) {
-                    fileCacheDao.observeForChat(chatId, 10000, 0).collect { entities ->
-                        _items.value = entities
-                        warmThumbnailsForEntities(entities, activeSubfolder = normalizeVirtualPath(_virtualPath.value))
-                        launch { refreshLocalThumbnails(chatId, entities) }
-                    }
+                    fileCacheDao.observeForChat(chatId, 10000, 0)
+                        .conflate()
+                        .collect { entities ->
+                            _items.value = entities
+                            warmThumbsJob?.cancel()
+                            warmThumbsJob = launch {
+                                warmThumbnailsForEntities(
+                                    entities,
+                                    activeSubfolder = normalizeVirtualPath(_virtualPath.value),
+                                )
+                            }
+                            localThumbScanJob?.cancel()
+                            localThumbScanJob = launch {
+                                delay(250L)
+                                refreshLocalThumbnails(chatId, entities)
+                            }
+                        }
                 }
             pdfWatchJob =
                 viewModelScope.launch(dispatchers.io) {
@@ -741,7 +882,10 @@ class FolderViewModel
                                 .map { it.id to it.localPath }
                         }.distinctUntilChanged()
                         .collect {
-                            refreshLocalThumbnails(chatId, _items.value)
+                            localThumbScanJob?.cancel()
+                            localThumbScanJob = launch {
+                                refreshLocalThumbnails(chatId, _items.value)
+                            }
                         }
                 }
             viewModelScope.launch(dispatchers.io) {
@@ -753,14 +897,39 @@ class FolderViewModel
             chatId: Long,
             entities: List<FileCacheEntity>,
         ) {
-            val candidates =
-                entities.filter { mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) }
+            val activeSub = normalizeVirtualPath(_virtualPath.value)
+            val candidates = ArrayList<FileCacheEntity>(60)
+            if (activeSub.isNotEmpty()) {
+                for (entity in entities) {
+                    if (candidates.size >= 60) break
+                    if (entity.messageId in scannedLocalThumbIds) continue
+                    val p = entity.thumbnailPath
+                    if (!p.isNullOrBlank() && !p.contains("/minithumbs/")) continue
+                    if (matchesSubfolderPrefix(normalizeVirtualPath(entity.virtualPath), activeSub)) {
+                        candidates.add(entity)
+                    }
+                }
+            }
+            for (entity in entities) {
+                if (candidates.size >= 60) break
+                if (entity.messageId in scannedLocalThumbIds) continue
+                val p = entity.thumbnailPath
+                if (!p.isNullOrBlank() && !p.contains("/minithumbs/")) continue
+                if (activeSub.isNotEmpty() &&
+                    matchesSubfolderPrefix(normalizeVirtualPath(entity.virtualPath), activeSub)
+                ) {
+                    continue
+                }
+                candidates.add(entity)
+            }
             if (candidates.isEmpty()) return
+            val updates = ArrayList<FileCacheDao.ThumbnailPathUpdate>()
             for (entity in candidates) {
+                scannedLocalThumbIds.add(entity.messageId)
                 val cached = mediaThumbnailCache.getCachedThumbnailPath(chatId, entity.messageId)
                 if (cached != null) {
                     if (entity.thumbnailPath != cached) {
-                        runCatching { fileCacheDao.updateThumbnailPath(chatId, entity.messageId, cached) }
+                        updates.add(FileCacheDao.ThumbnailPathUpdate(chatId, entity.messageId, cached))
                     }
                     continue
                 }
@@ -772,6 +941,9 @@ class FolderViewModel
                     mimeType = entity.mimeType,
                     fileName = entity.fileName,
                 )
+            }
+            if (updates.isNotEmpty()) {
+                runCatching { fileCacheDao.updateThumbnailPaths(updates) }
             }
         }
 
@@ -791,38 +963,34 @@ class FolderViewModel
             activeSubfolder: String,
         ) {
             val hasPassphrase = backupCrypto.hasVaultPassphrase()
-            fun needsWarm(entity: FileCacheEntity): Boolean {
+            fun needsWarmFast(entity: FileCacheEntity): Boolean {
                 if (entity.isLocked) return false
+                val p = entity.thumbnailPath
                 if (isEncryptedEntity(entity)) {
                     if (!hasPassphrase) return false
-                    val path = entity.thumbnailPath
-                    val validLocal = path != null &&
-                        path.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true) &&
-                        mediaThumbnailCache.isValidThumbnailPath(path)
-                    return !validLocal
+                    return p.isNullOrBlank() ||
+                        !p.endsWith(MediaThumbnailCache.ENCRYPTED_THUMB_EXT, ignoreCase = true)
                 }
-                return mediaThumbnailCache.needsThumbnailUpgrade(entity.thumbnailPath)
+                return p.isNullOrBlank() || p.contains("/minithumbs/")
             }
 
             var queued = 0
             val normActive = normalizeVirtualPath(activeSubfolder)
             if (normActive.isNotEmpty()) {
                 for (entity in entities) {
-                    if (queued >= 30) break
+                    if (queued >= 24) break
                     val itemPath = normalizeVirtualPath(entity.virtualPath)
                     if (!matchesSubfolderPrefix(itemPath, normActive)) continue
-                    if (!needsWarm(entity)) continue
-                    if (attemptedThumbKeys.add(entity.chatId to entity.messageId)) {
-                        thumbRequests.trySend(entity to false)
-                        queued++
-                    }
+                    if (!needsWarmFast(entity)) continue
+                    enqueueThumbRequest(entity, force = false, highPriority = false)
+                    queued++
                 }
             }
 
             val perSubfolderCount = HashMap<String, Int>()
             var subfolderQueued = 0
             for (entity in entities) {
-                if (!needsWarm(entity)) continue
+                if (!needsWarmFast(entity)) continue
                 val normVpath = normalizeVirtualPath(entity.virtualPath)
                 val subKey = when {
                     normActive.isEmpty() && normVpath.isNotEmpty() -> normVpath.substringBefore('/')
@@ -830,31 +998,30 @@ class FolderViewModel
                         normVpath.removePrefix("$normActive/").substringBefore('/')
                     else -> ""
                 }
-                val shouldWarmTop = queued < 30
-                val shouldWarmSubfolderCover = !shouldWarmTop &&
-                    subKey.isNotEmpty() &&
-                    subfolderQueued < 24 &&
-                    (perSubfolderCount[subKey] ?: 0) < 4 &&
+                val isRootMatch = normActive.isEmpty() && normVpath.isEmpty()
+                val shouldWarmTop = queued < 24 && isRootMatch
+                val shouldWarmSubfolderCover = subKey.isNotEmpty() &&
+                    subfolderQueued < 16 &&
+                    (perSubfolderCount[subKey] ?: 0) < 2 &&
                     (isEncryptedEntity(entity) || hasThumbnailableKind(entity))
                 if (shouldWarmTop || shouldWarmSubfolderCover) {
-                    if (attemptedThumbKeys.add(entity.chatId to entity.messageId)) {
-                        thumbRequests.trySend(entity to false)
-                        if (shouldWarmTop) {
-                            queued++
-                        } else {
-                            subfolderQueued++
-                            perSubfolderCount[subKey] = (perSubfolderCount[subKey] ?: 0) + 1
-                        }
+                    enqueueThumbRequest(entity, force = false, highPriority = false)
+                    if (shouldWarmTop) {
+                        queued++
+                    } else {
+                        subfolderQueued++
+                        perSubfolderCount[subKey] = (perSubfolderCount[subKey] ?: 0) + 1
                     }
                 }
-                if (queued >= 30 && subfolderQueued >= 24) break
+                if (queued >= 24 && subfolderQueued >= 16) break
             }
         }
 
         fun refresh() {
             val chatId = currentChatId ?: return
             refreshJob?.cancel()
-            attemptedThumbKeys.clear()
+            clearPendingThumbQueue(clearCompleted = true)
+            scannedLocalThumbIds.clear()
             _thumbRefreshNonce.value += 1
             oldestMessageId = 0L
             hasMoreMessages = true
@@ -863,7 +1030,11 @@ class FolderViewModel
                     _refreshing.value = true
                     _error.value = null
                     try {
-                        val cloudSyncDeferred = async { runCatching { cloudSyncManager.syncFromCloud() } }
+                        val cloudSyncDeferred = async {
+                            runCatching {
+                                withTimeoutOrNull(4_000L) { cloudSyncManager.syncFromCloud() }
+                            }
+                        }
                         val firstBatch = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
                         cloudSyncDeferred.await()
 
@@ -911,12 +1082,24 @@ class FolderViewModel
                                 delay(delayMs)
                                 try {
                                     val current = _items.value
-                                    if (current.isNotEmpty() &&
-                                        current.all {
-                                            !mediaThumbnailCache.needsThumbnailUpgrade(it.thumbnailPath) ||
-                                                !hasThumbnailableKind(it)
-                                        }
-                                    ) {
+                                    val checkSlice = if (activeSubfolder.isEmpty()) {
+                                        current.asSequence().take(60)
+                                    } else {
+                                        current.asSequence()
+                                            .filter {
+                                                matchesSubfolderPrefix(
+                                                    normalizeVirtualPath(it.virtualPath),
+                                                    activeSubfolder,
+                                                )
+                                            }
+                                            .take(60)
+                                    }
+                                    val allDone = checkSlice.any() && checkSlice.all { item ->
+                                        !hasThumbnailableKind(item) ||
+                                            (!item.thumbnailPath.isNullOrBlank() &&
+                                                !item.thumbnailPath.contains("/minithumbs/"))
+                                    }
+                                    if (allDone) {
                                         break
                                     }
                                     val msgs2 = filterOutTrashed(chatId, telegramClient.fetchMessages(chatId, 0, 100))
@@ -1582,15 +1765,29 @@ class FolderViewModel
         }
 
         fun openVirtualFolder(path: String) {
-            _virtualPath.value = normalizeVirtualPath(path)
+            val target = normalizeVirtualPath(path)
+            _virtualPath.value = target
             _selected.value = emptySet()
+            val snapshot = _items.value
+            clearCompletedForSubfolder(snapshot, target)
+            warmThumbsJob?.cancel()
+            warmThumbsJob = viewModelScope.launch(dispatchers.io) {
+                warmThumbnailsForEntities(snapshot, activeSubfolder = target)
+            }
         }
 
         fun navigateUpVirtualFolder(): Boolean {
             val cur = normalizeVirtualPath(_virtualPath.value)
             if (cur.isEmpty()) return false
-            _virtualPath.value = cur.substringBeforeLast('/', "")
+            val target = cur.substringBeforeLast('/', "")
+            _virtualPath.value = target
             _selected.value = emptySet()
+            val snapshot = _items.value
+            clearCompletedForSubfolder(snapshot, target)
+            warmThumbsJob?.cancel()
+            warmThumbsJob = viewModelScope.launch(dispatchers.io) {
+                warmThumbnailsForEntities(snapshot, activeSubfolder = target)
+            }
             return true
         }
 

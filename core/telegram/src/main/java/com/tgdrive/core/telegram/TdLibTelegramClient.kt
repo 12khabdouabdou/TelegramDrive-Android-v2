@@ -553,10 +553,17 @@ class TdLibTelegramClient(
     ): List<TelegramMessage> {
         val msgById = tdMessages.associateBy { it.id }
         val miniDir = File(appContext.cacheDir, "minithumbs")
+        var eagerDownloads = 0
         return domainMsgs.map { msg ->
             val tdMsg = msgById[msg.id]
             val thumbFileId = tdMsg?.extractThumbnailFileId()
-            if (thumbFileId != null && thumbFileId != 0 && tdMsg != null && !tdMsg.isThumbnailDownloaded()) {
+            if (eagerDownloads < 24 &&
+                thumbFileId != null &&
+                thumbFileId != 0 &&
+                tdMsg != null &&
+                !tdMsg.isThumbnailDownloaded()
+            ) {
+                eagerDownloads++
                 try {
                     registerPendingThumbnail(thumbFileId, msg.chatId, msg.id)
                     client?.send(TdApi.DownloadFile(thumbFileId, 16, 0, 0, false)) { res ->
