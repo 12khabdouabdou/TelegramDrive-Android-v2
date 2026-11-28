@@ -111,6 +111,7 @@ class UploadManager @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
     private val stagingSemaphore = Semaphore(MAX_STAGE_PARALLEL)
     private val smallFileSemaphore = Semaphore(MAX_SMALL_PARALLEL)
+    private val smallDiskSlotSemaphore = Semaphore(MAX_SMALL_STAGED_SLOTS)
     private val heavyJobSemaphore = Semaphore(1)
 
     private val activeJobs = ConcurrentHashMap<String, Job>()
@@ -126,8 +127,10 @@ class UploadManager @Inject constructor(
     val completedChatEvents: SharedFlow<Long> = _completedChatEvents.asSharedFlow()
 
     init {
-        scope.launch { purgeStaleStaging() }
-        scope.launch { restorePendingUploads() }
+        scope.launch {
+            purgeStaleStaging()
+            restorePendingUploads()
+        }
         observeNetworkForWifiQueue()
     }
 
@@ -680,7 +683,7 @@ class UploadManager @Inject constructor(
 
         val isHeavy = item.sizeBytes >= LARGE_FILE_THRESHOLD_BYTES ||
             (item.sizeBytes > maxLimit && options.autoSplitOversized)
-        val networkSemaphore = if (isHeavy) heavyJobSemaphore else smallFileSemaphore
+        val diskSlotSemaphore = if (isHeavy) heavyJobSemaphore else smallDiskSlotSemaphore
 
         data class PreparedStage(
             val fileToUpload: File? = null,
@@ -694,7 +697,8 @@ class UploadManager @Inject constructor(
         val stagingDir = File(ctx.cacheDir, STAGING_DIR_NAME).apply { mkdirs() }
         var stagedFile: File? = null
         var encryptedFile: File? = null
-        try {
+        return diskSlotSemaphore.withPermit {
+            try {
             val prepared = stagingSemaphore.withPermit {
                 if (id in cancelledIds) {
                     uploadTracker.markCancelled(id)
@@ -888,46 +892,186 @@ class UploadManager @Inject constructor(
                 }
             }
 
-            prepared.abortResult?.let { return it }
+                prepared.abortResult?.let { return@withPermit it }
 
-            val splitSrc = prepared.oversizedSplitSource
-            if (splitSrc != null) {
-                val splitOk = heavyJobSemaphore.withPermit {
-                    uploadOversizedSingleFileSplit(
+                val splitSrc = prepared.oversizedSplitSource
+                if (splitSrc != null) {
+                    val splitOk = if (isHeavy) {
+                        uploadOversizedSingleFileSplit(
+                            id = id,
+                            chatId = chatId,
+                            sourceFile = splitSrc,
+                            displayName = rawName,
+                            maxPartBytes = (maxLimit * 92L / 100L),
+                            options = options,
+                            virtualPath = spec.virtualPath,
+                            captureDateMs = prepared.captureDateMs,
+                            stagingDir = stagingDir,
+                        )
+                    } else {
+                        heavyJobSemaphore.withPermit {
+                            uploadOversizedSingleFileSplit(
+                                id = id,
+                                chatId = chatId,
+                                sourceFile = splitSrc,
+                                displayName = rawName,
+                                maxPartBytes = (maxLimit * 92L / 100L),
+                                options = options,
+                                virtualPath = spec.virtualPath,
+                                captureDateMs = prepared.captureDateMs,
+                                stagingDir = stagingDir,
+                            )
+                        }
+                    }
+                    if (splitOk) {
+                        waitingForWifiIds.remove(id)
+                        if (spec.virtualPath.isNotBlank()) {
+                            cloudSyncManager.schedulePushMetadata()
+                        }
+                        withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
+                    }
+                    return@withPermit splitOk
+                }
+
+                val fileToUpload = prepared.fileToUpload
+                    ?: throw IllegalStateException("Staged upload file missing")
+                val finalMime = prepared.finalMime
+                val uploadSize = fileToUpload.length()
+
+                suspend fun performSingleUpload(): Boolean {
+                    if (id in cancelledIds) {
+                        uploadTracker.markCancelled(id)
+                        withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
+                        return false
+                    }
+                    if (id in pausedIds) {
+                        val isWifiWait = id in waitingForWifiIds
+                        uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                        withContext(NonCancellable) {
+                            runCatching {
+                                pendingUploadDao.updateStatus(
+                                    id,
+                                    if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
+                                )
+                            }
+                        }
+                        return false
+                    }
+                    if (shouldDeferForWifi(options.wifiOnly)) {
+                        markWaitingForWifi(id)
+                        return false
+                    }
+
+                    uploadTracker.updatePhase(
+                        id = id,
+                        status = UploadStatus.UPLOADING,
+                        detail = null,
+                        progress = 0f,
+                        totalBytes = uploadSize,
+                        fileName = targetName,
+                        isEncrypted = options.encryption.enabled,
+                    )
+
+                    val captionTag = if (!options.encryption.enabled && spec.virtualPath.isNotBlank()) {
+                        TelegramPathTag.formatCaption(spec.virtualPath)
+                    } else {
+                        ""
+                    }
+                    if (captionTag.isNotEmpty()) {
+                        telegramClient.registerUploadMetadata(
+                            localPath = fileToUpload.absolutePath,
+                            caption = captionTag,
+                        )
+                    }
+
+                    val uploadResult = uploadWithRetry(
                         id = id,
                         chatId = chatId,
-                        sourceFile = splitSrc,
-                        displayName = rawName,
-                        maxPartBytes = (maxLimit * 92L / 100L),
-                        options = options,
-                        virtualPath = spec.virtualPath,
-                        captureDateMs = prepared.captureDateMs,
-                        stagingDir = stagingDir,
+                        localPath = fileToUpload.absolutePath,
+                        fileName = targetName,
+                        mimeType = finalMime,
                     )
-                }
-                if (splitOk) {
-                    waitingForWifiIds.remove(id)
-                    if (spec.virtualPath.isNotBlank()) {
-                        cloudSyncManager.schedulePushMetadata()
+
+                    val thumbPath = if (options.encryption.enabled) {
+                        val encBytes = prepared.encryptedThumbBytes
+                        if (encBytes != null) {
+                            runCatching {
+                                mediaThumbnailCache.saveAndSyncEncryptedThumbBytes(
+                                    chatId = chatId,
+                                    messageId = uploadResult.messageId,
+                                    encryptedBytes = encBytes,
+                                )
+                            }.getOrNull()
+                        } else {
+                            null
+                        }
+                    } else {
+                        val promoted = uploadResult.generatedThumbPath?.let { prebuilt ->
+                            runCatching {
+                                mediaThumbnailCache.promotePrebuiltThumbnail(
+                                    chatId = chatId,
+                                    messageId = uploadResult.messageId,
+                                    sourcePath = prebuilt,
+                                )
+                            }.getOrNull()
+                        }
+                        promoted ?: runCatching {
+                            mediaThumbnailCache.generateFromLocalFile(
+                                chatId = chatId,
+                                messageId = uploadResult.messageId,
+                                localPath = fileToUpload.absolutePath,
+                                mimeType = finalMime,
+                                fileName = targetName,
+                            )
+                        }.getOrNull()
                     }
-                    withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
-                }
-                return splitOk
-            }
 
-            val fileToUpload = prepared.fileToUpload
-                ?: throw IllegalStateException("Staged upload file missing")
-            val finalMime = prepared.finalMime
-            val uploadSize = fileToUpload.length()
+                    fileCacheDao.upsertAll(
+                        listOf(
+                            FileCacheEntity(
+                                messageId = uploadResult.messageId,
+                                chatId = chatId,
+                                fileName = targetName,
+                                fileSize = uploadSize,
+                                mimeType = finalMime,
+                                thumbnailPath = thumbPath,
+                                remoteId = uploadResult.remoteId,
+                                date = prepared.captureDateMs,
+                                lastAccessed = System.currentTimeMillis(),
+                                virtualPath = spec.virtualPath,
+                                isEncryptedVault = options.encryption.enabled,
+                            ),
+                        ),
+                    )
 
-            return networkSemaphore.withPermit {
-                if (id in cancelledIds) {
-                    uploadTracker.markCancelled(id)
+                    if (spec.virtualPath.isNotBlank()) {
+                        cloudSyncManager.noteVirtualPathChanged(
+                            chatId = chatId,
+                            messageId = uploadResult.messageId,
+                            virtualPath = spec.virtualPath,
+                            schedulePush = false,
+                        )
+                    }
+
+                    if (options.conflictStrategy == UploadConflictStrategy.REPLACE && existingMatch != null) {
+                        runCatching { telegramClient.deleteMessage(chatId, existingMatch.messageId) }
+                        runCatching { fileCacheDao.deleteById(chatId, existingMatch.messageId) }
+                    }
+
+                    waitingForWifiIds.remove(id)
+                    uploadTracker.completeUpload(id)
                     withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
-                    return@withPermit false
+                    return true
                 }
+
+                return@withPermit if (isHeavy) {
+                    performSingleUpload()
+                } else {
+                    smallFileSemaphore.withPermit { performSingleUpload() }
+                }
+            } catch (e: CancellationException) {
+                val isWifiWait = id in waitingForWifiIds
                 if (id in pausedIds) {
-                    val isWifiWait = id in waitingForWifiIds
                     uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
                     withContext(NonCancellable) {
                         runCatching {
@@ -937,144 +1081,25 @@ class UploadManager @Inject constructor(
                             )
                         }
                     }
-                    return@withPermit false
-                }
-                if (shouldDeferForWifi(options.wifiOnly)) {
-                    markWaitingForWifi(id)
-                    return@withPermit false
-                }
-
-                uploadTracker.updatePhase(
-                    id = id,
-                    status = UploadStatus.UPLOADING,
-                    detail = null,
-                    progress = 0f,
-                    totalBytes = uploadSize,
-                    fileName = targetName,
-                    isEncrypted = options.encryption.enabled,
-                )
-
-                val captionTag = if (!options.encryption.enabled && spec.virtualPath.isNotBlank()) {
-                    TelegramPathTag.formatCaption(spec.virtualPath)
                 } else {
-                    ""
+                    waitingForWifiIds.remove(id)
+                    uploadTracker.markCancelled(id)
+                    withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                 }
-                if (captionTag.isNotEmpty()) {
-                    telegramClient.registerUploadMetadata(
-                        localPath = fileToUpload.absolutePath,
-                        caption = captionTag,
-                    )
-                }
-
-                val uploadResult = uploadWithRetry(
-                    id = id,
-                    chatId = chatId,
-                    localPath = fileToUpload.absolutePath,
-                    fileName = targetName,
-                    mimeType = finalMime,
-                )
-
-                val thumbPath = if (options.encryption.enabled) {
-                    val encBytes = prepared.encryptedThumbBytes
-                    if (encBytes != null) {
-                        runCatching {
-                            mediaThumbnailCache.saveAndSyncEncryptedThumbBytes(
-                                chatId = chatId,
-                                messageId = uploadResult.messageId,
-                                encryptedBytes = encBytes,
-                            )
-                        }.getOrNull()
-                    } else {
-                        null
-                    }
-                } else {
-                    val promoted = uploadResult.generatedThumbPath?.let { prebuilt ->
-                        runCatching {
-                            mediaThumbnailCache.promotePrebuiltThumbnail(
-                                chatId = chatId,
-                                messageId = uploadResult.messageId,
-                                sourcePath = prebuilt,
-                            )
-                        }.getOrNull()
-                    }
-                    promoted ?: runCatching {
-                        mediaThumbnailCache.generateFromLocalFile(
-                            chatId = chatId,
-                            messageId = uploadResult.messageId,
-                            localPath = fileToUpload.absolutePath,
-                            mimeType = finalMime,
-                            fileName = targetName,
-                        )
-                    }.getOrNull()
-                }
-
-                fileCacheDao.upsertAll(
-                    listOf(
-                        FileCacheEntity(
-                            messageId = uploadResult.messageId,
-                            chatId = chatId,
-                            fileName = targetName,
-                            fileSize = uploadSize,
-                            mimeType = finalMime,
-                            thumbnailPath = thumbPath,
-                            remoteId = uploadResult.remoteId,
-                            date = prepared.captureDateMs,
-                            lastAccessed = System.currentTimeMillis(),
-                            virtualPath = spec.virtualPath,
-                            isEncryptedVault = options.encryption.enabled,
-                        ),
-                    ),
-                )
-
-                if (spec.virtualPath.isNotBlank()) {
-                    cloudSyncManager.noteVirtualPathChanged(
-                        chatId = chatId,
-                        messageId = uploadResult.messageId,
-                        virtualPath = spec.virtualPath,
-                        schedulePush = false,
-                    )
-                }
-
-                if (options.conflictStrategy == UploadConflictStrategy.REPLACE && existingMatch != null) {
-                    runCatching { telegramClient.deleteMessage(chatId, existingMatch.messageId) }
-                    runCatching { fileCacheDao.deleteById(chatId, existingMatch.messageId) }
-                }
-
+                throw e
+            } catch (t: Throwable) {
+                Log.w("UploadManager: single file upload failed for '$targetName'", t)
                 waitingForWifiIds.remove(id)
-                uploadTracker.completeUpload(id)
-                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
-                true
-            }
-        } catch (e: CancellationException) {
-            val isWifiWait = id in waitingForWifiIds
-            if (id in pausedIds) {
-                uploadTracker.markPaused(id, detail = if (isWifiWait) "Waiting for Wi-Fi…" else "Paused")
+                uploadTracker.markFailed(id, t.message ?: "Upload failed", canRetry = true)
                 withContext(NonCancellable) {
-                    runCatching {
-                        pendingUploadDao.updateStatus(
-                            id,
-                            if (isWifiWait) STATUS_WAITING_WIFI else UploadStatus.PAUSED.name,
-                        )
-                    }
+                    runCatching { pendingUploadDao.updateStatus(id, UploadStatus.FAILED.name) }
                 }
-            } else {
-                waitingForWifiIds.remove(id)
-                uploadTracker.markCancelled(id)
-                withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
+                return@withPermit false
+            } finally {
+                activeJobs.remove(id)
+                runCatching { stagedFile?.delete() }
+                runCatching { encryptedFile?.delete() }
             }
-            throw e
-        } catch (t: Throwable) {
-            Log.w("UploadManager: single file upload failed for '$targetName'", t)
-            waitingForWifiIds.remove(id)
-            uploadTracker.markFailed(id, t.message ?: "Upload failed", canRetry = true)
-            withContext(NonCancellable) {
-                runCatching { pendingUploadDao.updateStatus(id, UploadStatus.FAILED.name) }
-            }
-            return false
-        } finally {
-            activeJobs.remove(id)
-            runCatching { stagedFile?.delete() }
-            runCatching { encryptedFile?.delete() }
         }
     }
 
@@ -2163,14 +2188,18 @@ class UploadManager @Inject constructor(
     }
 
     private fun purgeStaleStaging() {
-        val cutoff = System.currentTimeMillis() - STALE_STAGING_MS
-        listOf(STAGING_DIR_NAME, "share_staging").forEach { dirName ->
-            val dir = File(ctx.cacheDir, dirName)
-            if (dir.isDirectory) {
-                dir.listFiles()?.forEach { child ->
-                    if (child.lastModified() < cutoff) {
-                        runCatching { child.deleteRecursively() }
-                    }
+        val uploadDir = File(ctx.cacheDir, STAGING_DIR_NAME)
+        if (uploadDir.isDirectory) {
+            uploadDir.listFiles()?.forEach { child ->
+                runCatching { child.deleteRecursively() }
+            }
+        }
+        val shareCutoff = System.currentTimeMillis() - SHARE_STALE_STAGING_MS
+        val shareDir = File(ctx.cacheDir, "share_staging")
+        if (shareDir.isDirectory) {
+            shareDir.listFiles()?.forEach { child ->
+                if (child.lastModified() < shareCutoff) {
+                    runCatching { child.deleteRecursively() }
                 }
             }
         }
@@ -2182,9 +2211,10 @@ class UploadManager @Inject constructor(
         private const val KIND_URIS_ZIP = "URIS_ZIP"
         private const val STATUS_WAITING_WIFI = "WAITING_WIFI"
         private const val STAGING_DIR_NAME = "upload_staging"
-        private const val STALE_STAGING_MS = 12L * 60 * 60 * 1000
+        private const val SHARE_STALE_STAGING_MS = 60L * 60 * 1000
         private const val MAX_STAGE_PARALLEL = 2
         private const val MAX_SMALL_PARALLEL = 4
+        private const val MAX_SMALL_STAGED_SLOTS = MAX_SMALL_PARALLEL + 1
         private const val LARGE_FILE_THRESHOLD_BYTES = 100L * 1024 * 1024
         private const val MAX_UPLOAD_ATTEMPTS = 3
         private const val COPY_BUFFER_BYTES = 256 * 1024

@@ -93,8 +93,14 @@ class UploadManagerTest {
             every { isCurrentlyUnmetered() } returns true
         },
         cloudSyncManager: CloudSyncManager = mockk(relaxed = true),
+        contentStreamBytes: ((Uri) -> ByteArray)? = null,
     ): Pair<UploadManager, UploadTracker> {
         val ctx = fakeContext(File(tmp, "cache").apply { mkdirs() })
+        if (contentStreamBytes != null) {
+            every { ctx.contentResolver.openInputStream(any()) } answers {
+                java.io.ByteArrayInputStream(contentStreamBytes(firstArg()))
+            }
+        }
         val tracker = UploadTracker(ctx)
         val crypto = BackupCrypto(fakeKeystoreHelper())
         val zipEntryDao = mockk<ZipEntryDao>(relaxed = true)
@@ -624,5 +630,72 @@ class UploadManagerTest {
         coVerify { tg.registerUploadMetadata(src.absolutePath, caption = "tgdrive:path=Docs/2026", prebuiltThumbnailPath = null) }
         coVerify { cloudSync.noteVirtualPathChanged(33L, 808L, "Docs/2026", schedulePush = false) }
         coVerify(exactly = 1) { cloudSync.schedulePushMetadata() }
+    }
+
+    @Test
+    fun `startup purge immediately deletes leftover upload_staging files`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val stagingDir = File(tmp, "cache/upload_staging").apply { mkdirs() }
+        val leftover = File(stagingDir, "crashed_3gb_leftover.bin").apply { writeBytes("leftover".toByteArray()) }
+
+        val tg = mockk<TelegramClient>(relaxed = true)
+        val dao = mockk<FileCacheDao>(relaxed = true)
+        createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        assertThat(leftover.exists()).isFalse()
+    }
+
+    @Test
+    fun `enqueueFiles bounds concurrent staged files while uploads are in flight`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val gate = CompletableDeferred<Unit>()
+        val payload = "sample-content".toByteArray()
+        val stagingDir = File(tmp, "cache/upload_staging")
+        val nextId = java.util.concurrent.atomic.AtomicLong(100L)
+        var maxObservedStaged = 0
+
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } coAnswers {
+                val count = stagingDir.listFiles()?.count { it.isFile } ?: 0
+                if (count > maxObservedStaged) maxObservedStaged = count
+                gate.await()
+                val msgId = nextId.incrementAndGet()
+                UploadResult(messageId = msgId, remoteId = "rem_$msgId")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(99L) } returns emptyList()
+        }
+        val (manager, tracker) = createManager(
+            tmp = tmp,
+            dispatcher = d,
+            telegramClient = tg,
+            fileCacheDao = dao,
+            contentStreamBytes = { payload },
+        )
+        runCurrent()
+
+        val items = (1..10).map { idx ->
+            val uri = mockk<Uri>(relaxed = true) {
+                every { scheme } returns "content"
+                every { lastPathSegment } returns "photo_$idx.bin"
+            }
+            UploadFileItem(uri, "photo_$idx.bin", "application/octet-stream", payload.size.toLong())
+        }
+        manager.enqueueFiles(chatId = 99L, files = items)
+        runCurrent()
+
+        val activeStaged = stagingDir.listFiles()?.count { it.isFile } ?: 0
+        assertThat(activeStaged).isAtMost(5)
+        assertThat(maxObservedStaged).isAtMost(5)
+
+        gate.complete(Unit)
+        advanceUntilIdle()
+
+        assertThat(tracker.state.value.items).hasSize(10)
+        assertThat(tracker.state.value.items.all { it.status == UploadStatus.DONE }).isTrue()
+        assertThat(stagingDir.listFiles()?.count { it.isFile } ?: 0).isEqualTo(0)
     }
 }

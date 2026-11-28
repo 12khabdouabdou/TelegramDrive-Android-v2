@@ -351,4 +351,31 @@ class ZipUploaderChunkedTest {
         }
         assertThat(File(outDir, "zeros.bin").exists()).isFalse()
     }
+
+    @Test
+    fun `zipSingleFileSplit deletes each volume immediately after onPartReady returns`(@TempDir tmp: File) = runTest {
+        val source = File(tmp, "big_stream.bin").apply { writeBytes(randomBytes(210 * 1024, 55L)) }
+        val splitDir = File(tmp, "split_inc")
+        var previousVol: File? = null
+        var seenCount = 0
+
+        ZipUploader.zipSingleFileSplit(
+            sourceFile = source,
+            displayName = "big_stream.bin",
+            workDir = splitDir,
+            maxPartBytes = 90 * 1024L,
+            password = null,
+        ) { part ->
+            seenCount++
+            assertThat(part.partFile.exists()).isTrue()
+            previousVol?.let { prev ->
+                assertThat(prev.exists()).isFalse()
+            }
+            previousVol = part.partFile
+        }
+
+        assertThat(seenCount).isAtLeast(2)
+        assertThat(previousVol?.exists()).isFalse()
+        assertThat(splitDir.listFiles().orEmpty().filter { it.isFile }).isEmpty()
+    }
 }

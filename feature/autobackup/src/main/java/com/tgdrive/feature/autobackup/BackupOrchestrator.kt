@@ -167,8 +167,8 @@ class BackupOrchestrator @Inject constructor(
             null
         }
 
-        // --- 3. Purge stale staging files older than 1 hour
-        stagingManager.purgeStale()
+        // --- 3. Purge leftover staging files before starting a new backup run
+        stagingManager.purgeStale(maxAgeMs = 0L)
 
         var filesScanned = 0
         var filesToUpload = 0
@@ -596,6 +596,7 @@ class BackupOrchestrator @Inject constructor(
 
             val stagingSemaphore = Semaphore(2)
             val smallNetworkSemaphore = Semaphore(3)
+            val smallDiskSlotSemaphore = Semaphore(4)
             val largeNetworkSemaphore = Semaphore(1)
 
             fun currentLivePrefs(): AppPreferencesData = latestPrefsRef.get() ?: prefs
@@ -650,285 +651,314 @@ class BackupOrchestrator @Inject constructor(
 
                         val sourceUri = sourceUriByPath[file.absolutePath].orEmpty()
                         var stagedPathToRelease: String? = null
-                        try {
-                            val stageOutcome = stagingSemaphore.withPermit {
-                                ensureNotCancelled(jobId)
-                                val (q, enc) = stageOptionsFor(file)
-                                stagingManager.stageForUpload(
-                                    file.absolutePath,
-                                    file.name,
-                                    file.mimeType,
-                                    file.size,
-                                    q,
-                                    enc,
-                                )
-                            }
-                            if (stageOutcome is StagingManager.StageOutcome.Failed) {
-                                failures += BackupFailureRecord(file.name, file.absolutePath, stageOutcome.reason, sourceUri)
-                                return@launch
-                            }
-                            val staged = stageOutcome as StagingManager.StageOutcome.Ready
-                            stagedPathToRelease = staged.path
-
-                            val netSem = if (staged.effectiveSize >= LARGE_BACKUP_FILE_BYTES) {
-                                largeNetworkSemaphore
-                            } else {
-                                smallNetworkSemaphore
-                            }
-
-                            netSem.withPermit {
-                                ensureNotCancelled(jobId)
-                                if (shouldStopForPause()) {
-                                    abortedMidLoop.set(true)
+                        val isLarge = file.size >= LARGE_BACKUP_FILE_BYTES
+                        val diskSlotSem = if (isLarge) largeNetworkSemaphore else smallDiskSlotSemaphore
+                        diskSlotSem.withPermit {
+                            try {
+                                val stageOutcome = stagingSemaphore.withPermit {
+                                    ensureNotCancelled(jobId)
+                                    val (q, enc) = stageOptionsFor(file)
+                                    stagingManager.stageForUpload(
+                                        file.absolutePath,
+                                        file.name,
+                                        file.mimeType,
+                                        file.size,
+                                        q,
+                                        enc,
+                                    )
+                                }
+                                if (stageOutcome is StagingManager.StageOutcome.Failed) {
+                                    failures += BackupFailureRecord(
+                                        file.name,
+                                        file.absolutePath,
+                                        stageOutcome.reason,
+                                        sourceUri,
+                                    )
                                     return@withPermit
                                 }
-                                val liveNow = currentLivePrefs()
-                                if (isMetered && liveNow.backupCellularDailyLimitMb > 0 &&
-                                    usedCellularCounter.get() >= cellularLimitBytes
-                                ) {
-                                    cellularLimitHit.set(true)
-                                    return@withPermit
-                                }
+                                val staged = stageOutcome as StagingManager.StageOutcome.Ready
+                                stagedPathToRelease = staged.path
 
-                                val (fileTargetChatId, fileFolderDbId) = targetByPath[file.absolutePath]
-                                    ?: (defaultTargetChatId to defaultTargetPrefId.takeIf { it > 0 })
-                                val captureMs = stagingManager.extractCaptureTimestampMs(
-                                    uriStr = file.absolutePath,
-                                    mimeType = file.mimeType,
-                                    fallbackLastModified = file.lastModified,
-                                )
-                                val rootFolderTitle = folderNameByUri[sourceUri].orEmpty()
-                                val virtualPath = buildVirtualPath(
-                                    rootFolderTitle = rootFolderTitle,
-                                    relativeDir = file.relativePath,
-                                    organizeByDate = liveNow.backupAutoOrganizeByDate,
-                                    captureTimestampMs = captureMs,
-                                )
-
-                                val slotNum = startedCounter.incrementAndGet().coerceAtMost(filesToUpload)
-                                registry.updatePhase(
-                                    BackupPhase.Uploading(
-                                        current = slotNum,
-                                        total = filesToUpload,
-                                        fileName = staged.effectiveName,
-                                        bytesSent = 0L,
-                                        bytesTotal = staged.effectiveSize,
-                                        totalBytesUploaded = computeLiveBytesTotal(),
-                                        totalBytesAll = totalBytesAll,
-                                        speedBytesPerSec = 0L,
-                                        etaSeconds = -1L,
-                                        currentLocalUri = file.absolutePath,
-                                    ),
-                                )
-
-                                if (!staged.wasEncrypted && virtualPath.isNotBlank()) {
-                                    val capTag = TelegramPathTag.formatCaption(virtualPath)
-                                    if (capTag.isNotEmpty()) {
-                                        telegramClient.registerUploadMetadata(staged.path, caption = capTag)
+                                suspend fun uploadStaged() {
+                                    ensureNotCancelled(jobId)
+                                    if (shouldStopForPause()) {
+                                        abortedMidLoop.set(true)
+                                        return
                                     }
-                                }
+                                    val liveNow = currentLivePrefs()
+                                    if (isMetered && liveNow.backupCellularDailyLimitMb > 0 &&
+                                        usedCellularCounter.get() >= cellularLimitBytes
+                                    ) {
+                                        cellularLimitHit.set(true)
+                                        return
+                                    }
 
-                                var lastUploadProgressMs = 0L
-                                val uploadResult = uploadWithFloodWaitRetry(
-                                    chatId = fileTargetChatId,
-                                    localPath = staged.path,
-                                    fileName = staged.effectiveName,
-                                    mimeType = staged.effectiveMime,
-                                    onFloodWait = {
-                                        adaptiveDelayMs.set(1_000L)
-                                        cleanUploadsSinceFlood.set(0)
-                                    },
-                                    onProgress = { sent, total ->
-                                        inFlightBytes.set(i, sent.coerceIn(0L, staged.effectiveSize))
-                                        val now = System.currentTimeMillis()
-                                        if (sent >= total || now - lastUploadProgressMs >= 200L) {
-                                            lastUploadProgressMs = now
-                                            val bytesNow = computeLiveBytesTotal()
-                                            val elapsedSec = ((now - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
-                                            val speedBps = (bytesNow / elapsedSec).toLong()
-                                            val remBytes = (totalBytesAll - bytesNow).coerceAtLeast(0L)
-                                            val etaSec = if (speedBps > 0L) remBytes / speedBps else -1L
-                                            val curDone = completedCounter.get().coerceAtLeast(slotNum)
-                                            registry.updatePhase(
-                                                BackupPhase.Uploading(
-                                                    current = curDone.coerceAtMost(filesToUpload),
-                                                    total = filesToUpload,
-                                                    fileName = staged.effectiveName,
-                                                    bytesSent = sent,
-                                                    bytesTotal = total.coerceAtLeast(staged.effectiveSize),
-                                                    totalBytesUploaded = bytesNow,
-                                                    totalBytesAll = totalBytesAll,
-                                                    speedBytesPerSec = speedBps,
-                                                    etaSeconds = etaSec,
-                                                    currentLocalUri = file.absolutePath,
-                                                ),
-                                            )
-                                            val prevNotif = lastNotifMs.get()
-                                            if (now - prevNotif >= 1500L && lastNotifMs.compareAndSet(prevNotif, now)) {
-                                                val sub = buildNotifSubtext(staged.effectiveName, speedBps, etaSec)
-                                                notifier.showForeground(jobId, curDone.coerceAtMost(filesToUpload), filesToUpload, sub)
-                                            }
+                                    val (fileTargetChatId, fileFolderDbId) = targetByPath[file.absolutePath]
+                                        ?: (defaultTargetChatId to defaultTargetPrefId.takeIf { it > 0 })
+                                    val captureMs = stagingManager.extractCaptureTimestampMs(
+                                        uriStr = file.absolutePath,
+                                        mimeType = file.mimeType,
+                                        fallbackLastModified = file.lastModified,
+                                    )
+                                    val rootFolderTitle = folderNameByUri[sourceUri].orEmpty()
+                                    val virtualPath = buildVirtualPath(
+                                        rootFolderTitle = rootFolderTitle,
+                                        relativeDir = file.relativePath,
+                                        organizeByDate = liveNow.backupAutoOrganizeByDate,
+                                        captureTimestampMs = captureMs,
+                                    )
+
+                                    val slotNum = startedCounter.incrementAndGet().coerceAtMost(filesToUpload)
+                                    registry.updatePhase(
+                                        BackupPhase.Uploading(
+                                            current = slotNum,
+                                            total = filesToUpload,
+                                            fileName = staged.effectiveName,
+                                            bytesSent = 0L,
+                                            bytesTotal = staged.effectiveSize,
+                                            totalBytesUploaded = computeLiveBytesTotal(),
+                                            totalBytesAll = totalBytesAll,
+                                            speedBytesPerSec = 0L,
+                                            etaSeconds = -1L,
+                                            currentLocalUri = file.absolutePath,
+                                        ),
+                                    )
+
+                                    if (!staged.wasEncrypted && virtualPath.isNotBlank()) {
+                                        val capTag = TelegramPathTag.formatCaption(virtualPath)
+                                        if (capTag.isNotEmpty()) {
+                                            telegramClient.registerUploadMetadata(staged.path, caption = capTag)
                                         }
-                                    },
-                                )
-
-                                inFlightBytes.set(i, 0L)
-                                if (cleanUploadsSinceFlood.incrementAndGet() >= 3) {
-                                    cleanUploadsSinceFlood.set(0)
-                                    val prevDelay = adaptiveDelayMs.get()
-                                    if (prevDelay > 0L) {
-                                        adaptiveDelayMs.set(if (prevDelay <= 150L) 0L else prevDelay / 2L)
                                     }
-                                }
 
-                                val msgId = uploadResult.messageId
-                                val generatedThumb = if (staged.wasEncrypted) {
-                                    try {
-                                        mediaThumbnailCache.generateAndSyncEncryptedThumb(
-                                            chatId = fileTargetChatId,
-                                            messageId = msgId,
-                                            localPath = file.absolutePath,
-                                            mimeType = file.mimeType,
-                                            originalFileName = file.name,
-                                        )
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (_: Throwable) {
-                                        null
+                                    var lastUploadProgressMs = 0L
+                                    val uploadResult = uploadWithFloodWaitRetry(
+                                        chatId = fileTargetChatId,
+                                        localPath = staged.path,
+                                        fileName = staged.effectiveName,
+                                        mimeType = staged.effectiveMime,
+                                        onFloodWait = {
+                                            adaptiveDelayMs.set(1_000L)
+                                            cleanUploadsSinceFlood.set(0)
+                                        },
+                                        onProgress = { sent, total ->
+                                            inFlightBytes.set(i, sent.coerceIn(0L, staged.effectiveSize))
+                                            val now = System.currentTimeMillis()
+                                            if (sent >= total || now - lastUploadProgressMs >= 200L) {
+                                                lastUploadProgressMs = now
+                                                val bytesNow = computeLiveBytesTotal()
+                                                val elapsedSec =
+                                                    ((now - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
+                                                val speedBps = (bytesNow / elapsedSec).toLong()
+                                                val remBytes = (totalBytesAll - bytesNow).coerceAtLeast(0L)
+                                                val etaSec = if (speedBps > 0L) remBytes / speedBps else -1L
+                                                val curDone = completedCounter.get().coerceAtLeast(slotNum)
+                                                registry.updatePhase(
+                                                    BackupPhase.Uploading(
+                                                        current = curDone.coerceAtMost(filesToUpload),
+                                                        total = filesToUpload,
+                                                        fileName = staged.effectiveName,
+                                                        bytesSent = sent,
+                                                        bytesTotal = total.coerceAtLeast(staged.effectiveSize),
+                                                        totalBytesUploaded = bytesNow,
+                                                        totalBytesAll = totalBytesAll,
+                                                        speedBytesPerSec = speedBps,
+                                                        etaSeconds = etaSec,
+                                                        currentLocalUri = file.absolutePath,
+                                                    ),
+                                                )
+                                                val prevNotif = lastNotifMs.get()
+                                                if (now - prevNotif >= 1500L &&
+                                                    lastNotifMs.compareAndSet(prevNotif, now)
+                                                ) {
+                                                    val sub = buildNotifSubtext(
+                                                        staged.effectiveName,
+                                                        speedBps,
+                                                        etaSec,
+                                                    )
+                                                    notifier.showForeground(
+                                                        jobId,
+                                                        curDone.coerceAtMost(filesToUpload),
+                                                        filesToUpload,
+                                                        sub,
+                                                    )
+                                                }
+                                            }
+                                        },
+                                    )
+
+                                    inFlightBytes.set(i, 0L)
+                                    if (cleanUploadsSinceFlood.incrementAndGet() >= 3) {
+                                        cleanUploadsSinceFlood.set(0)
+                                        val prevDelay = adaptiveDelayMs.get()
+                                        if (prevDelay > 0L) {
+                                            adaptiveDelayMs.set(if (prevDelay <= 150L) 0L else prevDelay / 2L)
+                                        }
                                     }
-                                } else {
-                                    val promoted = uploadResult.generatedThumbPath?.let { prebuilt ->
-                                        runCatching {
-                                            mediaThumbnailCache.promotePrebuiltThumbnail(
+
+                                    val msgId = uploadResult.messageId
+                                    val generatedThumb = if (staged.wasEncrypted) {
+                                        try {
+                                            mediaThumbnailCache.generateAndSyncEncryptedThumb(
                                                 chatId = fileTargetChatId,
                                                 messageId = msgId,
-                                                sourcePath = prebuilt,
+                                                localPath = file.absolutePath,
+                                                mimeType = file.mimeType,
+                                                originalFileName = file.name,
                                             )
-                                        }.getOrNull()
-                                    }
-                                    promoted ?: try {
-                                        mediaThumbnailCache.generateFromLocalFile(
-                                            chatId = fileTargetChatId,
-                                            messageId = msgId,
-                                            localPath = staged.path,
-                                            mimeType = staged.effectiveMime,
-                                            fileName = staged.effectiveName,
-                                        )
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (_: Throwable) {
-                                        null
-                                    }
-                                }
-
-                                stagingManager.release(staged.path)
-                                stagedPathToRelease = null
-
-                                syncedFileDao.upsert(
-                                    SyncedFileEntity(
-                                        localPath = file.absolutePath,
-                                        telegramMessageId = msgId,
-                                        sha256 = file.sha256,
-                                        size = file.size,
-                                        syncedAt = System.currentTimeMillis(),
-                                        folderId = fileFolderDbId,
-                                        lastModified = file.lastModified,
-                                    ),
-                                )
-
-                                fileCacheDao.upsertAll(
-                                    listOf(
-                                        FileCacheEntity(
-                                            messageId = msgId,
-                                            chatId = fileTargetChatId,
-                                            fileName = staged.effectiveName,
-                                            fileSize = staged.effectiveSize,
-                                            mimeType = staged.effectiveMime,
-                                            thumbnailPath = generatedThumb,
-                                            remoteId = uploadResult.remoteId,
-                                            date = captureMs,
-                                            isStarred = false,
-                                            lastAccessed = 0L,
-                                            virtualPath = virtualPath,
-                                            isEncryptedVault = staged.wasEncrypted,
-                                        ),
-                                    ),
-                                )
-
-                                if (virtualPath.isNotBlank()) {
-                                    cloudSyncManager.noteVirtualPathChanged(
-                                        chatId = fileTargetChatId,
-                                        messageId = msgId,
-                                        virtualPath = virtualPath,
-                                        schedulePush = false,
-                                    )
-                                    metadataDirty.set(true)
-                                }
-
-                                if (liveNow.backupDeleteAfterUpload) {
-                                    runCatching {
-                                        val uri = android.net.Uri.parse(file.absolutePath)
-                                        val deleted = DocumentsContract.deleteDocument(ctx.contentResolver, uri)
-                                        if (!deleted) {
-                                            Log.w("BackupOrchestrator: SAF provider refused to delete '${file.name}'")
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (_: Throwable) {
+                                            null
+                                        }
+                                    } else {
+                                        val promoted = uploadResult.generatedThumbPath?.let { prebuilt ->
+                                            runCatching {
+                                                mediaThumbnailCache.promotePrebuiltThumbnail(
+                                                    chatId = fileTargetChatId,
+                                                    messageId = msgId,
+                                                    sourcePath = prebuilt,
+                                                )
+                                            }.getOrNull()
+                                        }
+                                        promoted ?: try {
+                                            mediaThumbnailCache.generateFromLocalFile(
+                                                chatId = fileTargetChatId,
+                                                messageId = msgId,
+                                                localPath = staged.path,
+                                                mimeType = staged.effectiveMime,
+                                                fileName = staged.effectiveName,
+                                            )
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (_: Throwable) {
+                                            null
                                         }
                                     }
-                                }
 
-                                val doneCount = completedCounter.incrementAndGet()
-                                val totalBytesDone = bytesUploadedCounter.addAndGet(staged.effectiveSize)
+                                    stagingManager.release(staged.path)
+                                    stagedPathToRelease = null
 
-                                if (isMetered) {
-                                    val newCellular = usedCellularCounter.addAndGet(staged.effectiveSize)
-                                    prefsUpdateMutex.withLock {
+                                    syncedFileDao.upsert(
+                                        SyncedFileEntity(
+                                            localPath = file.absolutePath,
+                                            telegramMessageId = msgId,
+                                            sha256 = file.sha256,
+                                            size = file.size,
+                                            syncedAt = System.currentTimeMillis(),
+                                            folderId = fileFolderDbId,
+                                            lastModified = file.lastModified,
+                                        ),
+                                    )
+
+                                    fileCacheDao.upsertAll(
+                                        listOf(
+                                            FileCacheEntity(
+                                                messageId = msgId,
+                                                chatId = fileTargetChatId,
+                                                fileName = staged.effectiveName,
+                                                fileSize = staged.effectiveSize,
+                                                mimeType = staged.effectiveMime,
+                                                thumbnailPath = generatedThumb,
+                                                remoteId = uploadResult.remoteId,
+                                                date = captureMs,
+                                                isStarred = false,
+                                                lastAccessed = 0L,
+                                                virtualPath = virtualPath,
+                                                isEncryptedVault = staged.wasEncrypted,
+                                            ),
+                                        ),
+                                    )
+
+                                    if (virtualPath.isNotBlank()) {
+                                        cloudSyncManager.noteVirtualPathChanged(
+                                            chatId = fileTargetChatId,
+                                            messageId = msgId,
+                                            virtualPath = virtualPath,
+                                            schedulePush = false,
+                                        )
+                                        metadataDirty.set(true)
+                                    }
+
+                                    if (liveNow.backupDeleteAfterUpload) {
                                         runCatching {
-                                            preferences.update { p ->
-                                                p.copy(
-                                                    backupCellularUsedBytes = maxOf(p.backupCellularUsedBytes, newCellular),
-                                                    backupCellularUsageDay = todayKey,
+                                            val uri = android.net.Uri.parse(file.absolutePath)
+                                            val deleted = DocumentsContract.deleteDocument(ctx.contentResolver, uri)
+                                            if (!deleted) {
+                                                Log.w(
+                                                    "BackupOrchestrator: SAF provider refused delete " +
+                                                        "'${file.name}'",
                                                 )
                                             }
                                         }
                                     }
-                                    if (liveNow.backupCellularDailyLimitMb > 0 && newCellular >= cellularLimitBytes) {
-                                        cellularLimitHit.set(true)
+
+                                    val doneCount = completedCounter.incrementAndGet()
+                                    val totalBytesDone = bytesUploadedCounter.addAndGet(staged.effectiveSize)
+
+                                    if (isMetered) {
+                                        val newCellular = usedCellularCounter.addAndGet(staged.effectiveSize)
+                                        prefsUpdateMutex.withLock {
+                                            runCatching {
+                                                preferences.update { p ->
+                                                    p.copy(
+                                                        backupCellularUsedBytes =
+                                                            maxOf(p.backupCellularUsedBytes, newCellular),
+                                                        backupCellularUsageDay = todayKey,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        val dailyLimitMb = liveNow.backupCellularDailyLimitMb
+                                        if (dailyLimitMb > 0 && newCellular >= cellularLimitBytes) {
+                                            cellularLimitHit.set(true)
+                                        }
+                                    }
+
+                                    val elapsedTotalSec =
+                                        ((System.currentTimeMillis() - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
+                                    val overallSpeed = (totalBytesDone / elapsedTotalSec).toLong()
+                                    val remBytes = (totalBytesAll - totalBytesDone).coerceAtLeast(0L)
+                                    val etaSec = if (overallSpeed > 0L) remBytes / overallSpeed else -1L
+                                    val sub = buildNotifSubtext(staged.effectiveName, overallSpeed, etaSec)
+                                    runCatching { setForeground(jobId, doneCount, filesToUpload, sub) }
+                                    val nowAfter = System.currentTimeMillis()
+                                    val prevAfter = lastNotifMs.get()
+                                    val throttled = nowAfter - prevAfter >= 1_000L &&
+                                        lastNotifMs.compareAndSet(prevAfter, nowAfter)
+                                    if (doneCount == filesToUpload || throttled) {
+                                        runCatching { notifier.showForeground(jobId, doneCount, filesToUpload, sub) }
+                                    }
+
+                                    val stepDelay = adaptiveDelayMs.get()
+                                    if (stepDelay > 0L) {
+                                        delay(stepDelay)
                                     }
                                 }
 
-                                val elapsedTotalSec = ((System.currentTimeMillis() - uploadLoopStartMs) / 1000.0).coerceAtLeast(0.25)
-                                val overallSpeed = (totalBytesDone / elapsedTotalSec).toLong()
-                                val remBytes = (totalBytesAll - totalBytesDone).coerceAtLeast(0L)
-                                val etaSec = if (overallSpeed > 0L) remBytes / overallSpeed else -1L
-                                val sub = buildNotifSubtext(staged.effectiveName, overallSpeed, etaSec)
-                                runCatching { setForeground(jobId, doneCount, filesToUpload, sub) }
-                                val nowAfter = System.currentTimeMillis()
-                                val prevAfter = lastNotifMs.get()
-                                if (doneCount == filesToUpload ||
-                                    (nowAfter - prevAfter >= 1_000L && lastNotifMs.compareAndSet(prevAfter, nowAfter))
-                                ) {
-                                    runCatching { notifier.showForeground(jobId, doneCount, filesToUpload, sub) }
+                                if (isLarge) {
+                                    uploadStaged()
+                                } else if (staged.effectiveSize >= LARGE_BACKUP_FILE_BYTES) {
+                                    largeNetworkSemaphore.withPermit { uploadStaged() }
+                                } else {
+                                    smallNetworkSemaphore.withPermit { uploadStaged() }
                                 }
-
-                                val stepDelay = adaptiveDelayMs.get()
-                                if (stepDelay > 0L) {
-                                    delay(stepDelay)
+                            } catch (e: CancellationException) {
+                                inFlightBytes.set(i, 0L)
+                                throw e
+                            } catch (t: Throwable) {
+                                inFlightBytes.set(i, 0L)
+                                Log.w("BackupOrchestrator: failed to upload ${file.name}", t)
+                                failures += BackupFailureRecord(
+                                    fileName = file.name,
+                                    localPath = file.absolutePath,
+                                    reason = t.message ?: t.javaClass.simpleName,
+                                    folderUri = sourceUri,
+                                )
+                            } finally {
+                                withContext(NonCancellable) {
+                                    stagingManager.release(stagedPathToRelease)
                                 }
-                            }
-                        } catch (e: CancellationException) {
-                            inFlightBytes.set(i, 0L)
-                            throw e
-                        } catch (t: Throwable) {
-                            inFlightBytes.set(i, 0L)
-                            Log.w("BackupOrchestrator: failed to upload ${file.name}", t)
-                            failures += BackupFailureRecord(
-                                fileName = file.name,
-                                localPath = file.absolutePath,
-                                reason = t.message ?: t.javaClass.simpleName,
-                                folderUri = sourceUri,
-                            )
-                        } finally {
-                            withContext(NonCancellable) {
-                                stagingManager.release(stagedPathToRelease)
                             }
                         }
                     }

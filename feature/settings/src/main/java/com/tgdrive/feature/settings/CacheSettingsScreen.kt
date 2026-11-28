@@ -71,7 +71,7 @@ fun CacheSettingsScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    var cacheSize by remember { mutableLongStateOf(0L) }
+    var breakdown by remember { mutableStateOf(CacheBreakdown(0L, 0L, 0L)) }
     var pinnedCount by remember { mutableStateOf(0) }
     var pinnedBytes by remember { mutableLongStateOf(0L) }
     var showClearDialog by remember { mutableStateOf(false) }
@@ -81,7 +81,7 @@ fun CacheSettingsScreen(
     val bottomPad = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
     LaunchedEffect(Unit) {
-        cacheSize = measureTdlibCache(context)
+        breakdown = measureCacheBreakdown(context)
         val (count, bytes) = vm.offlinePinStats()
         pinnedCount = count
         pinnedBytes = bytes
@@ -110,7 +110,7 @@ fun CacheSettingsScreen(
                         showClearDialog = false
                         scope.launch {
                             vm.clearCacheAndAwait()
-                            cacheSize = measureTdlibCache(context)
+                            breakdown = measureCacheBreakdown(context)
                             snackbarHostState.showSnackbar(clearedMsg)
                         }
                     },
@@ -183,9 +183,24 @@ fun CacheSettingsScreen(
             ) {
                 CalloutCard(
                     label = stringResource(R.string.settings_cache_tdlib_label),
-                    value = cacheSize.toHumanSize(),
+                    value = breakdown.tdlibBytes.toHumanSize(),
                     subtitle = stringResource(R.string.settings_cache_tdlib_desc),
                     tint = MaterialTheme.colorScheme.primary,
+                )
+
+                val appCacheSubtitle = if (breakdown.stagingBytes > 0L) {
+                    stringResource(
+                        R.string.settings_cache_app_desc_with_staging,
+                        breakdown.stagingBytes.toHumanSize(),
+                    )
+                } else {
+                    stringResource(R.string.settings_cache_app_desc)
+                }
+                CalloutCard(
+                    label = stringResource(R.string.settings_cache_app_label),
+                    value = breakdown.appCacheBytes.toHumanSize(),
+                    subtitle = appCacheSubtitle,
+                    tint = MaterialTheme.colorScheme.tertiary,
                 )
 
                 CalloutCard(
@@ -250,12 +265,28 @@ fun CacheSettingsScreen(
     }
 }
 
-private suspend fun measureTdlibCache(context: Context): Long =
+private data class CacheBreakdown(
+    val tdlibBytes: Long,
+    val appCacheBytes: Long,
+    val stagingBytes: Long,
+)
+
+private fun dirSize(dir: File): Long =
+    if (dir.exists()) {
+        dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+    } else {
+        0L
+    }
+
+private suspend fun measureCacheBreakdown(context: Context): CacheBreakdown =
     withContext(Dispatchers.IO) {
-        val tdlibDir = File(context.filesDir, "tgdrive_tdlib/files")
-        if (tdlibDir.exists()) {
-            tdlibDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-        } else {
-            0L
-        }
+        val tdlibBytes = dirSize(File(context.filesDir, "tgdrive_tdlib/files"))
+        val appCacheBytes = dirSize(context.cacheDir)
+        val stagingBytes = listOf("upload_staging", "backup_staging", "share_staging")
+            .sumOf { dirName -> dirSize(File(context.cacheDir, dirName)) }
+        CacheBreakdown(
+            tdlibBytes = tdlibBytes,
+            appCacheBytes = appCacheBytes,
+            stagingBytes = stagingBytes,
+        )
     }

@@ -70,6 +70,7 @@ object ZipUploader {
     private const val COPY_BUFFER_SIZE = 64 * 1024
     private const val PROGRESS_INTERVAL_MS = 250L
     private const val PIPELINE_BUFFER_SAFETY_BYTES = 128L * 1024 * 1024
+    private const val MAX_PIPELINE_PART_BYTES = 512L * 1024 * 1024
 
     private val INCOMPRESSIBLE_EXTS = setOf(
         "jpg", "jpeg", "heic", "heif", "webp", "png", "gif",
@@ -421,16 +422,20 @@ object ZipUploader {
                 currentCoroutineContext().ensureActive()
                 emitted++
                 val isFinalZip = vol.extension.equals("zip", ignoreCase = true)
-                onPartReady(
-                    ZipPartOutput(
-                        partFile = vol,
-                        partIndex = emitted,
-                        isSplitVolume = true,
-                        splitGroupBaseName = stem,
-                        entries = if (isFinalZip) listOf(safeLeaf) else emptyList(),
-                        uncompressedBytes = if (isFinalZip) sourceFile.length() else 0L,
-                    ),
-                )
+                try {
+                    onPartReady(
+                        ZipPartOutput(
+                            partFile = vol,
+                            partIndex = emitted,
+                            isSplitVolume = true,
+                            splitGroupBaseName = stem,
+                            entries = if (isFinalZip) listOf(safeLeaf) else emptyList(),
+                            uncompressedBytes = if (isFinalZip) sourceFile.length() else 0L,
+                        ),
+                    )
+                } finally {
+                    runCatching { if (vol.exists()) vol.delete() }
+                }
             }
         } finally {
             volumes.forEach { vol -> runCatching { if (vol.exists()) vol.delete() } }
@@ -648,10 +653,13 @@ object ZipUploader {
             }
         }
 
-        val canPipeline = enablePipeline && entries.size > 1 && (
-            !checkFreeSpace ||
-                hasEnoughFreeSpace(workDir, minOf(totalEstimated, maxPartBytes * 2L) + PIPELINE_BUFFER_SAFETY_BYTES)
-            )
+        val canPipeline = enablePipeline &&
+            entries.size > 1 &&
+            maxPartBytes <= MAX_PIPELINE_PART_BYTES &&
+            (
+                !checkFreeSpace ||
+                    hasEnoughFreeSpace(workDir, minOf(totalEstimated, maxPartBytes * 2L) + PIPELINE_BUFFER_SAFETY_BYTES)
+                )
 
         if (!canPipeline) {
             return packEntriesSequential(
@@ -675,7 +683,7 @@ object ZipUploader {
 
         return coroutineScope {
             val channel = Channel<ZipPartOutput>(
-                capacity = 1,
+                capacity = Channel.RENDEZVOUS,
                 onUndeliveredElement = { leftover -> runCatching { leftover.partFile.delete() } },
             )
             val producer = async {

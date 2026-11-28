@@ -387,4 +387,55 @@ class BackupOrchestratorTest {
         val alreadyDated = BackupOrchestrator.buildVirtualPath("Camera", "2025/Trips", organizeByDate = true, captureTimestampMs = ts)
         assertThat(alreadyDated).isEqualTo("Camera/2025/Trips")
     }
+
+    @Test
+    fun `concurrent backup bounds staged files while uploads are suspended`() = runTest(testDispatcher) {
+        val folderUri = "content://com.android.externalstorage.documents/tree/primary%3ABulk"
+        prefsFlow.value = prefsFlow.value.copy(backupFolderUris = setOf(folderUri))
+        val files = (1..10).map { i ->
+            LocalFile("content://doc/$i", "img_$i.jpg", 1_024L, 1_000L + i, "image/jpeg")
+        }
+        coEvery { folderScanner.scanDetailed(folderUri, any(), any()) } returns FolderScanResult(
+            files = files,
+            folderName = "Bulk",
+        )
+
+        val activeStaged = java.util.concurrent.atomic.AtomicInteger(0)
+        val peakStaged = java.util.concurrent.atomic.AtomicInteger(0)
+        every { stagingManager.stageForUpload(any(), any(), any(), any(), any(), any()) } answers {
+            val name = secondArg<String>()
+            val cur = activeStaged.incrementAndGet()
+            peakStaged.updateAndGet { prev -> maxOf(prev, cur) }
+            StagingManager.StageOutcome.Ready("/tmp/$name", name, "image/jpeg", 1_024L)
+        }
+        every { stagingManager.release(any()) } answers {
+            if (firstArg<String?>() != null) {
+                activeStaged.decrementAndGet()
+            }
+        }
+
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val nextId = java.util.concurrent.atomic.AtomicLong(1L)
+        coEvery { telegramClient.uploadFile(any(), any(), any(), any(), any()) } coAnswers {
+            gate.await()
+            val id = nextId.incrementAndGet()
+            UploadResult(id, "rem_$id")
+        }
+
+        var outcome: BackupOrchestrator.RunOutcome? = null
+        val job = launch {
+            outcome = orchestrator.runBackup(jobId = "job_bounded_stage", isManual = true)
+        }
+        kotlinx.coroutines.yield()
+
+        assertThat(peakStaged.get()).isIn(1..4)
+        assertThat(activeStaged.get()).isAtMost(4)
+
+        gate.complete(Unit)
+        job.join()
+
+        assertThat(outcome).isEqualTo(BackupOrchestrator.RunOutcome.Success(uploaded = 10, skipped = 0, total = 10))
+        assertThat(activeStaged.get()).isEqualTo(0)
+        assertThat(peakStaged.get()).isAtMost(4)
+    }
 }

@@ -35,8 +35,11 @@
     <string name="settings_cache_back">Back</string>
     <string name="settings_cache_tdlib_label">TDLib download cache</string>
     <string name="settings_cache_tdlib_desc">Downloaded files stored on device</string>
+    <string name="settings_cache_app_label">App &amp; temporary cache</string>
+    <string name="settings_cache_app_desc">Downloads, thumbnails, decrypted previews &amp; upload temp files</string>
+    <string name="settings_cache_app_desc_with_staging">Downloads, thumbnails &amp; temp files (%1$s upload staging)</string>
     <string name="settings_cache_clear_confirm_title">Clear cache?</string>
-    <string name="settings_cache_clear_confirm_msg">This will delete all downloaded files from TDLib\'s cache. Files on Telegram are not affected.</string>
+    <string name="settings_cache_clear_confirm_msg">This will clear TDLib\'s download cache and temporary app cache files. Offline pinned files, active uploads, and files on Telegram are not affected.</string>
     <string name="settings_cache_clear_action">Clear</string>
     <string name="settings_about_title">About</string>
     <string name="settings_about_back">Back</string>

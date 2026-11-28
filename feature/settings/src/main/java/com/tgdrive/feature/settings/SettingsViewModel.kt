@@ -486,6 +486,51 @@ class SettingsViewModel @Inject constructor(
         try {
             withContext(dispatchers.io) {
                 telegramClient.clearDownloadCache()
+                runCatching { decryptedTempSweeper.wipeAll() }
+                for (
+                    dirName in listOf(
+                        "downloads",
+                        "decrypted",
+                        "image_cache",
+                        "zip_extracts",
+                        "split_stage",
+                        "split_merged",
+                        "pdf_thumbs",
+                        "zip_thumbs",
+                        "media_thumbs",
+                        "minithumbs",
+                        "upload_thumbs",
+                        "cloud_sync",
+                        "text_edits",
+                        "crop_tmp",
+                        "scan_tmp",
+                    )
+                ) {
+                    runCatching { File(appContext.cacheDir, dirName).deleteRecursively() }
+                }
+                runCatching {
+                    appContext.cacheDir.listFiles()?.forEach { f ->
+                        if (f.name.startsWith("zip_export_")) {
+                            runCatching { f.deleteRecursively() }
+                        }
+                    }
+                }
+                val hasActiveUploads = uploadManager.uploads.value.items.any { it.status.isActive }
+                if (!hasActiveUploads) {
+                    for (dirName in listOf("upload_staging", "backup_staging", "share_staging")) {
+                        runCatching { File(appContext.cacheDir, dirName).deleteRecursively() }
+                    }
+                } else {
+                    val shareCutoff = System.currentTimeMillis() - 10L * 60 * 1000L
+                    val shareDir = File(appContext.cacheDir, "share_staging")
+                    if (shareDir.isDirectory) {
+                        shareDir.listFiles()?.forEach { f ->
+                            if (f.lastModified() < shareCutoff) {
+                                runCatching { f.deleteRecursively() }
+                            }
+                        }
+                    }
+                }
             }
             Log.i("SettingsViewModel: cache cleared")
         } catch (e: CancellationException) {
