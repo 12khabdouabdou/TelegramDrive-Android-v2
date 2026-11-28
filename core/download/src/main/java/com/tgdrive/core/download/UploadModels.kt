@@ -24,7 +24,7 @@ data class UploadFileItem(
 )
 
 data class NormalUploadOptions(
-    val conflictStrategy: UploadConflictStrategy = UploadConflictStrategy.KEEP_BOTH,
+    val conflictStrategy: UploadConflictStrategy = UploadConflictStrategy.SKIP,
     val encryption: UploadEncryptionSpec = UploadEncryptionSpec(),
     val autoSplitOversized: Boolean = true,
     val wifiOnly: Boolean = false,

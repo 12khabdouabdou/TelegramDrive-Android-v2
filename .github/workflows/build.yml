@@ -75,7 +75,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Decode optional release keystore
+        id: keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "${{ runner.temp }}/release.p12"
+            echo "path=${{ runner.temp }}/release.p12" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version_code=$((100 + GITHUB_RUN_NUMBER))" >> "$GITHUB_OUTPUT"
+
       - name: Build debug APKs (arm64-v8a + universal)
+        env:
+          VERSION_CODE: ${{ steps.keystore.outputs.version_code }}
+          RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           ./gradlew :app:assembleDebug --no-daemon
           ls -lh app/build/outputs/apk/debug/*.apk
@@ -94,18 +111,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Decode optional release keystore
-        id: keystore
-        env:
-          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$RELEASE_KEYSTORE_BASE64" ]; then
-            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "${{ runner.temp }}/release.jks"
-            echo "path=${{ runner.temp }}/release.jks" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build release APKs (arm64-v8a + universal, R8 check)
         env:
+          VERSION_CODE: ${{ steps.keystore.outputs.version_code }}
           RELEASE_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -116,6 +124,15 @@ jobs:
           if ls app/build/outputs/apk/release/*armeabi-v7a* app/build/outputs/apk/release/*x86* 2>/dev/null; then
             echo "Unexpected non-ARMv8 ABI split APK produced" >&2
             exit 1
+          fi
+          if [ -n "$RELEASE_KEYSTORE_PATH" ]; then
+            if ls app/build/outputs/apk/release/*-unsigned.apk 2>/dev/null; then
+              echo "Unexpected unsigned release APK produced" >&2
+              exit 1
+            fi
+            for apk in app/build/outputs/apk/release/*.apk; do
+              "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk"
+            done
           fi
 
       - name: Clean up temporary keystore

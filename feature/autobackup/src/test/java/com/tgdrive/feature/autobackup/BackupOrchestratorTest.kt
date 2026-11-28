@@ -438,4 +438,97 @@ class BackupOrchestratorTest {
         assertThat(activeStaged.get()).isEqualTo(0)
         assertThat(peakStaged.get()).isAtMost(4)
     }
+
+    @Test
+    fun `autobackup skips existing same-folder files across encrypted and unencrypted modes`() =
+        runTest(testDispatcher) {
+            val folderUri = "content://com.android.externalstorage.documents/tree/primary%3ACamera"
+            val photo = LocalFile("content://doc/photo", "photo.jpg", 2_048L, 1_500L, "image/jpeg")
+            val clip = LocalFile("content://doc/clip", "clip.mp4", 4_096L, 1_600L, "video/mp4")
+            val unique = LocalFile("content://doc/unique", "unique.jpg", 1_024L, 1_700L, "image/jpeg")
+            coEvery { folderScanner.scanDetailed(folderUri, any(), any()) } returns FolderScanResult(
+                files = listOf(photo, clip, unique),
+                folderName = "Camera",
+            )
+            coEvery { fileCacheDao.forChat(999L) } returns listOf(
+                FileCacheEntity(
+                    messageId = 101L,
+                    chatId = 999L,
+                    fileName = "photo.jpg.tgenc",
+                    fileSize = 2_100L,
+                    mimeType = "application/octet-stream",
+                    thumbnailPath = null,
+                    remoteId = "r101",
+                    date = 1_500L,
+                    virtualPath = "Camera",
+                    isEncryptedVault = true,
+                ),
+                FileCacheEntity(
+                    messageId = 102L,
+                    chatId = 999L,
+                    fileName = "clip.mp4",
+                    fileSize = 4_096L,
+                    mimeType = "video/mp4",
+                    thumbnailPath = null,
+                    remoteId = "r102",
+                    date = 1_600L,
+                    virtualPath = "Camera",
+                    isEncryptedVault = false,
+                ),
+                FileCacheEntity(
+                    messageId = 103L,
+                    chatId = 999L,
+                    fileName = "unique.jpg",
+                    fileSize = 1_024L,
+                    mimeType = "image/jpeg",
+                    thumbnailPath = null,
+                    remoteId = "r103",
+                    date = 1_700L,
+                    virtualPath = "Archive",
+                    isEncryptedVault = false,
+                ),
+            )
+            every { stagingManager.stageForUpload(any(), any(), any(), any(), any(), any()) } answers {
+                val name = secondArg<String>()
+                val enc = arg<Boolean>(5)
+                val outName = if (enc) "$name.tgenc" else name
+                StagingManager.StageOutcome.Ready(
+                    path = "/tmp/$outName",
+                    effectiveName = outName,
+                    effectiveMime = "application/octet-stream",
+                    effectiveSize = 1_100L,
+                    wasEncrypted = enc,
+                )
+            }
+            coEvery { telegramClient.uploadFile(any(), any(), any(), any(), any()) } returns UploadResult(201L, "rem201")
+
+            prefsFlow.value = prefsFlow.value.copy(
+                backupFolderUris = setOf(folderUri),
+                backupEncryptAll = false,
+            )
+            val unencOutcome = orchestrator.runBackup(jobId = "job_dup_unenc", isManual = true)
+            assertThat(unencOutcome).isEqualTo(
+                BackupOrchestrator.RunOutcome.Success(uploaded = 1, skipped = 2, total = 1),
+            )
+            coVerify {
+                syncedFileDao.upsert(
+                    match { it.localPath == "content://doc/photo" && it.telegramMessageId == 101L },
+                )
+            }
+            coVerify(exactly = 1) {
+                telegramClient.uploadFile(any(), any(), "unique.jpg", any(), any())
+            }
+
+            prefsFlow.value = prefsFlow.value.copy(
+                backupFolderUris = setOf(folderUri),
+                backupEncryptAll = true,
+            )
+            val encOutcome = orchestrator.runBackup(jobId = "job_dup_enc", isManual = true)
+            assertThat(encOutcome).isEqualTo(
+                BackupOrchestrator.RunOutcome.Success(uploaded = 1, skipped = 2, total = 1),
+            )
+            coVerify(exactly = 1) {
+                telegramClient.uploadFile(any(), any(), "unique.jpg.tgenc", any(), any())
+            }
+        }
 }

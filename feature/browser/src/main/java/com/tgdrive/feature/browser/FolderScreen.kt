@@ -1679,7 +1679,7 @@ private fun FolderNormalUploadDialog(
     onDismiss: () -> Unit,
     onConfirm: (NormalUploadOptions) -> Unit,
 ) {
-    var conflict by remember { mutableStateOf(UploadConflictStrategy.KEEP_BOTH) }
+    var conflict by remember { mutableStateOf(UploadConflictStrategy.SKIP) }
     var encrypt by remember { mutableStateOf(false) }
     var useSavedPassphrase by remember(hasSavedPassphrase) { mutableStateOf(hasSavedPassphrase) }
     var saveAsPassVault by remember { mutableStateOf(false) }
@@ -1716,14 +1716,14 @@ private fun FolderNormalUploadDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     FilterChip(
-                        selected = conflict == UploadConflictStrategy.KEEP_BOTH,
-                        onClick = { conflict = UploadConflictStrategy.KEEP_BOTH },
-                        label = { Text("Keep both") },
-                    )
-                    FilterChip(
                         selected = conflict == UploadConflictStrategy.SKIP,
                         onClick = { conflict = UploadConflictStrategy.SKIP },
                         label = { Text("Skip duplicates") },
+                    )
+                    FilterChip(
+                        selected = conflict == UploadConflictStrategy.KEEP_BOTH,
+                        onClick = { conflict = UploadConflictStrategy.KEEP_BOTH },
+                        label = { Text("Keep both") },
                     )
                     FilterChip(
                         selected = conflict == UploadConflictStrategy.REPLACE,

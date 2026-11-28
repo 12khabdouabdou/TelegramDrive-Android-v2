@@ -517,7 +517,7 @@ class RootViewModel @Inject constructor(
                         chatId = chatId,
                         files = fileItems,
                         options = NormalUploadOptions(
-                            conflictStrategy = UploadConflictStrategy.KEEP_BOTH,
+                            conflictStrategy = UploadConflictStrategy.SKIP,
                             encryption = encSpec,
                             autoSplitOversized = true,
                             wifiOnly = wifiOnly,

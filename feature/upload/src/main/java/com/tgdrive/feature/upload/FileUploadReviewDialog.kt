@@ -101,7 +101,7 @@ fun FileUploadReviewDialog(
         mutableStateOf("files_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}")
     }
     var compressionMode by remember { mutableStateOf(ZipCompressionMode.SMART) }
-    var conflictStrategy by remember { mutableStateOf(UploadConflictStrategy.KEEP_BOTH) }
+    var conflictStrategy by remember { mutableStateOf(UploadConflictStrategy.SKIP) }
     var autoSplitOversized by remember { mutableStateOf(true) }
 
     var encrypt by remember { mutableStateOf(false) }
@@ -345,14 +345,14 @@ fun FileUploadReviewDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         FilterChip(
-                            selected = conflictStrategy == UploadConflictStrategy.KEEP_BOTH,
-                            onClick = { conflictStrategy = UploadConflictStrategy.KEEP_BOTH },
-                            label = { Text(stringResource(R.string.upload_conflict_keep_both)) },
-                        )
-                        FilterChip(
                             selected = conflictStrategy == UploadConflictStrategy.SKIP,
                             onClick = { conflictStrategy = UploadConflictStrategy.SKIP },
                             label = { Text(stringResource(R.string.upload_conflict_skip)) },
+                        )
+                        FilterChip(
+                            selected = conflictStrategy == UploadConflictStrategy.KEEP_BOTH,
+                            onClick = { conflictStrategy = UploadConflictStrategy.KEEP_BOTH },
+                            label = { Text(stringResource(R.string.upload_conflict_keep_both)) },
                         )
                         FilterChip(
                             selected = conflictStrategy == UploadConflictStrategy.REPLACE,

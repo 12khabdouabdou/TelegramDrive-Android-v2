@@ -206,9 +206,9 @@ class UploadManager @Inject constructor(
                     }
                     return@launch
                 }
-                val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+                val existingRows = loadExistingForChat(resolvedChatId)
                 val claimedNames = ConcurrentHashMap.newKeySet<String>()
-                existingRows.forEach { claimedNames.add(claimedNameKey(it.virtualPath, it.fileName)) }
+                existingRows.forEach { claimedNames.add(logicalFolderKey(it.virtualPath, it.fileName)) }
 
                 val results = supervisorScope {
                     val jobs = preparedIds.mapNotNull { (id, file) ->
@@ -270,9 +270,9 @@ class UploadManager @Inject constructor(
                 val scanned = scanFolderForNormalUpload(treeUri)
                 if (scanned.isEmpty()) return@launch
 
-                val existingRows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+                val existingRows = loadExistingForChat(resolvedChatId)
                 val claimedNames = ConcurrentHashMap.newKeySet<String>()
-                existingRows.forEach { claimedNames.add(claimedNameKey(it.virtualPath, it.fileName)) }
+                existingRows.forEach { claimedNames.add(logicalFolderKey(it.virtualPath, it.fileName)) }
 
                 val prepared = scanned.mapIndexed { idx, entry ->
                     val id = "ul_dir_${System.currentTimeMillis()}_${idx}_${UUID.randomUUID().toString().take(8)}"
@@ -494,9 +494,9 @@ class UploadManager @Inject constructor(
                     }
                     val resolvedSpec = spec.copy(chatId = targetChat)
                     retrySpecs[uploadId] = resolvedSpec
-                    val existingRows = runCatching { fileCacheDao.forChat(targetChat) }.getOrDefault(emptyList())
+                    val existingRows = loadExistingForChat(targetChat)
                     val claimed = ConcurrentHashMap.newKeySet<String>().apply {
-                        existingRows.forEach { add(it.fileName.lowercase(Locale.US)) }
+                        existingRows.forEach { add(logicalFolderKey(it.virtualPath, it.fileName)) }
                     }
                     if (executeSingleFileTask(uploadId, resolvedSpec, claimed, existingRows)) {
                         if (resolvedSpec.virtualPath.isNotBlank()) {
@@ -656,28 +656,32 @@ class UploadManager @Inject constructor(
         val effectiveMime = if (options.encryption.enabled) "application/octet-stream" else item.mimeType.ifBlank { guessMimeType(rawName) }
 
         val normVpath = spec.virtualPath.trim('/')
-        val existingMatch = existingRowsSnapshot.firstOrNull {
+        val desiredLogical = normalizeLogicalName(desiredName)
+        val existingMatches = existingRowsSnapshot.filter {
             it.virtualPath.trim('/').equals(normVpath, ignoreCase = true) &&
-                it.fileName.equals(desiredName, ignoreCase = true)
+                normalizeLogicalName(it.fileName) == desiredLogical
         }
+        val existingMatch = existingMatches.firstOrNull {
+            it.fileName.equals(desiredName, ignoreCase = true)
+        } ?: existingMatches.firstOrNull()
         var targetName = desiredName
         when (options.conflictStrategy) {
             UploadConflictStrategy.SKIP -> {
-                if (existingMatch != null) {
+                val key = logicalFolderKey(normVpath, targetName)
+                if (existingMatch != null || !claimedNames.add(key)) {
                     uploadTracker.completeUpload(id, detail = "Already exists — skipped")
                     waitingForWifiIds.remove(id)
                     withContext(NonCancellable) { runCatching { pendingUploadDao.deleteById(id) } }
                     activeJobs.remove(id)
                     return false
                 }
-                claimedNames.add(claimedNameKey(normVpath, targetName))
             }
             UploadConflictStrategy.KEEP_BOTH -> {
                 targetName = claimUniqueName(normVpath, desiredName, claimedNames)
                 uploadTracker.updatePhase(id, UploadStatus.QUEUED, fileName = targetName)
             }
             UploadConflictStrategy.REPLACE -> {
-                claimedNames.add(claimedNameKey(normVpath, targetName))
+                claimedNames.add(logicalFolderKey(normVpath, targetName))
             }
         }
 
@@ -1053,9 +1057,11 @@ class UploadManager @Inject constructor(
                         )
                     }
 
-                    if (options.conflictStrategy == UploadConflictStrategy.REPLACE && existingMatch != null) {
-                        runCatching { telegramClient.deleteMessage(chatId, existingMatch.messageId) }
-                        runCatching { fileCacheDao.deleteById(chatId, existingMatch.messageId) }
+                    if (options.conflictStrategy == UploadConflictStrategy.REPLACE && existingMatches.isNotEmpty()) {
+                        existingMatches.forEach { old ->
+                            runCatching { telegramClient.deleteMessage(chatId, old.messageId) }
+                            runCatching { fileCacheDao.deleteById(chatId, old.messageId) }
+                        }
                     }
 
                     waitingForWifiIds.remove(id)
@@ -1645,15 +1651,26 @@ class UploadManager @Inject constructor(
         return available >= requiredBytes + FREE_SPACE_SAFETY_BYTES
     }
 
-    private fun claimedNameKey(virtualPath: String, fileName: String): String =
-        "${virtualPath.trim('/').lowercase(Locale.US)}\u0000${fileName.lowercase(Locale.US)}"
+    private suspend fun loadExistingForChat(resolvedChatId: Long): List<FileCacheEntity> {
+        val rows = runCatching { fileCacheDao.forChat(resolvedChatId) }.getOrDefault(emptyList())
+        return rows.map { row ->
+            if (row.virtualPath.isNotBlank()) {
+                row
+            } else {
+                val cloudVpath = runCatching {
+                    cloudSyncManager.getCloudVirtualPath(resolvedChatId, row.messageId)
+                }.getOrNull()
+                if (!cloudVpath.isNullOrBlank()) row.copy(virtualPath = cloudVpath) else row
+            }
+        }
+    }
 
     private fun claimUniqueName(
         virtualPath: String,
         desiredName: String,
         claimedNames: MutableSet<String>,
     ): String {
-        if (claimedNames.add(claimedNameKey(virtualPath, desiredName))) return desiredName
+        if (claimedNames.add(logicalFolderKey(virtualPath, desiredName))) return desiredName
         val isEnc = BackupCrypto.isEncryptedFileName(desiredName)
         val inner = if (isEnc) BackupCrypto.stripEncryptedExtension(desiredName) else desiredName
         val dot = inner.lastIndexOf('.')
@@ -1663,7 +1680,7 @@ class UploadManager @Inject constructor(
         while (true) {
             val candidateInner = "$stem ($index)$ext"
             val candidate = if (isEnc) "$candidateInner${BackupCrypto.ENCRYPTED_EXT}" else candidateInner
-            if (claimedNames.add(claimedNameKey(virtualPath, candidate))) return candidate
+            if (claimedNames.add(logicalFolderKey(virtualPath, candidate))) return candidate
             index++
         }
     }
@@ -2041,7 +2058,7 @@ class UploadManager @Inject constructor(
                 val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
                 val conflict = map["conflict"]?.let { name ->
                     UploadConflictStrategy.entries.firstOrNull { it.name == name }
-                } ?: UploadConflictStrategy.KEEP_BOTH
+                } ?: UploadConflictStrategy.SKIP
                 RetrySpec.SingleFile(
                     chatId = map["chatId"]?.toLongOrNull() ?: 0L,
                     file = UploadFileItem(
@@ -2245,6 +2262,14 @@ class UploadManager @Inject constructor(
                 .replace('\u0000', '_')
                 .trim()
                 .ifBlank { "file_${System.currentTimeMillis()}" }
+
+        fun normalizeLogicalName(fileName: String): String =
+            BackupCrypto.stripEncryptedExtension(sanitizeLeafName(fileName))
+                .trim()
+                .lowercase(Locale.US)
+
+        fun logicalFolderKey(virtualPath: String, fileName: String): String =
+            "${virtualPath.trim('/').lowercase(Locale.US)}\u0000${normalizeLogicalName(fileName)}"
 
         fun guessMimeType(fileName: String): String {
             val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)

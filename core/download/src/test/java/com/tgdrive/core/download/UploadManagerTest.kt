@@ -698,4 +698,122 @@ class UploadManagerTest {
         assertThat(tracker.state.value.items.all { it.status == UploadStatus.DONE }).isTrue()
         assertThat(stagingDir.listFiles()?.count { it.isFile } ?: 0).isEqualTo(0)
     }
+
+    @Test
+    fun `SKIP detects encrypted and unencrypted duplicates in same folder only`(@TempDir tmp: File) = runTest {
+        val d = StandardTestDispatcher(testScheduler)
+        val photo = File(tmp, "photo.jpg").apply { writeBytes("jpg".toByteArray()) }
+        val secret = File(tmp, "secret.pdf").apply { writeBytes("pdf".toByteArray()) }
+        val vault = File(tmp, "vault.jpg").apply { writeBytes("vault".toByteArray()) }
+        val fresh = File(tmp, "fresh.txt").apply { writeBytes("fresh".toByteArray()) }
+
+        val nextId = java.util.concurrent.atomic.AtomicLong(500L)
+        val tg = mockk<TelegramClient>(relaxed = true) {
+            coEvery { maxUploadSizeBytes() } returns TelegramClient.MAX_FILE_SIZE_STANDARD
+            coEvery { uploadFile(any(), any(), any(), any(), any()) } answers {
+                val id = nextId.incrementAndGet()
+                UploadResult(messageId = id, remoteId = "rem_$id")
+            }
+        }
+        val dao = mockk<FileCacheDao>(relaxed = true) {
+            coEvery { forChat(81L) } returns listOf(
+                FileCacheEntity(
+                    messageId = 1L,
+                    chatId = 81L,
+                    fileName = "photo.jpg",
+                    fileSize = 3L,
+                    mimeType = "image/jpeg",
+                    thumbnailPath = null,
+                    remoteId = "r1",
+                    date = 1L,
+                    virtualPath = "Trips",
+                ),
+                FileCacheEntity(
+                    messageId = 2L,
+                    chatId = 81L,
+                    fileName = "secret.pdf.tgenc",
+                    fileSize = 48L,
+                    mimeType = "application/octet-stream",
+                    thumbnailPath = null,
+                    remoteId = "r2",
+                    date = 1L,
+                    virtualPath = "Docs",
+                    isEncryptedVault = true,
+                ),
+                FileCacheEntity(
+                    messageId = 3L,
+                    chatId = 81L,
+                    fileName = "vault.jpg.tgenc",
+                    fileSize = 48L,
+                    mimeType = "application/octet-stream",
+                    thumbnailPath = null,
+                    remoteId = "r3",
+                    date = 1L,
+                    virtualPath = "Trips",
+                    isEncryptedVault = true,
+                ),
+            )
+        }
+        val (manager, tracker) = createManager(tmp, d, tg, dao)
+        runCurrent()
+
+        val encSpec = UploadEncryptionSpec(
+            enabled = true,
+            useSavedPassphrase = false,
+            customPassphrase = "pass",
+        )
+        manager.enqueueFiles(
+            chatId = 81L,
+            files = listOf(UploadFileItem(fileUri(photo), "photo.jpg", "image/jpeg", photo.length())),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.SKIP,
+                encryption = encSpec,
+                virtualPath = "Trips",
+            ),
+        )
+        manager.enqueueFiles(
+            chatId = 81L,
+            files = listOf(UploadFileItem(fileUri(secret), "secret.pdf", "application/pdf", secret.length())),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.SKIP,
+                virtualPath = "Docs",
+            ),
+        )
+        manager.enqueueFiles(
+            chatId = 81L,
+            files = listOf(UploadFileItem(fileUri(vault), "vault.jpg", "image/jpeg", vault.length())),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.SKIP,
+                encryption = encSpec,
+                virtualPath = "Trips",
+            ),
+        )
+        manager.enqueueFiles(
+            chatId = 81L,
+            files = listOf(UploadFileItem(fileUri(photo), "photo.jpg", "image/jpeg", photo.length())),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.SKIP,
+                virtualPath = "Other",
+            ),
+        )
+        manager.enqueueFiles(
+            chatId = 81L,
+            files = listOf(
+                UploadFileItem(fileUri(fresh), "fresh.txt", "text/plain", fresh.length()),
+                UploadFileItem(fileUri(fresh), "fresh.txt", "text/plain", fresh.length()),
+            ),
+            options = NormalUploadOptions(
+                conflictStrategy = UploadConflictStrategy.SKIP,
+                virtualPath = "Notes",
+            ),
+        )
+        advanceUntilIdle()
+
+        assertThat(tracker.state.value.items.all { it.status == UploadStatus.DONE }).isTrue()
+        coVerify(exactly = 0) { tg.uploadFile(81L, any(), "photo.jpg.tgenc", any(), any()) }
+        coVerify(exactly = 0) { tg.uploadFile(81L, any(), "secret.pdf", any(), any()) }
+        coVerify(exactly = 0) { tg.uploadFile(81L, any(), "vault.jpg.tgenc", any(), any()) }
+        coVerify(exactly = 1) { tg.uploadFile(81L, any(), "photo.jpg", any(), any()) }
+        coVerify(exactly = 1) { tg.uploadFile(81L, any(), "fresh.txt", any(), any()) }
+    }
 }

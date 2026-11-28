@@ -14,6 +14,7 @@ import com.tgdrive.core.common.toHumanSize
 import com.tgdrive.core.datastore.AppPreferences
 import com.tgdrive.core.datastore.AppPreferencesData
 import com.tgdrive.core.datastore.BackupMediaFilter
+import com.tgdrive.core.datastore.BackupQuality
 import com.tgdrive.core.datastore.BackupUploadOrder
 import com.tgdrive.core.db.dao.FileCacheDao
 import com.tgdrive.core.db.dao.FolderDao
@@ -409,12 +410,84 @@ class BackupOrchestrator @Inject constructor(
                         strict = prefs.backupStrictMode,
                     )
                     totalSkippedCount += groupDiff.toSkip.size
-                    val uploadSet = groupDiff.toUpload.mapTo(HashSet()) { it.absolutePath }
+                    val cachedRows = runCatching { fileCacheDao.forChat(destChatId) }.getOrDefault(emptyList())
+                    val existingByFolderAndName = HashMap<Pair<String, String>, MutableList<FileCacheEntity>>()
+                    for (row in cachedRows) {
+                        val rowVpath = row.virtualPath.ifBlank {
+                            runCatching {
+                                cloudSyncManager.getCloudVirtualPath(destChatId, row.messageId)
+                            }.getOrNull().orEmpty()
+                        }.trim('/').lowercase(Locale.US)
+                        val rowLogical = BackupCrypto.stripEncryptedExtension(row.fileName)
+                            .trim()
+                            .lowercase(Locale.US)
+                        existingByFolderAndName.getOrPut(rowVpath to rowLogical) { ArrayList(1) }.add(row)
+                    }
+                    val folderDbId = targetPrefId.takeIf { it > 0 }
+                    val claimedInFolder = HashSet<Pair<String, String>>()
+                    val dedupedToUpload = ArrayList<LocalFile>(groupDiff.toUpload.size)
+                    for (item in groupDiff.toUpload) {
+                        val srcUri = sourceUriByPath[item.absolutePath].orEmpty()
+                        val rootTitle = folderNameByUri[srcUri].orEmpty()
+                        val captureMs = if (prefs.backupAutoOrganizeByDate) {
+                            stagingManager.extractCaptureTimestampMs(
+                                uriStr = item.absolutePath,
+                                mimeType = item.mimeType,
+                                fallbackLastModified = item.lastModified,
+                            )
+                        } else {
+                            item.lastModified
+                        }
+                        val destVpath = buildVirtualPath(
+                            rootFolderTitle = rootTitle,
+                            relativeDir = item.relativePath,
+                            organizeByDate = prefs.backupAutoOrganizeByDate,
+                            captureTimestampMs = captureMs,
+                        ).trim('/').lowercase(Locale.US)
+                        val logicalName = BackupCrypto.stripEncryptedExtension(item.name)
+                            .trim()
+                            .lowercase(Locale.US)
+                        val folderKey = destVpath to logicalName
+                        val candidates = existingByFolderAndName[folderKey].orEmpty()
+                        val willEncrypt = prefs.isFolderEncrypted(srcUri)
+                        val willCompress = prefs.backupQuality == BackupQuality.STORAGE_SAVER
+                        val matchedRemote = candidates.firstOrNull { existing ->
+                            val existingEnc = existing.isEncryptedVault ||
+                                BackupCrypto.isEncryptedFileName(existing.fileName)
+                            if (existingEnc || willEncrypt || willCompress) {
+                                true
+                            } else {
+                                existing.fileSize == item.size ||
+                                    existing.fileSize <= 0L ||
+                                    item.lastModified <= existing.date + 2_000L
+                            }
+                        }
+                        if (matchedRemote != null || !claimedInFolder.add(folderKey)) {
+                            totalSkippedCount++
+                            if (matchedRemote != null) {
+                                runCatching {
+                                    syncedFileDao.upsert(
+                                        SyncedFileEntity(
+                                            localPath = item.absolutePath,
+                                            telegramMessageId = matchedRemote.messageId,
+                                            sha256 = item.sha256,
+                                            size = item.size,
+                                            syncedAt = System.currentTimeMillis(),
+                                            folderId = folderDbId,
+                                            lastModified = item.lastModified,
+                                        ),
+                                    )
+                                }
+                            }
+                        } else {
+                            dedupedToUpload += item
+                        }
+                    }
+                    val uploadSet = dedupedToUpload.mapTo(HashSet()) { it.absolutePath }
                     for (uri in urisForTarget) {
                         toUploadByUri[uri] = scannedByUri[uri].orEmpty().filter { it.absolutePath in uploadSet }
                     }
-                    val folderDbId = targetPrefId.takeIf { it > 0 }
-                    for (item in groupDiff.toUpload) {
+                    for (item in dedupedToUpload) {
                         targetByPath[item.absolutePath] = destChatId to folderDbId
                         toUpload += item
                     }
